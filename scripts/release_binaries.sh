@@ -10,10 +10,11 @@ IMAGE_NAME="rust-build-env"
 
 # Function to build the Docker image if it doesn't exist
 build_docker_image() {
+  local arch=$1
   echo "Building Docker image $IMAGE_NAME..."
-  docker buildx build -t $IMAGE_NAME \
+  docker build -t $IMAGE_NAME \
                          -f "$ROOT_PATH/Dockerfile.rust-build" \
-                         --platform linux/amd64,linux/arm64 \
+                         --platform $arch \
                          --load \
                          "$ROOT_PATH"
 }
@@ -45,10 +46,12 @@ build() {
 
 # Main script
 main() {
-  build_docker_image
+  build_docker_image linux/amd64
 
   # Build for x86_64
   build x86_64-unknown-linux-gnu drive-abci-linux-gnu-x86_64 linux/amd64
+
+  build_docker_image linux/arm64
 
   # Build for aarch64
   build aarch64-unknown-linux-gnu drive-abci-linux-gnu-aarch64 linux/arm64
