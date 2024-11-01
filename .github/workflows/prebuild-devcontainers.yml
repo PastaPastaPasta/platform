@@ -50,6 +50,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Commit variables
+        id: prepare
+        run: |
+          REPO_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo-name=${REPO_NAME}" >> $GITHUB_OUTPUT
+
       - name: Build and push Platform devcontainer
         uses: devcontainers/ci@v0.3
         with:
