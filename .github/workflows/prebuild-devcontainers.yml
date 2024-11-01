@@ -53,9 +53,9 @@ jobs:
       - name: Build and push Platform devcontainer
         uses: devcontainers/ci@v0.3
         with:
-          imageName: ghcr.io/dashpay/platform/devcontainer
+          imageName: ghcr.io/${{ steps.prepare.outputs.repo-name }}/devcontainer
           imageTag: 0.1.0
           platform: linux/amd64,linux/arm64
           configFile: .devcontainer/devcontainer-build.json
           push: always
-          cacheFrom: ghcr.io/dashpay/platform/devcontainer
+          cacheFrom: ghcr.io/${{ steps.prepare.outputs.repo-name }}/devcontainer
