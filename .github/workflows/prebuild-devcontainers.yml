@@ -1,5 +1,8 @@
 name: Prebuild Dev Containers
 
+permissions:
+  packages: write
+
 on:
   push:
     paths:
@@ -45,7 +48,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Platform devcontainer
         uses: devcontainers/ci@v0.3
