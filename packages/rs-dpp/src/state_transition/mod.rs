@@ -1387,8 +1387,8 @@ impl StateTransition {
 
         let data = self.signable_bytes()?;
 
-        bls.verify_signature(signature.as_slice(), &data, public_key)
-            .map(|_| ())
+        let is_valid = bls
+            .verify_signature(signature.as_slice(), &data, public_key)
             .map_err(|e| {
                 // TODO: it shouldn't respond with consensus error
                 ProtocolError::from(ConsensusError::SignatureError(
@@ -1396,7 +1396,77 @@ impl StateTransition {
                         InvalidStateTransitionSignatureError::new(e.to_string()),
                     ),
                 ))
-            })
+            })?;
+
+        if is_valid {
+            Ok(())
+        } else {
+            Err(ProtocolError::from(ConsensusError::SignatureError(
+                SignatureError::InvalidStateTransitionSignatureError(
+                    InvalidStateTransitionSignatureError::new(
+                        "Invalid BLS state transition signature".to_string(),
+                    ),
+                ),
+            )))
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "bls-signatures",
+    feature = "fixtures-and-mocks",
+    feature = "random-public-keys",
+    feature = "state-transition-signing",
+    feature = "state-transition-validation"
+))]
+mod tests {
+    use super::StateTransition;
+    use crate::bls::native_bls::NativeBlsModule;
+    use crate::identity::identity_public_key::v0::IdentityPublicKeyV0;
+    use crate::identity::{KeyType, Purpose, SecurityLevel};
+    use crate::tests::fixtures::get_identity_update_transition_fixture;
+    use crate::version::PlatformVersion;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn invalid_bls_signature_is_rejected_for_identity_signed_transition() {
+        let platform_version = PlatformVersion::latest().clone();
+        let mut rng = StdRng::seed_from_u64(42);
+        let bls = NativeBlsModule;
+
+        let (public_key_data, private_key_data) = KeyType::BLS12_381
+            .random_public_and_private_key_data(&mut rng, &platform_version)
+            .expect("expected BLS keypair");
+        let identity_public_key = IdentityPublicKeyV0 {
+            id: 1,
+            purpose: Purpose::AUTHENTICATION,
+            security_level: SecurityLevel::MASTER,
+            contract_bounds: None,
+            key_type: KeyType::BLS12_381,
+            data: public_key_data.into(),
+            read_only: false,
+            disabled_at: None,
+        }
+        .into();
+
+        let mut state_transition: StateTransition =
+            get_identity_update_transition_fixture(platform_version).into();
+        state_transition
+            .sign(&identity_public_key, &private_key_data, &bls)
+            .expect("expected valid BLS signature");
+
+        let mut invalid_signature = state_transition
+            .signature()
+            .expect("expected signature")
+            .to_vec();
+        invalid_signature[0] ^= 0x01;
+        state_transition.set_signature(invalid_signature.into());
+
+        assert!(state_transition
+            .verify_identity_signed_signature(&identity_public_key, &bls)
+            .is_err());
     }
 }
 
