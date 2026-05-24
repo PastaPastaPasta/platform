@@ -1501,7 +1501,7 @@ impl FromProof<platform::GetDocumentHistoryRequest> for DocumentHistory {
         verify_tenderdash_proof(proof, mtd, &root_hash, provider)?;
 
         Ok((
-            maybe_history.and_then(|history| IndexMap::from_iter(history).into_option()),
+            maybe_history.map(IndexMap::from_iter),
             mtd.clone(),
             proof.clone(),
         ))

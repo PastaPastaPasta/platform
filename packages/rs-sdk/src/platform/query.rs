@@ -193,7 +193,11 @@ impl Query<proto::GetDocumentHistoryRequest> for DocumentHistoryQuery {
     ) -> Result<proto::GetDocumentHistoryRequest, Error> {
         let prove = settings.prove;
         if !prove {
-            unimplemented!("queries without proofs are not supported yet");
+            return Err(Error::Config(
+                "dash-sdk does not support non-proven document history queries; proof \
+                 verification is mandatory on the SDK fetch path"
+                    .to_string(),
+            ));
         }
 
         Ok(proto::GetDocumentHistoryRequest {
