@@ -416,6 +416,18 @@ impl DocumentQuery {
     /// `contract` must be the data contract the request targets — the
     /// request's `data_contract_id` is checked against `contract.id()`
     /// and the named document type must exist on it.
+    ///
+    /// Scope caveat: this mirrors the server's *wire-shape* decoding
+    /// (shared clause decoders), not its full `validate_and_route`
+    /// business rules — e.g. SUM/AVG requiring a non-empty field,
+    /// GROUP BY being illegal with SELECT DOCUMENTS, or HAVING being
+    /// unimplemented are enforced server-side only. A request violating
+    /// those decodes here but can never yield a provable response from
+    /// a real server. That gap matters precisely for fabricated
+    /// request/response pairs, so the proof-verifying entry point
+    /// [`verify_documents_response`] closes it: it rejects every such
+    /// shape before delegating, rather than letting the lowering to
+    /// [`DriveDocumentQuery`] silently drop it.
     pub fn try_from_request(
         request: GetDocumentsRequest,
         contract: Arc<DataContract>,
@@ -639,6 +651,72 @@ fn order_clauses_from_cbor(bytes: &[u8]) -> Result<Vec<OrderClause>, Error> {
     }
 }
 
+/// Reject the request shapes that can never have produced the proved
+/// plain-document response being verified.
+///
+/// Each rejection mirrors a gate an honest server runs before it would
+/// ever build such a proof, and each covers a field the
+/// `DocumentQuery` → [`DriveDocumentQuery`] lowering discards — which
+/// is exactly the set an attacker could vary freely while replaying a
+/// genuine proof. See [`verify_documents_response`] for the threat
+/// model.
+///
+/// Server counterparts, all in
+/// `packages/rs-drive-abci/src/query/document_query/v1/mod.rs`:
+/// `validate_and_route` rejects a non-empty HAVING for any
+/// non-aggregate SELECT and a non-empty GROUP BY under SELECT
+/// DOCUMENTS; `reject_offset_off_the_ranked_path` rejects any OFFSET
+/// that did not route to the ranked executor (a documents fetch never
+/// does). `prove: false` is not a server rejection — it makes the
+/// server return an unproved response, so a proved response cannot
+/// have come from one.
+fn reject_request_the_server_would_not_have_proved(
+    query: &DocumentQuery,
+    prove: bool,
+) -> Result<(), drive_proof_verifier::Error> {
+    let reject = |error: String| Err(drive_proof_verifier::Error::RequestError { error });
+
+    if !prove {
+        return reject(
+            "request carries prove=false, so an honest server would have answered it with an \
+             unproved response; a proved response cannot belong to this request"
+                .to_string(),
+        );
+    }
+    // This entry point verifies plain document fetches only. An aggregate
+    // projection (COUNT/SUM/AVG) is proved with a different proof shape;
+    // handing it to the Documents verifier would surface as an opaque
+    // low-level proof error, so reject it up front instead.
+    if query.select != drive::query::SelectProjection::documents() {
+        return reject(format!(
+            "verify_documents_response only verifies plain document fetches; the request \
+             carries a {:?} projection — use the aggregate proof helpers instead",
+            query.select.function
+        ));
+    }
+    if !query.having.is_empty() {
+        return reject(format!(
+            "request carries {} HAVING clause(s), which the server refuses for a \
+             non-aggregate SELECT; no proved document response can belong to it",
+            query.having.len()
+        ));
+    }
+    if !query.group_by.is_empty() {
+        return reject(format!(
+            "request carries GROUP BY {:?}, which the server refuses under SELECT DOCUMENTS; \
+             no proved document response can belong to it",
+            query.group_by
+        ));
+    }
+    if let Some(offset) = query.offset {
+        return reject(format!(
+            "request carries OFFSET {offset}, which the server accepts only on the ranked \
+             surface, never for a document fetch; no proved document response can belong to it"
+        ));
+    }
+    Ok(())
+}
+
 /// Embedder entry point: verify a proved [`GetDocumentsResponse`]
 /// directly against the wire request that produced it.
 ///
@@ -656,6 +734,20 @@ fn order_clauses_from_cbor(bytes: &[u8]) -> Result<Vec<OrderClause>, Error> {
 /// embedder's [`ContextProvider`] can resolve contracts, use
 /// [`verify_documents_response_with_provider_contract`] instead and
 /// skip the explicit parameter.
+///
+/// # Binding the proof to the whole request
+///
+/// GroveDB and Tenderdash proofs authenticate the state and the
+/// resolved [`DriveDocumentQuery`] — not the request envelope. The
+/// rich→drive lowering drops request fields that a documents query has
+/// no place for (`group_by`, `having`, `offset`, `prove`), so
+/// delegating without first checking them would let an untrusted
+/// transport pair a request the real server would have *refused* with
+/// a valid proof for the narrower query it lowers to, and this
+/// function would accept it. Every such field is therefore rejected up
+/// front, mirroring the server's own gates in
+/// `rs-drive-abci`'s `validate_and_route` /
+/// `reject_offset_off_the_ranked_path`.
 pub fn verify_documents_response(
     request: GetDocumentsRequest,
     contract: Arc<DataContract>,
@@ -664,11 +756,20 @@ pub fn verify_documents_response(
     platform_version: &PlatformVersion,
     provider: &dyn ContextProvider,
 ) -> Result<(Option<Documents>, ResponseMetadata, Proof), drive_proof_verifier::Error> {
+    // `prove` does not survive decoding (a `DocumentQuery` has no such
+    // field), so read it off the wire request before it is consumed.
+    let prove = match &request.version {
+        Some(V0(v0)) => v0.prove,
+        Some(V1(v1)) => v1.prove,
+        // Missing version is reported by the decode below.
+        None => true,
+    };
     let query = DocumentQuery::try_from_request(request, contract).map_err(|e| {
         drive_proof_verifier::Error::RequestError {
             error: format!("failed to decode GetDocumentsRequest into a DocumentQuery: {e}"),
         }
     })?;
+    reject_request_the_server_would_not_have_proved(&query, prove)?;
     <Documents as FromProof<DocumentQuery>>::maybe_from_proof_with_metadata(
         query,
         response,
@@ -1124,8 +1225,21 @@ impl<'a> TryFrom<&'a DocumentQuery> for DriveDocumentQuery<'a> {
         )
         .map_err(Error::Drive)?;
 
+        // `DriveDocumentQuery`'s limit is a `u16`; the wire's is a `u32`.
+        // The server refuses anything above `u16::MAX` outright
+        // (`QuerySyntaxError::InvalidLimit`), so a checked conversion is
+        // what actually mirrors it — an `as` cast would wrap 65537 to a
+        // 1-document query and verify a proof for a query nobody asked
+        // for. `0` keeps its "unset → server default" sentinel meaning.
         let limit = if request.limit != 0 {
-            Some(request.limit as u16)
+            Some(u16::try_from(request.limit).map_err(|_| {
+                Error::Config(format!(
+                    "limit {} does not fit a documents query's u16 limit (max {}); \
+                     the server rejects such limits with InvalidLimit",
+                    request.limit,
+                    u16::MAX
+                ))
+            })?)
         } else {
             None
         };

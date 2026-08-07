@@ -17,7 +17,7 @@ use dpp::platform_value::Value;
 use dpp::prelude::DataContract;
 use dpp::tests::fixtures::get_data_contract_fixture;
 use dpp::version::PlatformVersion;
-use drive::query::{OrderClause, SelectProjection, WhereClause, WhereOperator};
+use drive::query::{DriveDocumentQuery, OrderClause, SelectProjection, WhereClause, WhereOperator};
 
 fn test_contract() -> Arc<DataContract> {
     let platform_version = PlatformVersion::latest();
@@ -290,4 +290,181 @@ fn rejects_contract_mismatch() {
         error.to_string().contains("targets data contract"),
         "unexpected error: {error}"
     );
+}
+
+/// A `u32` wire limit above `u16::MAX` must be refused, not wrapped.
+///
+/// `DriveDocumentQuery`'s limit is a `u16`; the server rejects anything
+/// larger with `InvalidLimit` and so never proves such a query. An `as`
+/// cast would silently turn a request for 65537 documents into a
+/// 1-document query, and a proof for *that* query would then verify —
+/// binding the proof to something the caller never asked for.
+#[test]
+fn limit_above_u16_max_is_rejected_not_truncated() {
+    let contract = test_contract();
+    let query = DocumentQuery::new(contract, "niceDocument")
+        .expect("document type exists")
+        .with_limit(u16::MAX as u32 + 2);
+
+    let error = DriveDocumentQuery::try_from(&query)
+        .expect_err("a limit above u16::MAX must not be silently truncated");
+    assert!(
+        error.to_string().contains("65537"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Request-shape checks in [`verify_documents_response`].
+///
+/// Every field asserted here is dropped by the `DocumentQuery` →
+/// `DriveDocumentQuery` lowering, so without an explicit rejection an
+/// untrusted transport could pair a request the real server would have
+/// refused with a genuine proof for the narrower query it lowers to.
+///
+/// The provider panics on every call, which also pins *when* the
+/// rejection happens: before any proof machinery runs.
+mod verify_binds_the_whole_request {
+    use super::*;
+    use dapi_grpc::platform::v0::GetDocumentsResponse;
+    use dash_context_provider::{ContextProvider, ContextProviderError};
+    use dash_platform_queries::documents::document_query::verify_documents_response;
+    use dpp::dashcore::Network;
+    use dpp::data_contract::associated_token::token_configuration::TokenConfiguration;
+    use dpp::prelude::{CoreBlockHeight, Identifier};
+    use drive::query::{
+        HavingAggregate, HavingAggregateFunction, HavingClause, HavingOperator, HavingRightOperand,
+    };
+
+    /// Fails the test if proof verification is reached at all.
+    struct NeverCalledProvider;
+
+    impl ContextProvider for NeverCalledProvider {
+        fn get_data_contract(
+            &self,
+            _id: &Identifier,
+            _platform_version: &PlatformVersion,
+        ) -> Result<Option<Arc<DataContract>>, ContextProviderError> {
+            panic!("request must be rejected before proof verification starts")
+        }
+
+        fn get_token_configuration(
+            &self,
+            _token_id: &Identifier,
+        ) -> Result<Option<TokenConfiguration>, ContextProviderError> {
+            panic!("request must be rejected before proof verification starts")
+        }
+
+        fn get_quorum_public_key(
+            &self,
+            _quorum_type: u32,
+            _quorum_hash: [u8; 32],
+            _core_chain_locked_height: u32,
+        ) -> Result<[u8; 48], ContextProviderError> {
+            panic!("request must be rejected before proof verification starts")
+        }
+
+        fn get_platform_activation_height(&self) -> Result<CoreBlockHeight, ContextProviderError> {
+            panic!("request must be rejected before proof verification starts")
+        }
+    }
+
+    /// Encode `query` onto the V1 wire, let `mutate` reshape the request
+    /// the way a hostile transport could, and return the rejection.
+    fn verify_error(
+        query: DocumentQuery,
+        mutate: impl FnOnce(&mut GetDocumentsRequest),
+    ) -> drive_proof_verifier::Error {
+        let contract = Arc::clone(&query.data_contract);
+        let mut request = query
+            .try_into_request_for_version(v1_platform_version())
+            .expect("query should encode onto the wire");
+        mutate(&mut request);
+
+        verify_documents_response(
+            request,
+            contract,
+            GetDocumentsResponse::default(),
+            Network::Testnet,
+            PlatformVersion::latest(),
+            &NeverCalledProvider,
+        )
+        .expect_err("the reshaped request must be rejected")
+    }
+
+    fn documents_query() -> DocumentQuery {
+        DocumentQuery::new(test_contract(), "niceDocument").expect("document type exists")
+    }
+
+    /// The server refuses GROUP BY under SELECT DOCUMENTS
+    /// (`validate_and_route`), so no proved document response can
+    /// belong to such a request.
+    #[test]
+    fn rejects_group_by() {
+        let error = verify_error(documents_query().with_group_by("age"), |_| {});
+        assert!(
+            error.to_string().contains("GROUP BY"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The server refuses a non-empty HAVING for any non-aggregate
+    /// SELECT (`validate_and_route`).
+    #[test]
+    fn rejects_having() {
+        let query = documents_query().with_having(vec![HavingClause {
+            aggregate: HavingAggregate {
+                function: HavingAggregateFunction::Count,
+                field: String::new(),
+            },
+            operator: HavingOperator::GreaterThan,
+            right: HavingRightOperand::Value(Value::U64(0)),
+        }]);
+        let error = verify_error(query, |_| {});
+        assert!(
+            error.to_string().contains("HAVING"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The server accepts OFFSET only on the ranked surface
+    /// (`reject_offset_off_the_ranked_path`); a document fetch never
+    /// routes there.
+    #[test]
+    fn rejects_offset() {
+        let error = verify_error(documents_query().with_offset(7), |_| {});
+        assert!(
+            error.to_string().contains("OFFSET"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `prove: false` makes an honest server answer without a proof, so
+    /// a proved response cannot belong to such a request.
+    #[test]
+    fn rejects_unproved_request() {
+        let error = verify_error(documents_query(), |request| {
+            let Some(Version::V1(v1)) = &mut request.version else {
+                panic!("expected the V1 wire shape");
+            };
+            v1.prove = false;
+        });
+        assert!(
+            error.to_string().contains("prove=false"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// An aggregate projection is proved with a different proof shape;
+    /// the pre-existing guard stays alongside the new ones.
+    #[test]
+    fn rejects_aggregate_projection() {
+        let error = verify_error(
+            documents_query().with_select(SelectProjection::count_star()),
+            |_| {},
+        );
+        assert!(
+            error.to_string().contains("plain document fetches"),
+            "unexpected error: {error}"
+        );
+    }
 }
