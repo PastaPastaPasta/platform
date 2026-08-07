@@ -11,5 +11,10 @@ pub mod document_split_counts;
 pub mod document_split_sums;
 pub mod document_sum;
 pub(crate) mod having_proof_helpers;
+/// Shared wire-proto → drive-type decoders for `getDocuments`,
+/// used by both rs-drive-abci (server request decode) and
+/// [`document_query::DocumentQuery::try_from_request`] (client
+/// verification) so the two directions cannot drift.
+pub mod proto_conversions;
 pub(crate) mod ranked_proof_helpers;
 pub(crate) mod sum_proof_helpers;
