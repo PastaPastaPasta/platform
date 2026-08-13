@@ -39,17 +39,19 @@ If you want networking, retries, and a managed connection pool, use
 
 ## What's here
 
-- `DocumentQuery` — rich document query builder with wire
-  encoding for both request versions.
+- `DocumentQuery` — rich document query builder, wire encoding for both
+  request versions, and decoding **from** the wire request
+  (`DocumentQuery::try_from_request`) using the same proto conversions the
+  server (`drive-abci`) uses, so client and server cannot drift.
+- `verify_documents_response` — request-driven proof verification for document
+  queries, delegating to `drive-proof-verifier`'s `FromProof`.
 - Aggregate proof helpers (count/sum/average/ranked) shared with `dash-sdk`.
-- DPNS username helpers — label normalization/validation and the
-  convertibility/contested checks shared with `dash-sdk`.
-- `transition::validation` — structural validation for state transitions
-  ahead of signing.
-
-Wire-request decoding (`DocumentQuery::try_from_request`), request-driven
-proof verification, and pure DPNS/DashPay document builders arrive in the
-next slice of this series.
+- Pure DPNS builders — `build_dpns_preorder_and_domain_documents`, label
+  normalization/validation — and pure DashPay contact-request document
+  assembly (`dashpay::build_contact_request_document`); crypto material is
+  supplied by the caller, keys never enter this crate.
+- `transition::validation` and document-transition helpers
+  (`ensure_entropy_matches_document_id`, `prepare_document_for_transition`).
 
 ## Feature flags
 
