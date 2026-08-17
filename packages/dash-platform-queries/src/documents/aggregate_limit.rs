@@ -8,14 +8,13 @@
 //! `drive_config.max_query_limit` with
 //! `QuerySyntaxError::InvalidLimit` *before* producing proof bytes.
 //! The verifier mirrors that gate against the compile-time
-//! [`DEFAULT_QUERY_LIMIT`] (100 — the same value as the config
-//! default `DEFAULT_MAX_QUERY_LIMIT`; the SDK cannot see an
-//! operator's runtime tuning, and proof bytes never depend on it)
-//! so a request the server would refuse can never reach a proof
-//! primitive. Without the cap, an untrusted transport could pair a
-//! server-invalid request (limit 101..=65535 fits the wire's `u32`
-//! and even a `u16`) with a genuine proof produced for a different,
-//! server-permitted query.
+//! [`DEFAULT_MAX_QUERY_LIMIT`] — `max_query_limit`'s config default
+//! (100); the SDK cannot see an operator's runtime tuning, and proof
+//! bytes never depend on it — so a request the server would refuse
+//! can never reach a proof primitive. Without the cap, an untrusted
+//! transport could pair a server-invalid request (limit 101..=65535
+//! fits the wire's `u32` and even a `u16`) with a genuine proof
+//! produced for a different, server-permitted query.
 //!
 //! The `0` sentinel ("no limit set on the wire": V0's `limit: 0`,
 //! V1's `limit: None`) is translated per walk shape, mirroring the
@@ -28,7 +27,15 @@
 //!   because the server keeps an unset limit as an unbounded outer
 //!   walk.
 
-use drive::config::DEFAULT_QUERY_LIMIT;
+use drive::config::{DEFAULT_MAX_QUERY_LIMIT, DEFAULT_QUERY_LIMIT};
+
+// The distinct-walk fallback (`DEFAULT_QUERY_LIMIT`, mirroring the
+// server's `limit.unwrap_or(DEFAULT_QUERY_LIMIT)`) must itself pass
+// the cap, exactly as the server checks its own fallback against
+// `max_query_limit`. Both are 100 today with no compile-time link;
+// this pin makes a future divergence a build error here instead of
+// a silent parity break.
+const _: () = assert!(DEFAULT_QUERY_LIMIT <= DEFAULT_MAX_QUERY_LIMIT);
 
 /// Reject a limit the server's aggregate prove paths would refuse
 /// with `InvalidLimit`. Run this before any proof or
@@ -39,10 +46,10 @@ pub(crate) fn check_within_server_cap(
     limit: u32,
     surface: &str,
 ) -> Result<(), drive_proof_verifier::Error> {
-    if limit > u32::from(DEFAULT_QUERY_LIMIT) {
+    if limit > u32::from(DEFAULT_MAX_QUERY_LIMIT) {
         return Err(drive_proof_verifier::Error::RequestError {
             error: format!(
-                "limit {limit} exceeds the server's max_query_limit {DEFAULT_QUERY_LIMIT} \
+                "limit {limit} exceeds the server's max_query_limit {DEFAULT_MAX_QUERY_LIMIT} \
                  on the prove path ({surface}); the server refuses such requests with \
                  InvalidLimit before producing proof bytes, so no proved response can \
                  belong to this request"
@@ -58,7 +65,7 @@ pub(crate) fn check_within_server_cap(
 /// [`check_within_server_cap`] first, which is what makes the
 /// narrowing cast exact.
 pub(crate) fn distinct_walk_limit(limit: u32) -> u16 {
-    debug_assert!(limit <= u32::from(DEFAULT_QUERY_LIMIT));
+    debug_assert!(limit <= u32::from(DEFAULT_MAX_QUERY_LIMIT));
     if limit == 0 {
         DEFAULT_QUERY_LIMIT
     } else {
@@ -72,7 +79,7 @@ pub(crate) fn distinct_walk_limit(limit: u32) -> u16 {
 /// [`check_within_server_cap`] first, which is what makes the
 /// narrowing cast exact.
 pub(crate) fn carrier_walk_limit(limit: u32) -> Option<u16> {
-    debug_assert!(limit <= u32::from(DEFAULT_QUERY_LIMIT));
+    debug_assert!(limit <= u32::from(DEFAULT_MAX_QUERY_LIMIT));
     if limit == 0 {
         None
     } else {
