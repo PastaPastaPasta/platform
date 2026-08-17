@@ -572,4 +572,40 @@ mod verify_binds_the_whole_request {
             );
         }
     }
+
+    /// The aggregate verify paths (COUNT / SUM / AVG) share the same
+    /// server-side limit cap — drive's aggregate dispatchers refuse
+    /// over-`max_query_limit` requests with `InvalidLimit` before
+    /// producing proof bytes — so their verifiers must refuse the
+    /// same requests before any proof machinery. Exercised through
+    /// the COUNT path; all three route through the shared
+    /// `aggregate_limit::check_within_server_cap` gate. The panicking
+    /// provider pins that the rejection precedes all proof machinery,
+    /// and the asserted message pins that the limit gate (not the
+    /// missing proof in the default response) is what fired.
+    #[test]
+    fn rejects_aggregate_limit_above_server_cap() {
+        use drive_proof_verifier::{DocumentCount, FromProof};
+
+        for limit in [101u32, 65_535, u32::MAX] {
+            let query = documents_query()
+                .with_select(SelectProjection::count_star())
+                .with_limit(limit);
+            let error =
+                <DocumentCount as FromProof<DocumentQuery>>::maybe_from_proof_with_metadata(
+                    query,
+                    GetDocumentsResponse::default(),
+                    Network::Testnet,
+                    PlatformVersion::latest(),
+                    &NeverCalledProvider,
+                )
+                .expect_err("an over-cap limit on the COUNT verify path must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("exceeds the server's max_query_limit 100"),
+                "unexpected error for limit {limit}: {error}"
+            );
+        }
+    }
 }
