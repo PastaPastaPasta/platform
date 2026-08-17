@@ -31,6 +31,7 @@ use dpp::{
     prelude::{DataContract, Identifier},
     InvalidVectorSizeError, ProtocolError,
 };
+use drive::config::DEFAULT_QUERY_LIMIT;
 use drive::query::drive_document_ranked_query::mode_detection::ranked_order_key;
 use drive::query::{
     DriveDocumentQuery, HavingAggregate, HavingAggregateFunction, HavingClause, HavingOperator,
@@ -651,6 +652,46 @@ fn order_clauses_from_cbor(bytes: &[u8]) -> Result<Vec<OrderClause>, Error> {
     }
 }
 
+/// Reject a request whose wire version (the `V0`/`V1` oneof arm,
+/// i.e. feature version 0/1) falls outside the supplied platform
+/// version's `drive_abci.query.document_query` bounds.
+///
+/// This is the same `check_version` gate the server runs before it
+/// decodes anything (`Platform::query_documents` in rs-drive-abci,
+/// which answers an out-of-bounds wire version with
+/// `QueryError::UnsupportedQueryVersion`). Without it, an untrusted
+/// transport could pair a request wire-version the supplied platform
+/// version's server refuses to serve with a valid proof produced for
+/// the other wire shape, and verification would accept the pair.
+///
+/// A missing `version` oneof is deliberately let through — the decode
+/// that follows reports it with its established error message.
+fn check_wire_version_is_served(
+    request: &GetDocumentsRequest,
+    platform_version: &PlatformVersion,
+) -> Result<(), drive_proof_verifier::Error> {
+    let Some(version) = &request.version else {
+        return Ok(());
+    };
+    let feature_version: u16 = match version {
+        V0(_) => 0,
+        V1(_) => 1,
+    };
+    let bounds = &platform_version.drive_abci.query.document_query;
+    if !bounds.check_version(feature_version) {
+        return Err(drive_proof_verifier::Error::RequestError {
+            error: format!(
+                "GetDocumentsRequest wire version V{feature_version} is outside the \
+                 document_query feature-version bounds {}..={} served at platform version \
+                 {}; the server answers such a request with UnsupportedQueryVersion, so no \
+                 proved response can belong to it",
+                bounds.min_version, bounds.max_version, platform_version.protocol_version
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Reject the request shapes that can never have produced the proved
 /// plain-document response being verified.
 ///
@@ -748,6 +789,17 @@ fn reject_request_the_server_would_not_have_proved(
 /// front, mirroring the server's own gates in
 /// `rs-drive-abci`'s `validate_and_route` /
 /// `reject_offset_off_the_ranked_path`.
+///
+/// The same reasoning covers the request envelope itself: the wire
+/// version (`V0`/`V1` oneof arm) is checked against
+/// `platform_version.drive_abci.query.document_query`'s bounds before
+/// anything is decoded — the server's `query_documents` dispatch
+/// refuses an out-of-bounds wire version with
+/// `UnsupportedQueryVersion`, so a proof can never belong to one — and
+/// the query limit is capped at the server's
+/// [`DEFAULT_QUERY_LIMIT`] during the `DriveDocumentQuery` lowering,
+/// exactly as `DriveDocumentQuery::from_typed_clauses` caps it
+/// server-side.
 pub fn verify_documents_response(
     request: GetDocumentsRequest,
     contract: Arc<DataContract>,
@@ -756,6 +808,10 @@ pub fn verify_documents_response(
     platform_version: &PlatformVersion,
     provider: &dyn ContextProvider,
 ) -> Result<(Option<Documents>, ResponseMetadata, Proof), drive_proof_verifier::Error> {
+    // First gate, mirroring the server's own dispatch order: a wire
+    // version the supplied platform version's server refuses to serve
+    // is rejected before any decoding or proof machinery.
+    check_wire_version_is_served(&request, platform_version)?;
     // `prove` does not survive decoding (a `DocumentQuery` has no such
     // field), so read it off the wire request before it is consumed.
     let prove = match &request.version {
@@ -791,6 +847,11 @@ pub fn verify_documents_response_with_provider_contract(
     platform_version: &PlatformVersion,
     provider: &dyn ContextProvider,
 ) -> Result<(Option<Documents>, ResponseMetadata, Proof), drive_proof_verifier::Error> {
+    // Same first gate as `verify_documents_response`, run here as well
+    // so an out-of-bounds wire version is rejected before the provider
+    // is asked for anything (the contract lookup below is already
+    // context-provider machinery).
+    check_wire_version_is_served(&request, platform_version)?;
     let contract_id_bytes = match &request.version {
         Some(V0(v0)) => v0.data_contract_id.as_slice(),
         Some(V1(v1)) => v1.data_contract_id.as_slice(),
@@ -1225,23 +1286,28 @@ impl<'a> TryFrom<&'a DocumentQuery> for DriveDocumentQuery<'a> {
         )
         .map_err(Error::Drive)?;
 
-        // `DriveDocumentQuery`'s limit is a `u16`; the wire's is a `u32`.
-        // The server refuses anything above `u16::MAX` outright
-        // (`QuerySyntaxError::InvalidLimit`), so a checked conversion is
-        // what actually mirrors it — an `as` cast would wrap 65537 to a
-        // 1-document query and verify a proof for a query nobody asked
-        // for. `0` keeps its "unset → server default" sentinel meaning.
-        let limit = if request.limit != 0 {
-            Some(u16::try_from(request.limit).map_err(|_| {
-                Error::Config(format!(
-                    "limit {} does not fit a documents query's u16 limit (max {}); \
-                     the server rejects such limits with InvalidLimit",
-                    request.limit,
-                    u16::MAX
-                ))
-            })?)
-        } else {
-            None
+        // Mirror the limit contract of the server's
+        // `DriveDocumentQuery::from_typed_clauses` exactly: `0` (this
+        // struct's "unset" sentinel — V0's `limit: 0`, V1's
+        // `limit: None`) falls back to the server default, and anything
+        // above `DEFAULT_QUERY_LIMIT` (the `config.default_query_limit`
+        // every deployed server runs with) is refused with the server's
+        // own `QuerySyntaxError::InvalidLimit` rather than truncated or
+        // passed through. A `u16::try_from` alone would not do: limits
+        // 101..=65535 fit a `u16` but the server refuses them, so a raw
+        // `DriveDocumentQuery` carrying one would verify a proof no
+        // honest server could have produced.
+        let limit = match request.limit {
+            0 => None,
+            limit if limit > u32::from(DEFAULT_QUERY_LIMIT) => {
+                return Err(Error::Drive(drive::error::Error::Query(
+                    drive::error::query::QuerySyntaxError::InvalidLimit(format!(
+                        "limit {} greater than max limit {}",
+                        limit, DEFAULT_QUERY_LIMIT
+                    )),
+                )));
+            }
+            limit => Some(limit as u16),
         };
 
         let (start_at, start_at_included) = match request.start.as_ref() {

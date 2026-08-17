@@ -294,11 +294,11 @@ fn rejects_contract_mismatch() {
 
 /// A `u32` wire limit above `u16::MAX` must be refused, not wrapped.
 ///
-/// `DriveDocumentQuery`'s limit is a `u16`; the server rejects anything
-/// larger with `InvalidLimit` and so never proves such a query. An `as`
-/// cast would silently turn a request for 65537 documents into a
-/// 1-document query, and a proof for *that* query would then verify —
-/// binding the proof to something the caller never asked for.
+/// The server rejects anything above its query limit cap with
+/// `InvalidLimit` and so never proves such a query. An `as` cast would
+/// silently turn a request for 65537 documents into a 1-document
+/// query, and a proof for *that* query would then verify — binding the
+/// proof to something the caller never asked for.
 #[test]
 fn limit_above_u16_max_is_rejected_not_truncated() {
     let contract = test_contract();
@@ -312,6 +312,39 @@ fn limit_above_u16_max_is_rejected_not_truncated() {
         error.to_string().contains("65537"),
         "unexpected error: {error}"
     );
+}
+
+/// The lowering mirrors `DriveDocumentQuery::from_typed_clauses`'
+/// limit contract exactly: `0` = unset → server default (`None`
+/// here), `1..=DEFAULT_QUERY_LIMIT` passes through, and anything
+/// above the cap — including 101..=65535, which fits a `u16` but is
+/// server-invalid — is refused with the server's `InvalidLimit`.
+#[test]
+fn limit_cap_mirrors_the_server() {
+    let contract = test_contract();
+    let query = |limit: u32| {
+        DocumentQuery::new(Arc::clone(&contract), "niceDocument")
+            .expect("document type exists")
+            .with_limit(limit)
+    };
+
+    let unset_query = query(0);
+    let unset = DriveDocumentQuery::try_from(&unset_query).expect("limit 0 is the unset sentinel");
+    assert_eq!(unset.limit, None, "0 must lower to the server default");
+
+    let at_cap_query = query(100);
+    let at_cap =
+        DriveDocumentQuery::try_from(&at_cap_query).expect("the server serves limits up to 100");
+    assert_eq!(at_cap.limit, Some(100));
+
+    for limit in [101u32, 65_535, 65_537, u32::MAX] {
+        let error = DriveDocumentQuery::try_from(&query(limit))
+            .expect_err("a limit the server refuses must not reach a DriveDocumentQuery");
+        assert!(
+            error.to_string().contains("greater than max limit 100"),
+            "unexpected error for limit {limit}: {error}"
+        );
+    }
 }
 
 /// Request-shape checks in [`verify_documents_response`].
@@ -369,9 +402,11 @@ mod verify_binds_the_whole_request {
     }
 
     /// Encode `query` onto the V1 wire, let `mutate` reshape the request
-    /// the way a hostile transport could, and return the rejection.
-    fn verify_error(
+    /// the way a hostile transport could, and return the rejection
+    /// produced when verifying against `verify_at`.
+    fn verify_error_at_version(
         query: DocumentQuery,
+        verify_at: &PlatformVersion,
         mutate: impl FnOnce(&mut GetDocumentsRequest),
     ) -> drive_proof_verifier::Error {
         let contract = Arc::clone(&query.data_contract);
@@ -385,10 +420,18 @@ mod verify_binds_the_whole_request {
             contract,
             GetDocumentsResponse::default(),
             Network::Testnet,
-            PlatformVersion::latest(),
+            verify_at,
             &NeverCalledProvider,
         )
         .expect_err("the reshaped request must be rejected")
+    }
+
+    /// [`verify_error_at_version`] against the latest platform version.
+    fn verify_error(
+        query: DocumentQuery,
+        mutate: impl FnOnce(&mut GetDocumentsRequest),
+    ) -> drive_proof_verifier::Error {
+        verify_error_at_version(query, PlatformVersion::latest(), mutate)
     }
 
     fn documents_query() -> DocumentQuery {
@@ -466,5 +509,67 @@ mod verify_binds_the_whole_request {
             error.to_string().contains("plain document fetches"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A V1 wire request verified against a platform version whose
+    /// `document_query` bounds are `0..=0` (protocol version 1) must
+    /// be refused before anything else runs — the server's
+    /// `query_documents` dispatch answers it with
+    /// `UnsupportedQueryVersion` and never proves it. The panicking
+    /// provider pins that the rejection precedes all proof machinery.
+    #[test]
+    fn rejects_wire_version_outside_platform_version_bounds() {
+        let error = verify_error_at_version(documents_query(), v0_platform_version(), |_| {});
+        assert!(
+            error
+                .to_string()
+                .contains("wire version V1 is outside the document_query feature-version bounds"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Same wire-version gate on the provider-resolved entry point:
+    /// the rejection must land before the contract lookup, which is
+    /// already context-provider machinery (the provider here panics on
+    /// `get_data_contract`).
+    #[test]
+    fn rejects_wire_version_before_provider_contract_lookup() {
+        use dash_platform_queries::documents::document_query::verify_documents_response_with_provider_contract;
+
+        let request = documents_query()
+            .try_into_request_for_version(v1_platform_version())
+            .expect("query should encode onto the wire");
+
+        let error = verify_documents_response_with_provider_contract(
+            request,
+            GetDocumentsResponse::default(),
+            Network::Testnet,
+            v0_platform_version(),
+            &NeverCalledProvider,
+        )
+        .expect_err("an out-of-bounds wire version must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("wire version V1 is outside the document_query feature-version bounds"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Limits in `101..=65535` fit the wire's `u32` (and a `u16`) but
+    /// the server refuses them with `InvalidLimit`
+    /// (`DriveDocumentQuery::from_typed_clauses` caps at
+    /// `DEFAULT_QUERY_LIMIT` = 100), so no proved response can belong
+    /// to such a request. The panicking provider pins that the
+    /// rejection precedes all proof machinery.
+    #[test]
+    fn rejects_limit_above_server_cap() {
+        for limit in [101u32, 65_535, u32::MAX] {
+            let error = verify_error(documents_query().with_limit(limit), |_| {});
+            assert!(
+                error.to_string().contains("greater than max limit 100"),
+                "unexpected error for limit {limit}: {error}"
+            );
+        }
     }
 }
