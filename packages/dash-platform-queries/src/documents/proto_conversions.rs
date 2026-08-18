@@ -72,7 +72,7 @@ pub enum DecodeError {
 /// garbage (no future protocol value would map a malformed integer
 /// to a valid behavior), so they surface as
 /// [`DecodeError::InvalidArgument`].
-pub fn where_operator_from_proto(op: i32) -> Result<WhereOperator, DecodeError> {
+pub(crate) fn where_operator_from_proto(op: i32) -> Result<WhereOperator, DecodeError> {
     let proto_op = ProtoWhereOperator::try_from(op).map_err(|_| {
         DecodeError::InvalidArgument(format!(
             "unknown WhereOperator discriminant: {} (valid values: 0..=10, see \
@@ -108,7 +108,7 @@ pub fn where_operator_from_proto(op: i32) -> Result<WhereOperator, DecodeError> 
 /// operand is always concrete; empty where-clauses are expressed
 /// by an empty `where_clauses` field at the request level, not by
 /// sending an empty `DocumentFieldValue`.
-pub fn value_from_proto(value: ProtoDocumentFieldValue) -> Result<Value, DecodeError> {
+pub(crate) fn value_from_proto(value: ProtoDocumentFieldValue) -> Result<Value, DecodeError> {
     value_from_proto_at_depth(value, 0)
 }
 
@@ -162,7 +162,9 @@ fn value_from_proto_at_depth(
 /// [`WhereClause`]. Errors surface as
 /// [`DecodeError::InvalidArgument`] for both operator-discriminant
 /// and value-shape failures.
-pub fn where_clause_from_proto(clause: ProtoWhereClause) -> Result<WhereClause, DecodeError> {
+pub(crate) fn where_clause_from_proto(
+    clause: ProtoWhereClause,
+) -> Result<WhereClause, DecodeError> {
     let operator = where_operator_from_proto(clause.operator)?;
     let value = clause.value.ok_or_else(|| {
         DecodeError::InvalidArgument(format!(
@@ -179,7 +181,7 @@ pub fn where_clause_from_proto(clause: ProtoWhereClause) -> Result<WhereClause, 
     })
 }
 
-/// Plural form of [`where_clause_from_proto`] for the request-level
+/// Plural form of `where_clause_from_proto` for the request-level
 /// `repeated WhereClause` field. Returns an error on the first
 /// malformed clause.
 pub fn where_clauses_from_proto(
@@ -195,7 +197,9 @@ pub fn where_clauses_from_proto(
 /// (aggregate function applied to a field — wire-only, rejected
 /// with [`DecodeError::Unsupported`]). Unset (`None`) is rejected
 /// as malformed wire input.
-pub fn order_clause_from_proto(clause: ProtoOrderClause) -> Result<OrderClause, DecodeError> {
+pub(crate) fn order_clause_from_proto(
+    clause: ProtoOrderClause,
+) -> Result<OrderClause, DecodeError> {
     let ascending = clause.ascending;
     match clause.target {
         Some(order_clause::Target::Field(field)) => Ok(OrderClause { field, ascending }),
@@ -211,7 +215,7 @@ pub fn order_clause_from_proto(clause: ProtoOrderClause) -> Result<OrderClause, 
     }
 }
 
-/// Plural form of [`order_clause_from_proto`] for the request-level
+/// Plural form of `order_clause_from_proto` for the request-level
 /// `repeated OrderClause` field. Returns the first error
 /// encountered.
 pub fn order_clauses_from_proto(
@@ -295,7 +299,9 @@ fn having_aggregate_from_proto(
 /// SQL's own ordering surface — `ORDER BY <the selected aggregate> DESC
 /// LIMIT n [OFFSET m]` — which arrives as an `OrderClause` and never
 /// reaches here.
-pub fn having_clause_from_proto(clause: ProtoHavingClause) -> Result<HavingClause, DecodeError> {
+pub(crate) fn having_clause_from_proto(
+    clause: ProtoHavingClause,
+) -> Result<HavingClause, DecodeError> {
     let aggregate = clause.aggregate.ok_or_else(|| {
         DecodeError::InvalidArgument(
             "HavingClause has no aggregate set; every clause must carry an \
@@ -322,7 +328,7 @@ pub fn having_clause_from_proto(clause: ProtoHavingClause) -> Result<HavingClaus
     })
 }
 
-/// Plural form of [`having_clause_from_proto`] for the request-
+/// Plural form of `having_clause_from_proto` for the request-
 /// level `repeated HavingClause` field. Returns an error on the
 /// first malformed clause.
 pub fn having_clauses_from_proto(
