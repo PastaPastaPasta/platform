@@ -38,6 +38,32 @@ fn hash_double(data: Vec<u8>) -> [u8; 32] {
 /// [homograph-safe](convert_to_homograph_safe_chars) form is stored in
 /// `normalizedLabel`.
 ///
+/// # Salt secrecy and reveal order
+///
+/// The preorder/domain split is DPNS's front-running protection: the
+/// preorder commits to `saltedDomainHash` without revealing which name
+/// is being registered, and only the later domain document discloses
+/// the `label` and the `preorderSalt` that tie it to the commitment.
+/// That protection holds only if the caller upholds what the networked
+/// SDK (`dash-sdk`'s `register_dpns_name`) does automatically:
+///
+/// - generate a **fresh 32-byte salt from a CSPRNG** for every
+///   registration attempt (the SDK draws it from
+///   `StdRng::from_entropy()`). A reused or predictable salt lets an
+///   observer precompute `sha256d(salt ‖ "<candidate>.dash")` for
+///   candidate labels and identify — then front-run — the name from
+///   the preorder alone;
+/// - keep the salt, the label, and the assembled domain document
+///   **private until the preorder create transition is confirmed**
+///   (the SDK submits the preorder and waits for its response before
+///   broadcasting the domain document). Revealing them earlier
+///   discloses the name while it is still unclaimed, defeating the
+///   commitment.
+///
+/// Embedders driving their own transport inherit both obligations —
+/// this builder takes `salt` as an argument precisely because it has
+/// no randomness of its own and cannot enforce either one.
+///
 /// Returns `(preorder_document, domain_document)`.
 pub fn build_dpns_preorder_and_domain_documents(
     contract: &DataContract,
