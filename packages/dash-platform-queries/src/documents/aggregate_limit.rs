@@ -86,3 +86,55 @@ pub(crate) fn carrier_walk_limit(limit: u32) -> Option<u16> {
         Some(limit as u16)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cap is inclusive at `DEFAULT_MAX_QUERY_LIMIT`, exclusive
+    /// one past it, and the `0` sentinel always passes (its meaning
+    /// is resolved per walk shape) — the same acceptance set as the
+    /// server dispatchers' `> max_query_limit` rejection.
+    #[test]
+    fn cap_boundaries() {
+        assert!(check_within_server_cap(0, "TEST").is_ok());
+        assert!(check_within_server_cap(1, "TEST").is_ok());
+        assert!(check_within_server_cap(u32::from(DEFAULT_MAX_QUERY_LIMIT), "TEST").is_ok());
+
+        let error = check_within_server_cap(u32::from(DEFAULT_MAX_QUERY_LIMIT) + 1, "TEST")
+            .expect_err("one past the cap must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the server's max_query_limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Distinct walks translate the `0` sentinel to
+    /// `DEFAULT_QUERY_LIMIT`, mirroring the server's
+    /// `limit.unwrap_or(DEFAULT_QUERY_LIMIT)`; in-range values pass
+    /// through untouched.
+    #[test]
+    fn distinct_walk_sentinel_translation() {
+        assert_eq!(distinct_walk_limit(0), DEFAULT_QUERY_LIMIT);
+        assert_eq!(distinct_walk_limit(1), 1);
+        assert_eq!(
+            distinct_walk_limit(u32::from(DEFAULT_MAX_QUERY_LIMIT)),
+            DEFAULT_MAX_QUERY_LIMIT
+        );
+    }
+
+    /// Carrier walks keep the `0` sentinel as `None` (unbounded
+    /// outer walk), mirroring the server keeping an unset request
+    /// limit as `None`; in-range values pass through untouched.
+    #[test]
+    fn carrier_walk_sentinel_translation() {
+        assert_eq!(carrier_walk_limit(0), None);
+        assert_eq!(carrier_walk_limit(1), Some(1));
+        assert_eq!(
+            carrier_walk_limit(u32::from(DEFAULT_MAX_QUERY_LIMIT)),
+            Some(DEFAULT_MAX_QUERY_LIMIT)
+        );
+    }
+}
