@@ -87,6 +87,12 @@ pub trait CanRetry {
     /// Returns true if the operation can be retried safely.
     fn can_retry(&self) -> bool;
 
+    /// Returns true if the error was caused by the caller losing local network
+    /// connectivity rather than by the selected remote node failing.
+    fn is_local_connectivity_error(&self) -> bool {
+        false
+    }
+
     /// Returns true if this error represents a "no available addresses" condition.
     ///
     /// When all addresses have been banned due to errors, the client returns this error.

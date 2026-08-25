@@ -147,6 +147,39 @@ impl CanRetry for dapi_grpc::tonic::Status {
         )
     }
 
+    fn is_local_connectivity_error(&self) -> bool {
+        let mut source = std::error::Error::source(self);
+
+        while let Some(error) = source {
+            if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
+                if matches!(
+                    io_error.kind(),
+                    std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::NetworkDown
+                ) {
+                    return true;
+                }
+
+                // DNS lookup errors are not consistently assigned a typed
+                // ErrorKind across supported operating systems.
+                let message = io_error.to_string();
+                if [
+                    "failed to lookup address information",
+                    "nodename nor servname provided",
+                    "Name or service not known",
+                ]
+                .iter()
+                .any(|needle| message.contains(needle))
+                {
+                    return true;
+                }
+            }
+
+            source = error.source();
+        }
+
+        false
+    }
+
     /// Returns the Envoy-advertised ban duration for a `ResourceExhausted`
     /// response, or `None` if this is not a rate-limit or carries no usable
     /// `RateLimit-Reset` header.

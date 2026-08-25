@@ -14,6 +14,10 @@ use std::time::Duration;
 
 const DEFAULT_BASE_BAN_PERIOD: Duration = Duration::from_secs(60);
 
+/// Maximum health-ban window. This is also the ceiling for server-advertised
+/// rate-limit bans; see `dapi_client::MAX_RATE_LIMIT_BAN_SECS`.
+pub(crate) const MAX_BAN_PERIOD_SECS: u64 = 600;
+
 /// DAPI address.
 #[derive(Debug, Clone, Eq)]
 #[cfg_attr(feature = "mocks", derive(serde::Serialize, serde::Deserialize))]
@@ -91,11 +95,12 @@ impl AddressStatus {
     /// Ban the [Address] and record the `reason` for the ban.
     ///
     /// Applies exponential backoff: the ban window is `base × e^ban_count`
-    /// (where `ban_count` is the value *before* this call), and `banned_until`
-    /// is always re-based to `now + window` unconditionally, regardless of any
-    /// existing active ban.  Concretely, a health failure on a node that already
-    /// holds a longer rate-limit window (set via [`AddressStatus::ban_for`]) will
-    /// re-base `banned_until` to the exponential value, which may be shorter.
+    /// (where `ban_count` is the value *before* this call), capped at
+    /// [`MAX_BAN_PERIOD_SECS`]. `banned_until` is always re-based to
+    /// `now + window` unconditionally, regardless of any existing active ban.
+    /// Concretely, a health failure on a node that already holds a longer
+    /// rate-limit window (set via [`AddressStatus::ban_for`]) will re-base
+    /// `banned_until` to the capped exponential value, which may be shorter.
     /// This is intentional: the exponential health-ban ladder owns the window for
     /// genuinely-unhealthy nodes; the no-shorten guarantee is deliberately scoped
     /// to `ban_for → ban_for` sequences only.
@@ -104,7 +109,9 @@ impl AddressStatus {
     /// The counter resets to 0 on [`AddressStatus::unban`].
     pub fn ban_with_reason(&mut self, base_ban_period: &Duration, reason: Option<String>) {
         let coefficient = (self.ban_count as f64).exp();
-        let ban_period = Duration::from_secs_f64(base_ban_period.as_secs_f64() * coefficient);
+        let ban_period_secs =
+            (base_ban_period.as_secs_f64() * coefficient).min(MAX_BAN_PERIOD_SECS as f64);
+        let ban_period = Duration::from_secs_f64(ban_period_secs);
 
         self.banned_until = Some(chrono::Utc::now() + ban_period);
         self.ban_count += 1;
@@ -316,6 +323,25 @@ impl AddressList {
             })
             .choose(&mut rng)
             .map(|(addr, _)| addr.clone())
+    }
+
+    /// Return the banned address whose ban window expires first.
+    ///
+    /// This does not change [`Self::get_live_address`] semantics; callers may
+    /// use it explicitly for a bounded recovery probe when every address is
+    /// currently banned.
+    pub fn get_soonest_banned_address(&self) -> Option<Address> {
+        let guard = self.addresses.read().unwrap();
+
+        guard
+            .iter()
+            .filter_map(|(address, status)| {
+                status
+                    .banned_until
+                    .map(|banned_until| (address, banned_until))
+            })
+            .min_by_key(|(_, banned_until)| *banned_until)
+            .map(|(address, _)| address.clone())
     }
 
     /// Get all not banned addresses.
@@ -692,6 +718,28 @@ mod tests {
     }
 
     #[test]
+    fn test_get_soonest_banned_address() {
+        let empty = AddressList::new();
+        assert!(empty.get_soonest_banned_address().is_none());
+
+        let mut list = AddressList::new();
+        let first: Address = "http://127.0.0.1:3000".parse().unwrap();
+        let soonest: Address = "http://127.0.0.1:3001".parse().unwrap();
+        let last: Address = "http://127.0.0.1:3002".parse().unwrap();
+        list.add(first.clone());
+        list.add(soonest.clone());
+        list.add(last.clone());
+
+        assert!(list.get_soonest_banned_address().is_none());
+
+        list.ban_for(&first, Duration::from_secs(300), None);
+        list.ban_for(&soonest, Duration::from_secs(120), None);
+        list.ban_for(&last, Duration::from_secs(240), None);
+
+        assert_eq!(list.get_soonest_banned_address(), Some(soonest));
+    }
+
+    #[test]
     fn test_address_list_into_iter() {
         let mut list = AddressList::new();
         list.add("http://127.0.0.1:3000".parse().unwrap());
@@ -992,5 +1040,43 @@ mod tests {
                 n + 1
             );
         }
+    }
+
+    #[test]
+    fn test_ban_ladder_is_capped_after_third_exponential_window() {
+        let mut status = AddressStatus::default();
+        let base = Duration::from_secs(60);
+
+        for ban_number in 1..=6 {
+            let before = chrono::Utc::now();
+            status.ban(&base);
+            let after = chrono::Utc::now();
+            let banned_until = status.banned_until.expect("banned_until is set");
+            let lower = (banned_until - before).num_milliseconds() as f64 / 1000.0;
+            let upper = (banned_until - after).num_milliseconds() as f64 / 1000.0;
+            let expected = if ban_number <= 3 {
+                60.0 * ((ban_number - 1) as f64).exp()
+            } else {
+                MAX_BAN_PERIOD_SECS as f64
+            };
+
+            assert!(
+                lower >= expected - 0.05,
+                "ban #{ban_number} window lower {lower}s < expected {expected}s"
+            );
+            assert!(
+                upper <= expected + 0.05,
+                "ban #{ban_number} window upper {upper}s > expected {expected}s"
+            );
+        }
+
+        // The cap is applied before converting from floating-point seconds, so
+        // even an exponent that overflows to infinity cannot panic here.
+        status.ban_count = 10_000;
+        status.ban(&base);
+        let remaining =
+            (status.banned_until.expect("banned_until is set") - chrono::Utc::now()).num_seconds();
+        assert!(remaining <= MAX_BAN_PERIOD_SECS as i64);
+        assert!(remaining >= MAX_BAN_PERIOD_SECS as i64 - 1);
     }
 }

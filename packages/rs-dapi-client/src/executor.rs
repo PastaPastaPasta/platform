@@ -80,6 +80,10 @@ impl<E: CanRetry> CanRetry for ExecutionError<E> {
         self.inner.can_retry()
     }
 
+    fn is_local_connectivity_error(&self) -> bool {
+        self.inner.is_local_connectivity_error()
+    }
+
     fn is_no_available_addresses(&self) -> bool {
         self.inner.is_no_available_addresses()
     }

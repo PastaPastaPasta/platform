@@ -107,6 +107,12 @@ impl CanRetry for TransportError {
         }
     }
 
+    fn is_local_connectivity_error(&self) -> bool {
+        match self {
+            TransportError::Grpc(status) => status.is_local_connectivity_error(),
+        }
+    }
+
     fn rate_limit_ban_duration(&self) -> Option<std::time::Duration> {
         match self {
             TransportError::Grpc(status) => status.rate_limit_ban_duration(),
@@ -159,6 +165,31 @@ pub trait TransportClient: Send + Sized {
 mod tests {
     use super::*;
     use dapi_grpc::tonic::Code;
+    use std::error::Error;
+    use std::fmt::{Display, Formatter};
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+
+    fn status_with_io_error(error: std::io::Error) -> dapi_grpc::tonic::Status {
+        let mut status = dapi_grpc::tonic::Status::unavailable("connect failed");
+        status.set_source(Arc::new(error));
+        status
+    }
+
+    #[derive(Debug)]
+    struct ErrorWrapper(std::io::Error);
+
+    impl Display for ErrorWrapper {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "wrapped connect error")
+        }
+    }
+
+    impl Error for ErrorWrapper {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
 
     #[test]
     fn test_tonic_status_can_retry_retryable_codes() {
@@ -216,6 +247,67 @@ mod tests {
 
         let non_retryable = TransportError::Grpc(dapi_grpc::tonic::Status::not_found("permanent"));
         assert!(!non_retryable.can_retry());
+    }
+
+    #[test]
+    fn test_local_connectivity_error_classification() {
+        for kind in [ErrorKind::NetworkUnreachable, ErrorKind::NetworkDown] {
+            let error =
+                TransportError::Grpc(status_with_io_error(std::io::Error::new(kind, "offline")));
+            assert!(
+                error.is_local_connectivity_error(),
+                "{kind:?} should be classified as a local connectivity error"
+            );
+        }
+
+        for message in [
+            "failed to lookup address information",
+            "nodename nor servname provided",
+            "Name or service not known",
+        ] {
+            let error = TransportError::Grpc(status_with_io_error(std::io::Error::other(message)));
+            assert!(
+                error.is_local_connectivity_error(),
+                "DNS error '{message}' should be classified as local"
+            );
+        }
+
+        let mut nested = dapi_grpc::tonic::Status::unavailable("connect failed");
+        nested.set_source(Arc::new(ErrorWrapper(std::io::Error::new(
+            ErrorKind::NetworkUnreachable,
+            "offline",
+        ))));
+        assert!(TransportError::Grpc(nested).is_local_connectivity_error());
+    }
+
+    #[test]
+    fn test_non_local_connectivity_errors_are_not_classified_as_local() {
+        for kind in [ErrorKind::HostUnreachable, ErrorKind::ConnectionRefused] {
+            let error = TransportError::Grpc(status_with_io_error(std::io::Error::new(
+                kind,
+                "node-specific failure",
+            )));
+            assert!(
+                !error.is_local_connectivity_error(),
+                "{kind:?} should remain attributable to the selected node"
+            );
+        }
+
+        let sourceless = TransportError::Grpc(dapi_grpc::tonic::Status::unavailable("down"));
+        assert!(!sourceless.is_local_connectivity_error());
+
+        let deadline = TransportError::Grpc(dapi_grpc::tonic::Status::deadline_exceeded("timeout"));
+        assert!(!deadline.is_local_connectivity_error());
+    }
+
+    #[test]
+    fn test_transport_error_clone_drops_local_connectivity_source() {
+        let original = TransportError::Grpc(status_with_io_error(std::io::Error::new(
+            ErrorKind::NetworkUnreachable,
+            "offline",
+        )));
+        assert!(original.is_local_connectivity_error());
+        assert!(!original.clone().is_local_connectivity_error());
     }
 
     /// `rate_limit_ban_duration` returns `Some` only for `ResourceExhausted` with

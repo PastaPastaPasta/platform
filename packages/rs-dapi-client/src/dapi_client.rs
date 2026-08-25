@@ -26,8 +26,9 @@ use crate::{
 pub(crate) const MIN_RATE_LIMIT_BAN_SECS: u64 = 1;
 /// Ceiling for the Envoy-advertised `RateLimit-Reset` ban duration.
 /// Prevents a misconfigured or hostile header from parking a healthy node for
-/// an unreasonably long time.
-pub(crate) const MAX_RATE_LIMIT_BAN_SECS: u64 = 600;
+/// an unreasonably long time. Shared with the health-ban ladder; see
+/// `address_list::MAX_BAN_PERIOD_SECS`.
+pub(crate) const MAX_RATE_LIMIT_BAN_SECS: u64 = crate::address_list::MAX_BAN_PERIOD_SECS;
 
 /// General DAPI request error type.
 #[derive(Debug, thiserror::Error, Clone)]
@@ -69,6 +70,18 @@ impl CanRetry for DapiClientError {
             AddressList(_) => false,
             #[cfg(feature = "mocks")]
             Mock(_) => false,
+        }
+    }
+
+    fn is_local_connectivity_error(&self) -> bool {
+        match self {
+            DapiClientError::Transport(transport_error) => {
+                transport_error.is_local_connectivity_error()
+            }
+            DapiClientError::NoAvailableAddressesToRetry(transport_error) => {
+                transport_error.is_local_connectivity_error()
+            }
+            _ => false,
         }
     }
 
@@ -203,6 +216,14 @@ pub fn update_address_ban_status<R, E>(
         }
         Err(error) => {
             if error.can_retry() {
+                if error.is_local_connectivity_error() {
+                    tracing::debug!(
+                        ?error,
+                        "not banning DAPI address because the local device is offline"
+                    );
+                    return;
+                }
+
                 if let Some(address) = error.address.as_ref() {
                     if applied_settings.ban_failed_address {
                         let reason = Some(error.to_string());
@@ -545,6 +566,52 @@ mod tests {
     }
 
     #[test]
+    fn test_update_address_ban_status_local_connectivity_error_does_not_ban() {
+        use std::sync::Arc;
+
+        let mut address_list = AddressList::new();
+        let addr = mock_address();
+        address_list.add(addr.clone());
+
+        let mut status = dapi_grpc::tonic::Status::unavailable("connect failed");
+        status.set_source(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::NetworkUnreachable,
+            "offline",
+        )));
+        let result: ExecutionResult<i32, DapiClientError> = Err(ExecutionError {
+            inner: DapiClientError::Transport(TransportError::Grpc(status)),
+            retries: 0,
+            address: Some(addr.clone()),
+        });
+
+        update_address_ban_status(&address_list, &result, &make_applied_settings(true));
+        assert!(!address_list.is_banned(&addr));
+    }
+
+    #[test]
+    fn test_update_address_ban_status_host_unreachable_still_bans() {
+        use std::sync::Arc;
+
+        let mut address_list = AddressList::new();
+        let addr = mock_address();
+        address_list.add(addr.clone());
+
+        let mut status = dapi_grpc::tonic::Status::unavailable("connect failed");
+        status.set_source(Arc::new(std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            "host unreachable",
+        )));
+        let result: ExecutionResult<i32, DapiClientError> = Err(ExecutionError {
+            inner: DapiClientError::Transport(TransportError::Grpc(status)),
+            retries: 0,
+            address: Some(addr.clone()),
+        });
+
+        update_address_ban_status(&address_list, &result, &make_applied_settings(true));
+        assert!(address_list.is_banned(&addr));
+    }
+
+    #[test]
     fn test_update_address_ban_status_retryable_error_ban_disabled() {
         let mut address_list = AddressList::new();
         let addr = mock_address();
@@ -745,7 +812,18 @@ impl DapiRequestExecutor for DapiClient {
         let result: ExecutionResult<R::Response, DapiClientError> = async {
             loop {
                 // Try to get an address to initialize transport on:
-                let Some(address) = self.address_list.get_live_address() else {
+                // Probe one previously-banned address only when this call has
+                // not attempted a request yet. A successful probe unbans the
+                // address through the normal success path below.
+                let address = match self.address_list.get_live_address() {
+                    Some(address) => Some(address),
+                    None if last_transport_error.is_none() => {
+                        self.address_list.get_soonest_banned_address()
+                    }
+                    None => None,
+                };
+
+                let Some(address) = address else {
                     // No available addresses - wrap with last meaningful error if we have one
                     let error = if let Some(transport_error) = last_transport_error.take() {
                         tracing::debug!(
@@ -794,26 +872,34 @@ impl DapiRequestExecutor for DapiClient {
                 let mut transport_client = match transport_client_result {
                     Ok(client) => client,
                     Err(transport_error) => {
-                        let can_retry_error = transport_error.can_retry();
-
-                        // Clone error before moving it
-                        let cloned_error = transport_error.clone();
-
                         let execution_error = ExecutionError {
                             inner: DapiClientError::Transport(transport_error),
                             retries,
                             address: Some(address.clone()),
                         };
+                        let execution_result: ExecutionResult<R::Response, DapiClientError> =
+                            Err(execution_error);
 
                         update_address_ban_status::<R::Response, DapiClientError>(
                             &self.address_list,
-                            &Err(execution_error.clone()),
+                            &execution_result,
                             &applied_settings,
                         );
 
+                        let Err(execution_error) = execution_result else {
+                            unreachable!("transport client construction returned an error")
+                        };
+                        let can_retry_error = execution_error.can_retry();
+
                         if can_retry_error && retries < max_retries {
-                            // Store last transport error
-                            last_transport_error = Some(cloned_error);
+                            if let DapiClientError::Transport(ref transport_error) =
+                                execution_error.inner
+                            {
+                                // Cloning drops the Status source chain, but local
+                                // connectivity classification already ran above;
+                                // this copy only supplies the final error message.
+                                last_transport_error = Some(transport_error.clone());
+                            }
 
                             retries += 1;
                             tracing::warn!(
@@ -871,6 +957,9 @@ impl DapiRequestExecutor for DapiClient {
                         if error.can_retry() && retries < max_retries {
                             // Store last transport error
                             if let DapiClientError::Transport(ref te) = error.inner {
+                                // Cloning drops the Status source chain, but local
+                                // connectivity classification already ran above;
+                                // this copy only supplies the final error message.
                                 last_transport_error = Some(te.clone());
                             }
 
