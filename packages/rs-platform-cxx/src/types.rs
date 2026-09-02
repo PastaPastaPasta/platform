@@ -96,6 +96,69 @@ pub struct Meta {
     pub chain_id: String,
 }
 
+/// One public key an `IdentityUpdateTransition` asks to add, as parsed from
+/// a dApp-supplied payload. `contract_bounds_kind`: 0 = none,
+/// 1 = single contract, 2 = single contract + document type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityKeyToAdd {
+    pub id: u32,
+    pub key_type: u8,
+    pub purpose: u8,
+    pub security_level: u8,
+    pub read_only: bool,
+    /// Key data: 33-byte compressed pubkey for ECDSA_SECP256K1, 20-byte
+    /// hash for ECDSA_HASH160.
+    pub data: Vec<u8>,
+    pub contract_bounds_kind: u8,
+    pub contract_bounds_id: [u8; 32],
+    pub contract_bounds_document_type: String,
+}
+
+/// Inspectable fields of a parsed `IdentityUpdateTransition`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedIdentityUpdate {
+    pub identity_id: [u8; 32],
+    pub revision: u64,
+    pub nonce: u64,
+    pub add_public_keys: Vec<IdentityKeyToAdd>,
+    pub disable_public_key_ids: Vec<u32>,
+    /// Whatever the producer left in the outer signature slot (dApps leave 0).
+    pub signature_public_key_id: u32,
+}
+
+/// Inspectable fields of a `BatchTransition` carrying exactly one
+/// `TokenDirectPurchase`: everything the rebuild needs plus what the user
+/// must see (the identity that will be charged and the total price).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTokenPurchase {
+    pub owner_id: [u8; 32],
+    pub data_contract_id: [u8; 32],
+    pub token_id: [u8; 32],
+    pub token_contract_position: u16,
+    pub token_count: u64,
+    /// Credits the owner would agree to pay in total.
+    pub total_agreed_price: u64,
+    pub identity_contract_nonce: u64,
+}
+
+/// A parsed dApp-supplied state transition, discriminated by kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParsedStateTransition {
+    IdentityUpdate(ParsedIdentityUpdate),
+    TokenDirectPurchase(ParsedTokenPurchase),
+}
+
+/// Header of a stored document decoded against a known contract:
+/// identifiers, revision and the property map re-encoded as canonical CBOR
+/// so the embedder can read it without a DPP dependency.
+#[derive(Debug, Clone, Default)]
+pub struct StoredDocument {
+    pub document_id: [u8; 32],
+    pub owner_id: [u8; 32],
+    pub revision: u64,
+    pub properties_cbor: Vec<u8>,
+}
+
 /// A built, signed state transition.
 #[derive(Debug, Clone)]
 pub struct BuiltTransition {

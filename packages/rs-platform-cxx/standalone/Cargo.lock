@@ -686,6 +686,7 @@ name = "dash-platform-cxx"
 version = "4.2.0-dev.1"
 dependencies = [
  "async-trait",
+ "ciborium",
  "cxx",
  "cxx-build",
  "dapi-grpc",

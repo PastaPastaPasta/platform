@@ -166,3 +166,34 @@ pub fn decode_contact_request(doc_bytes: &[u8]) -> Result<ContactRequest, String
         created_at: document.created_at().unwrap_or(0),
     })
 }
+
+/// Decodes a stored document of `document_type_name` against any contract
+/// known to the provider, returning its header and the property map as
+/// canonical CBOR (identifiers and byte fields as CBOR byte strings) so the
+/// embedder can read it without a DPP dependency.
+pub fn decode_stored_document(
+    contract_id: &[u8],
+    document_type_name: &str,
+    doc_bytes: &[u8],
+) -> Result<crate::types::StoredDocument, String> {
+    use dpp::document::serialization_traits::DocumentPlatformConversionMethodsV0;
+    let contract_id =
+        dpp::prelude::Identifier::from(crate::types::id32(contract_id, "contract id")?);
+    let contract = crate::provider::known_data_contract(&contract_id)?
+        .ok_or("document decode against a contract that was never fetched (getDataContract)")?;
+    let version = PlatformVersion::latest();
+    let document_type = contract
+        .document_type_for_name(document_type_name)
+        .map_err(|e| format!("unknown document type {document_type_name}: {e}"))?;
+    let document = Document::from_bytes(doc_bytes, document_type, version)
+        .map_err(|e| format!("bad {document_type_name} document: {e}"))?;
+    let properties_cbor = Value::from(document.properties())
+        .to_cbor_buffer()
+        .map_err(|e| format!("unable to encode document properties: {e}"))?;
+    Ok(crate::types::StoredDocument {
+        document_id: document.id().to_buffer(),
+        owner_id: document.owner_id().to_buffer(),
+        revision: document.revision().unwrap_or(0),
+        properties_cbor,
+    })
+}

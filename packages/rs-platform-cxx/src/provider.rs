@@ -41,7 +41,8 @@ struct State {
     /// Core height at which Platform activated (mn_rr). Embedders that do not
     /// use queries requiring this value may set it to 0.
     platform_activation_height: CoreBlockHeight,
-    /// Lazily loaded pinned system contracts (DPNS, DashPay).
+    /// Lazily loaded pinned system contracts (DPNS, DashPay) plus any
+    /// contracts the embedder registered after proof-verifying them.
     contracts: HashMap<Identifier, Arc<DataContract>>,
 }
 
@@ -95,6 +96,22 @@ pub fn set_context(network_id: &str, platform_activation_height: u32) -> Result<
     state.network = Some(network);
     state.platform_activation_height = platform_activation_height;
     Ok(())
+}
+
+/// Makes `contract` resolvable to FromProof verification and the document
+/// builders. Embedders register contracts they fetched (and proof-verified)
+/// through `verify_get_data_contract`; the pinned system contracts never
+/// need registering.
+pub fn register_data_contract(contract: DataContract) {
+    let mut state = provider().state.write().expect("provider lock poisoned");
+    state.contracts.insert(contract.id(), Arc::new(contract));
+}
+
+/// A registered or pinned contract, if known locally.
+pub fn known_data_contract(id: &Identifier) -> Result<Option<Arc<DataContract>>, String> {
+    provider()
+        .get_data_contract(id, PlatformVersion::latest())
+        .map_err(|e| format!("unable to resolve data contract: {e}"))
 }
 
 /// The network set via `set_context`.

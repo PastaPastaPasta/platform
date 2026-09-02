@@ -27,8 +27,8 @@ use crate::types::{ContestedVoteState, KeyInfo};
 use dapi_grpc::platform::v0::get_documents_request::Version as GetDocumentsVersion;
 use dapi_grpc::platform::v0::{
     GetContestedResourceVoteStateRequest, GetContestedResourceVoteStateResponse,
-    GetDocumentsRequest, GetDocumentsResponse, GetIdentityBalanceRequest,
-    GetIdentityBalanceResponse, GetIdentityByPublicKeyHashRequest,
+    GetDataContractRequest, GetDataContractResponse, GetDocumentsRequest, GetDocumentsResponse,
+    GetIdentityBalanceRequest, GetIdentityBalanceResponse, GetIdentityByPublicKeyHashRequest,
     GetIdentityByPublicKeyHashResponse, GetIdentityContractNonceRequest,
     GetIdentityContractNonceResponse, GetIdentityKeysRequest, GetIdentityKeysResponse,
     GetIdentityNonceRequest, GetIdentityNonceResponse, GetIdentityRequest, GetIdentityResponse,
@@ -38,6 +38,7 @@ use dapi_grpc::platform::VersionedGrpcResponse;
 use dash_context_provider::ContextProvider as _;
 use dash_platform_queries::documents::document_query::verify_documents_response;
 use dpp::data_contract::accessors::v0::DataContractV0Getters;
+use dpp::data_contract::DataContract;
 use dpp::document::serialization_traits::DocumentPlatformConversionMethodsV0;
 use dpp::identity::Identity;
 use dpp::voting::vote_info_storage::contested_document_vote_poll_winner_info::ContestedDocumentVotePollWinnerInfo as WinnerInfo;
@@ -211,6 +212,32 @@ pub fn verify_get_identity_keys(
     Ok((keys, meta_from(&mtd)))
 }
 
+/// getDataContract: one proof covering the contract's serialized form.
+/// `None` = proven absent. On success the contract is registered with the
+/// provider so later document queries and builders against it resolve.
+pub fn verify_get_data_contract(
+    request: &[u8],
+    response: &[u8],
+) -> Result<(Option<Vec<u8>>, Meta), String> {
+    let request: GetDataContractRequest = decode_message(request, "GetDataContractRequest")?;
+    let response: GetDataContractResponse = decode_message(response, "GetDataContractResponse")?;
+    let version = response_version(&response);
+    let (contract, mtd, _) =
+        <(DataContract, Vec<u8>) as FromProof<GetDataContractRequest>>::maybe_from_proof_with_metadata(
+            request,
+            response,
+            network()?,
+            version,
+            provider(),
+        )
+        .map_err(|e| format!("data contract proof verification failed: {e}"))?;
+    let serialized = contract.map(|(contract, bytes)| {
+        crate::provider::register_data_contract(contract);
+        bytes
+    });
+    Ok((serialized, meta_from(&mtd)))
+}
+
 /// getDocuments: reconstructs the query from the request
 /// (DocumentQuery::try_from_request), verifies the proof, and returns the
 /// matched documents re-serialized in platform form (the input to the
@@ -236,7 +263,7 @@ pub fn verify_get_documents(
     let contract = provider()
         .get_data_contract(&contract_id.into(), version)
         .map_err(|e| format!("unable to resolve data contract: {e}"))?
-        .ok_or("document queries support only the pinned system contracts")?;
+        .ok_or("document query against a contract that was never fetched (getDataContract)")?;
 
     let (documents, mtd, _) = verify_documents_response(
         request,

@@ -621,3 +621,286 @@ pub fn build_identity_create(
     }
     built(&state_transition)
 }
+
+// ---------------------------------------------------------------------------
+// DashConnect: transitions rebuilt from a parsed dApp intent.
+// ---------------------------------------------------------------------------
+
+/// A public key to add through an `IdentityUpdateTransition`. Unlike
+/// [`NewIdentityKey`] the type is explicit: DashConnect registers the app
+/// authentication key as ECDSA_HASH160 (20-byte hash, no ownership proof)
+/// and the encryption key as ECDSA_SECP256K1 (33-byte pubkey, proof signed
+/// through the callback under this key's id).
+pub struct IdentityKeyToRegister {
+    pub id: u32,
+    pub key_type: u8,
+    pub purpose: u8,
+    pub security_level: u8,
+    pub read_only: bool,
+    pub data: Vec<u8>,
+}
+
+/// IdentityUpdateTransition adding `add_keys` and disabling `disable_ids`,
+/// signed with the identity's MASTER key (`master_key`, whose id routes the
+/// outer signature through the callback). Mirrors rs-dpp
+/// `IdentityUpdateTransitionV0::try_from_identity_with_signer`: every
+/// unique-type key proves ownership over the same signable bytes, then the
+/// outer signature is applied with `sign_external`, which also enforces the
+/// MASTER security-level requirement.
+///
+/// `revision` is the identity's revision *after* the update (current + 1)
+/// and `nonce` the next identity nonce, both fetched proof-verified by the
+/// embedder.
+pub fn build_identity_update(
+    identity_id: &[u8],
+    revision: u64,
+    nonce: u64,
+    add_keys: &[IdentityKeyToRegister],
+    disable_ids: &[u32],
+    master_key: &KeyInfo,
+    sign_fn: SignFn<'_>,
+) -> Result<BuiltTransition, String> {
+    use dpp::state_transition::identity_update_transition::v0::IdentityUpdateTransitionV0;
+    use dpp::state_transition::identity_update_transition::IdentityUpdateTransition;
+    use dpp::state_transition::public_key_in_creation::accessors::IdentityPublicKeyInCreationV0Setters;
+    use dpp::state_transition::public_key_in_creation::IdentityPublicKeyInCreation;
+    use dpp::state_transition::GetDataContractSecurityLevelRequirementFn;
+
+    if add_keys.is_empty() && disable_ids.is_empty() {
+        return Err("identity update adds and disables nothing".to_string());
+    }
+    let identity_id = Identifier::from(id32(identity_id, "identity id")?);
+
+    let mut add_public_keys: Vec<IdentityPublicKeyInCreation> = Vec::with_capacity(add_keys.len());
+    for key in add_keys {
+        let key_type = KeyType::try_from(key.key_type)
+            .map_err(|e| format!("identity key {}: bad key type: {e}", key.id))?;
+        let expected_len = match key_type {
+            KeyType::ECDSA_SECP256K1 => COMPRESSED_PUBKEY_SIZE,
+            KeyType::ECDSA_HASH160 => 20,
+            other => {
+                return Err(format!(
+                    "identity key {}: unsupported key type {other:?}",
+                    key.id
+                ))
+            }
+        };
+        if key.data.len() != expected_len {
+            return Err(format!(
+                "identity key {}: unexpected key data size {} (want {expected_len})",
+                key.id,
+                key.data.len()
+            ));
+        }
+        add_public_keys.push(
+            IdentityPublicKeyInCreationV0 {
+                id: key.id,
+                key_type,
+                purpose: Purpose::try_from(key.purpose)
+                    .map_err(|e| format!("identity key {}: bad purpose: {e}", key.id))?,
+                security_level: SecurityLevel::try_from(key.security_level)
+                    .map_err(|e| format!("identity key {}: bad security level: {e}", key.id))?,
+                contract_bounds: None,
+                read_only: key.read_only,
+                data: BinaryData::new(key.data.clone()),
+                signature: Default::default(),
+            }
+            .into(),
+        );
+    }
+
+    let mut transition = IdentityUpdateTransitionV0 {
+        identity_id,
+        revision,
+        nonce,
+        add_public_keys,
+        disable_public_keys: disable_ids.to_vec(),
+        user_fee_increase: 0,
+        signature_public_key_id: 0,
+        signature: Default::default(),
+    };
+
+    // Key ownership proofs cover the signable bytes of the whole transition
+    // (key signatures and the outer signature are excluded from them).
+    let unsigned: StateTransition = IdentityUpdateTransition::from(transition.clone()).into();
+    let signable = unsigned
+        .signable_bytes()
+        .map_err(|e| format!("unable to compute signable bytes: {e}"))?;
+    let digest = hash_double(&signable);
+    for key in transition.add_public_keys.iter_mut() {
+        if !key.key_type().is_unique_key_type() {
+            continue;
+        }
+        let signature = sign_digest(sign_fn, key.id(), digest)
+            .map_err(|e| format!("identity key {}: {e}", key.id()))?;
+        key.set_signature(BinaryData::new(signature));
+    }
+
+    let master = identity_key_from_info(master_key)?;
+    let mut state_transition: StateTransition = IdentityUpdateTransition::from(transition).into();
+    let signer = CallbackSigner { sign_fn };
+    futures::executor::block_on(state_transition.sign_external(
+        &master,
+        &signer,
+        None::<GetDataContractSecurityLevelRequirementFn>,
+    ))
+    .map_err(|e| format!("unable to sign identity update: {e}"))?;
+    built(&state_transition)
+}
+
+/// Batch transition carrying one `TokenDirectPurchase`, signed with `key`
+/// (rs-dpp requires CRITICAL for token transitions; `sign_external`
+/// enforces it). `total_agreed_price` is the credits figure the user saw:
+/// Drive rejects the purchase if the on-chain price disagrees, so the
+/// charged amount cannot diverge from the approved one.
+#[allow(clippy::too_many_arguments)]
+pub fn build_token_direct_purchase(
+    owner_id: &[u8],
+    data_contract_id: &[u8],
+    token_id: &[u8],
+    token_contract_position: u16,
+    token_count: u64,
+    total_agreed_price: u64,
+    identity_contract_nonce: u64,
+    key: &KeyInfo,
+    sign_fn: SignFn<'_>,
+) -> Result<BuiltTransition, String> {
+    use dpp::state_transition::batch_transition::methods::v1::DocumentsBatchTransitionMethodsV1;
+
+    let owner = Identifier::from(id32(owner_id, "owner id")?);
+    let contract = Identifier::from(id32(data_contract_id, "data contract id")?);
+    let token = Identifier::from(id32(token_id, "token id")?);
+    let expected_token =
+        dpp::tokens::calculate_token_id(&contract.to_buffer(), token_contract_position);
+    if token.to_buffer() != expected_token {
+        return Err("token id does not match the contract id and position".to_string());
+    }
+    if token_count == 0 {
+        return Err("token purchase of zero tokens".to_string());
+    }
+    let identity_key = identity_key_from_info(key)?;
+    let signer = CallbackSigner { sign_fn };
+    let state_transition =
+        futures::executor::block_on(BatchTransition::new_token_direct_purchase_transition(
+            token,
+            owner,
+            contract,
+            token_contract_position,
+            token_count,
+            total_agreed_price,
+            &identity_key,
+            identity_contract_nonce,
+            0,
+            &signer,
+            PlatformVersion::latest(),
+            None,
+        ))
+        .map_err(|e| format!("unable to build token purchase transition: {e}"))?;
+    built(&state_transition)
+}
+
+fn properties_from_cbor(properties_cbor: &[u8]) -> Result<BTreeMap<String, Value>, String> {
+    let cbor: ciborium::Value = ciborium::de::from_reader(properties_cbor)
+        .map_err(|e| format!("properties are not valid CBOR: {e}"))?;
+    let value =
+        Value::try_from(cbor).map_err(|e| format!("properties are not a platform value: {e}"))?;
+    value
+        .into_btree_string_map()
+        .map_err(|e| format!("properties are not a string-keyed map: {e}"))
+}
+
+/// Document create against any contract known to the provider (a pinned
+/// system contract or one registered via `verify_get_data_contract`).
+/// `properties_cbor` is a CBOR map of the document's properties; byte
+/// fields may be CBOR byte strings, identifier fields byte strings or
+/// base58 text (the document type sanitizes them).
+#[allow(clippy::too_many_arguments)]
+pub fn build_generic_document_create(
+    contract_id: &[u8],
+    document_type_name: &str,
+    owner_id: &[u8],
+    identity_contract_nonce: u64,
+    properties_cbor: &[u8],
+    entropy: &[u8],
+    key: &KeyInfo,
+    sign_fn: SignFn<'_>,
+) -> Result<BuiltTransition, String> {
+    let contract_id = Identifier::from(id32(contract_id, "contract id")?);
+    let owner = Identifier::from(id32(owner_id, "owner id")?);
+    let entropy = id32(entropy, "entropy")?;
+    let contract = crate::provider::known_data_contract(&contract_id)?
+        .ok_or("document create against a contract that was never fetched (getDataContract)")?;
+    let properties = properties_from_cbor(properties_cbor)?;
+    let document_id =
+        Document::generate_document_id_v0(&contract.id(), &owner, document_type_name, &entropy);
+    let document = Document::V0(DocumentV0 {
+        id: document_id,
+        owner_id: owner,
+        properties,
+        ..Default::default()
+    });
+    build_document_create_transition(
+        &contract,
+        document_type_name,
+        document,
+        identity_contract_nonce,
+        entropy,
+        key,
+        sign_fn,
+    )
+}
+
+/// Document replace against any known contract. `revision` is the new
+/// revision (current + 1); `properties_cbor` holds the full replacement
+/// property map.
+#[allow(clippy::too_many_arguments)]
+pub fn build_generic_document_replace(
+    contract_id: &[u8],
+    document_type_name: &str,
+    document_id: &[u8],
+    owner_id: &[u8],
+    revision: u64,
+    identity_contract_nonce: u64,
+    properties_cbor: &[u8],
+    key: &KeyInfo,
+    sign_fn: SignFn<'_>,
+) -> Result<BuiltTransition, String> {
+    let contract_id = Identifier::from(id32(contract_id, "contract id")?);
+    let contract = crate::provider::known_data_contract(&contract_id)?
+        .ok_or("document replace against a contract that was never fetched (getDataContract)")?;
+    if revision < 2 {
+        return Err("document replace requires revision > 1".to_string());
+    }
+    let version = PlatformVersion::latest();
+    let document_type = contract
+        .document_type_for_name(document_type_name)
+        .map_err(|e| format!("unknown document type {document_type_name}: {e}"))?;
+    let document_type_owned = contract
+        .document_type_cloned_for_name(document_type_name)
+        .map_err(|e| format!("unknown document type {document_type_name}: {e}"))?;
+    let document = Document::V0(DocumentV0 {
+        id: Identifier::from(id32(document_id, "document id")?),
+        owner_id: Identifier::from(id32(owner_id, "owner id")?),
+        properties: properties_from_cbor(properties_cbor)?,
+        revision: Some(revision),
+        ..Default::default()
+    });
+    let document = prepare_document_for_transition(&document, &document_type_owned);
+    let identity_key = identity_key_from_info(key)?;
+    let signer = CallbackSigner { sign_fn };
+    let state_transition = futures::executor::block_on(
+        BatchTransition::new_document_replacement_transition_from_document(
+            document,
+            document_type,
+            &identity_key,
+            identity_contract_nonce,
+            0,
+            None,
+            &signer,
+            version,
+            None,
+        ),
+    )
+    .map_err(|e| format!("unable to build {document_type_name} replace transition: {e}"))?;
+    built(&state_transition)
+}

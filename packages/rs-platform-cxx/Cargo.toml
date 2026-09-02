@@ -28,7 +28,9 @@ dpp = { path = "../rs-dpp", default-features = false, features = [
     "bls-signatures",
     "dpns-contract",
     "dashpay-contract",
+    "platform-value-cbor",
 ] }
+ciborium = "0.2"
 platform-version = { path = "../rs-platform-version" }
 prost = "0.14"
 hex = "0.4"
@@ -45,3 +47,4 @@ default = []
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
+dpp = { path = "../rs-dpp", default-features = false, features = ["factories"] }

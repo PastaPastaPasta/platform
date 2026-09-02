@@ -13,6 +13,7 @@
 //! `dash/platform/signer.h`) so private keys never leave the embedder.
 
 pub mod decode;
+pub mod parse;
 pub mod provider;
 pub mod st;
 pub mod types;
@@ -168,6 +169,72 @@ mod ffi {
         pubkey: Vec<u8>,
     }
 
+    /// Verified optional serialized data contract; `present == false` means
+    /// proven absent. When present, the contract is also registered with the
+    /// provider so document queries and builders against it resolve.
+    struct FfiVerifiedContract {
+        present: bool,
+        bytes: Vec<u8>,
+        meta: FfiMeta,
+    }
+
+    /// Header of a stored document decoded against a known contract. The
+    /// property map is canonical CBOR (identifiers and byte fields as CBOR
+    /// byte strings).
+    struct FfiStoredDocument {
+        document_id: Vec<u8>,
+        owner_id: Vec<u8>,
+        revision: u64,
+        properties_cbor: Vec<u8>,
+    }
+
+    /// One public key an `IdentityUpdateTransition` asks to add.
+    /// `contract_bounds_kind`: 0 = none, 1 = single contract, 2 = single
+    /// contract + document type.
+    #[derive(Clone)]
+    struct FfiIdentityKeyToAdd {
+        id: u32,
+        key_type: u8,
+        purpose: u8,
+        security_level: u8,
+        read_only: bool,
+        data: Vec<u8>,
+        contract_bounds_kind: u8,
+        contract_bounds_id: Vec<u8>,
+        contract_bounds_document_type: String,
+    }
+
+    /// Inspectable fields of a parsed `IdentityUpdateTransition`.
+    struct FfiParsedIdentityUpdate {
+        identity_id: Vec<u8>,
+        revision: u64,
+        nonce: u64,
+        add_public_keys: Vec<FfiIdentityKeyToAdd>,
+        disable_public_key_ids: Vec<u32>,
+    }
+
+    /// Inspectable fields of a batch carrying exactly one
+    /// `TokenDirectPurchase`.
+    struct FfiParsedTokenPurchase {
+        owner_id: Vec<u8>,
+        data_contract_id: Vec<u8>,
+        token_id: Vec<u8>,
+        token_contract_position: u16,
+        token_count: u64,
+        total_agreed_price: u64,
+        identity_contract_nonce: u64,
+    }
+
+    /// A parsed dApp-supplied state transition. `kind`: 1 = identity
+    /// update (`identity_update` populated), 2 = token direct purchase
+    /// (`token_purchase` populated). Exactly one payload is meaningful; the
+    /// other stays default-initialized.
+    struct FfiParsedStateTransition {
+        kind: u8,
+        identity_update: FfiParsedIdentityUpdate,
+        token_purchase: FfiParsedTokenPurchase,
+    }
+
     /// A built, signed state transition. `hash` is sha256(bytes), the wait
     /// handle for waitForStateTransitionResult.
     struct FfiBuiltTransition {
@@ -213,6 +280,8 @@ mod ffi {
             response: &[u8],
         ) -> Result<FfiVerifiedIdentity>;
         fn verify_get_documents(request: &[u8], response: &[u8]) -> Result<FfiVerifiedDocs>;
+        fn verify_get_data_contract(request: &[u8], response: &[u8])
+            -> Result<FfiVerifiedContract>;
         fn verify_get_contested_vote_state(
             request: &[u8],
             response: &[u8],
@@ -224,6 +293,65 @@ mod ffi {
         fn decode_dpns_domain(doc_bytes: &[u8]) -> Result<FfiDpnsName>;
         fn decode_dashpay_profile(doc_bytes: &[u8]) -> Result<FfiProfile>;
         fn decode_contact_request(doc_bytes: &[u8]) -> Result<FfiContactRequest>;
+        /// Decodes a stored document of any contract known to the provider.
+        fn decode_stored_document(
+            contract_id: &[u8],
+            document_type_name: &str,
+            doc_bytes: &[u8],
+        ) -> Result<FfiStoredDocument>;
+
+        // --- DashConnect: dApp-supplied transitions -----------------------
+        /// Reads the intent out of a raw `dash-st:` state transition without
+        /// signing or broadcasting it. Accepts tagged bytes and the tagless
+        /// inner-transition framing.
+        fn st_parse(bytes: &[u8]) -> Result<FfiParsedStateTransition>;
+        /// IdentityUpdate adding `add_keys` / disabling `disable_ids`, key
+        /// proofs and the outer MASTER signature routed through `signer` by
+        /// key id. `revision` = current + 1, `nonce` = next identity nonce.
+        fn st_build_identity_update(
+            identity_id: &[u8],
+            revision: u64,
+            nonce: u64,
+            add_keys: Vec<FfiIdentityKeyToAdd>,
+            disable_ids: Vec<u32>,
+            master_key: FfiIdentityKey,
+            signer: &WalletSigner,
+        ) -> Result<FfiBuiltTransition>;
+        /// Single TokenDirectPurchase batch signed with `key` (CRITICAL).
+        fn st_build_token_direct_purchase(
+            owner_id: &[u8],
+            data_contract_id: &[u8],
+            token_id: &[u8],
+            token_contract_position: u16,
+            token_count: u64,
+            total_agreed_price: u64,
+            identity_contract_nonce: u64,
+            key: FfiIdentityKey,
+            signer: &WalletSigner,
+        ) -> Result<FfiBuiltTransition>;
+        /// Document create/replace against any contract known to the
+        /// provider; `properties_cbor` is a CBOR map of the properties.
+        fn st_build_document_create(
+            contract_id: &[u8],
+            document_type_name: &str,
+            owner_id: &[u8],
+            identity_contract_nonce: u64,
+            properties_cbor: &[u8],
+            entropy: &[u8],
+            key: FfiIdentityKey,
+            signer: &WalletSigner,
+        ) -> Result<FfiBuiltTransition>;
+        fn st_build_document_replace(
+            contract_id: &[u8],
+            document_type_name: &str,
+            document_id: &[u8],
+            owner_id: &[u8],
+            revision: u64,
+            identity_contract_nonce: u64,
+            properties_cbor: &[u8],
+            key: FfiIdentityKey,
+            signer: &WalletSigner,
+        ) -> Result<FfiBuiltTransition>;
 
         // --- State transitions ------------------------------------------
         fn st_build_dpns_preorder(
@@ -436,6 +564,18 @@ fn verify_get_documents(request: &[u8], response: &[u8]) -> Result<ffi::FfiVerif
             .into_iter()
             .map(|data| ffi::FfiBytes { data })
             .collect(),
+        meta: ffi_meta(meta),
+    })
+}
+
+fn verify_get_data_contract(
+    request: &[u8],
+    response: &[u8],
+) -> Result<ffi::FfiVerifiedContract, String> {
+    let (bytes, meta) = verify::verify_get_data_contract(request, response)?;
+    Ok(ffi::FfiVerifiedContract {
+        present: bytes.is_some(),
+        bytes: bytes.unwrap_or_default(),
         meta: ffi_meta(meta),
     })
 }
@@ -708,4 +848,214 @@ fn st_build_identity_create(
     let handle = SignerHandle(signer);
     let sign_fn = |key_id: u32, digest: [u8; 32]| handle.sign(key_id, digest);
     st::build_identity_create(proof, &keys, &sign_fn).map(ffi_built)
+}
+
+// ---------------------------------------------------------------------------
+// Bridge implementations: DashConnect.
+// ---------------------------------------------------------------------------
+
+fn decode_stored_document(
+    contract_id: &[u8],
+    document_type_name: &str,
+    doc_bytes: &[u8],
+) -> Result<ffi::FfiStoredDocument, String> {
+    let document = decode::decode_stored_document(contract_id, document_type_name, doc_bytes)?;
+    Ok(ffi::FfiStoredDocument {
+        document_id: document.document_id.to_vec(),
+        owner_id: document.owner_id.to_vec(),
+        revision: document.revision,
+        properties_cbor: document.properties_cbor,
+    })
+}
+
+fn ffi_key_to_add(key: &types::IdentityKeyToAdd) -> ffi::FfiIdentityKeyToAdd {
+    ffi::FfiIdentityKeyToAdd {
+        id: key.id,
+        key_type: key.key_type,
+        purpose: key.purpose,
+        security_level: key.security_level,
+        read_only: key.read_only,
+        data: key.data.clone(),
+        contract_bounds_kind: key.contract_bounds_kind,
+        contract_bounds_id: if key.contract_bounds_kind == 0 {
+            Vec::new()
+        } else {
+            key.contract_bounds_id.to_vec()
+        },
+        contract_bounds_document_type: key.contract_bounds_document_type.clone(),
+    }
+}
+
+fn empty_parsed_identity_update() -> ffi::FfiParsedIdentityUpdate {
+    ffi::FfiParsedIdentityUpdate {
+        identity_id: Vec::new(),
+        revision: 0,
+        nonce: 0,
+        add_public_keys: Vec::new(),
+        disable_public_key_ids: Vec::new(),
+    }
+}
+
+fn empty_parsed_token_purchase() -> ffi::FfiParsedTokenPurchase {
+    ffi::FfiParsedTokenPurchase {
+        owner_id: Vec::new(),
+        data_contract_id: Vec::new(),
+        token_id: Vec::new(),
+        token_contract_position: 0,
+        token_count: 0,
+        total_agreed_price: 0,
+        identity_contract_nonce: 0,
+    }
+}
+
+/// `FfiParsedStateTransition::kind` for an identity update.
+pub const PARSED_KIND_IDENTITY_UPDATE: u8 = 1;
+/// `FfiParsedStateTransition::kind` for a token direct purchase.
+pub const PARSED_KIND_TOKEN_DIRECT_PURCHASE: u8 = 2;
+
+fn st_parse(bytes: &[u8]) -> Result<ffi::FfiParsedStateTransition, String> {
+    match parse::parse_state_transition(bytes)? {
+        types::ParsedStateTransition::IdentityUpdate(update) => Ok(ffi::FfiParsedStateTransition {
+            kind: PARSED_KIND_IDENTITY_UPDATE,
+            identity_update: ffi::FfiParsedIdentityUpdate {
+                identity_id: update.identity_id.to_vec(),
+                revision: update.revision,
+                nonce: update.nonce,
+                add_public_keys: update.add_public_keys.iter().map(ffi_key_to_add).collect(),
+                disable_public_key_ids: update.disable_public_key_ids,
+            },
+            token_purchase: empty_parsed_token_purchase(),
+        }),
+        types::ParsedStateTransition::TokenDirectPurchase(purchase) => {
+            Ok(ffi::FfiParsedStateTransition {
+                kind: PARSED_KIND_TOKEN_DIRECT_PURCHASE,
+                identity_update: empty_parsed_identity_update(),
+                token_purchase: ffi::FfiParsedTokenPurchase {
+                    owner_id: purchase.owner_id.to_vec(),
+                    data_contract_id: purchase.data_contract_id.to_vec(),
+                    token_id: purchase.token_id.to_vec(),
+                    token_contract_position: purchase.token_contract_position,
+                    token_count: purchase.token_count,
+                    total_agreed_price: purchase.total_agreed_price,
+                    identity_contract_nonce: purchase.identity_contract_nonce,
+                },
+            })
+        }
+    }
+}
+
+fn st_build_identity_update(
+    identity_id: &[u8],
+    revision: u64,
+    nonce: u64,
+    add_keys: Vec<ffi::FfiIdentityKeyToAdd>,
+    disable_ids: Vec<u32>,
+    master_key: ffi::FfiIdentityKey,
+    signer: &ffi::WalletSigner,
+) -> Result<ffi::FfiBuiltTransition, String> {
+    let add_keys: Vec<st::IdentityKeyToRegister> = add_keys
+        .into_iter()
+        .map(|key| st::IdentityKeyToRegister {
+            id: key.id,
+            key_type: key.key_type,
+            purpose: key.purpose,
+            security_level: key.security_level,
+            read_only: key.read_only,
+            data: key.data,
+        })
+        .collect();
+    let handle = SignerHandle(signer);
+    let sign_fn = |key_id: u32, digest: [u8; 32]| handle.sign(key_id, digest);
+    st::build_identity_update(
+        identity_id,
+        revision,
+        nonce,
+        &add_keys,
+        &disable_ids,
+        &key_info(&master_key),
+        &sign_fn,
+    )
+    .map(ffi_built)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn st_build_token_direct_purchase(
+    owner_id: &[u8],
+    data_contract_id: &[u8],
+    token_id: &[u8],
+    token_contract_position: u16,
+    token_count: u64,
+    total_agreed_price: u64,
+    identity_contract_nonce: u64,
+    key: ffi::FfiIdentityKey,
+    signer: &ffi::WalletSigner,
+) -> Result<ffi::FfiBuiltTransition, String> {
+    let handle = SignerHandle(signer);
+    let sign_fn = |key_id: u32, digest: [u8; 32]| handle.sign(key_id, digest);
+    st::build_token_direct_purchase(
+        owner_id,
+        data_contract_id,
+        token_id,
+        token_contract_position,
+        token_count,
+        total_agreed_price,
+        identity_contract_nonce,
+        &key_info(&key),
+        &sign_fn,
+    )
+    .map(ffi_built)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn st_build_document_create(
+    contract_id: &[u8],
+    document_type_name: &str,
+    owner_id: &[u8],
+    identity_contract_nonce: u64,
+    properties_cbor: &[u8],
+    entropy: &[u8],
+    key: ffi::FfiIdentityKey,
+    signer: &ffi::WalletSigner,
+) -> Result<ffi::FfiBuiltTransition, String> {
+    let handle = SignerHandle(signer);
+    let sign_fn = |key_id: u32, digest: [u8; 32]| handle.sign(key_id, digest);
+    st::build_generic_document_create(
+        contract_id,
+        document_type_name,
+        owner_id,
+        identity_contract_nonce,
+        properties_cbor,
+        entropy,
+        &key_info(&key),
+        &sign_fn,
+    )
+    .map(ffi_built)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn st_build_document_replace(
+    contract_id: &[u8],
+    document_type_name: &str,
+    document_id: &[u8],
+    owner_id: &[u8],
+    revision: u64,
+    identity_contract_nonce: u64,
+    properties_cbor: &[u8],
+    key: ffi::FfiIdentityKey,
+    signer: &ffi::WalletSigner,
+) -> Result<ffi::FfiBuiltTransition, String> {
+    let handle = SignerHandle(signer);
+    let sign_fn = |key_id: u32, digest: [u8; 32]| handle.sign(key_id, digest);
+    st::build_generic_document_replace(
+        contract_id,
+        document_type_name,
+        document_id,
+        owner_id,
+        revision,
+        identity_contract_nonce,
+        properties_cbor,
+        &key_info(&key),
+        &sign_fn,
+    )
+    .map(ffi_built)
 }
