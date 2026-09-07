@@ -60,7 +60,7 @@ object IdentityPubkeyCodec {
             dos.write(k.pubkeyBytes)
             when (val bounds = k.contractBounds) {
                 is ContractBounds.Scoped -> {
-                    require(bounds.encodedScope.size in 1..0xFFFF) { "Invalid scope size" }
+                    require(bounds.encodedScope.size in 1..2048) { "Invalid scope size" }
                     dos.writeShort(bounds.encodedScope.size)
                     dos.write(bounds.encodedScope)
                 }
@@ -78,7 +78,7 @@ object IdentityPubkeyCodec {
         return out.toByteArray()
     }
 
-    /** Discriminant matching the FFI: 0 none, 1 SingleContract, 2 with doc type. */
+    /** Discriminant matching the FFI: 0 none, 1 SingleContract, 2 with doc type, 3 Scoped. */
     internal fun contractBoundsKind(bounds: ContractBounds?): Int = when (bounds) {
         is ContractBounds.Scoped -> 3
         null -> 0

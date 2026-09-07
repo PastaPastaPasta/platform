@@ -1279,33 +1279,12 @@ impl StateTransition {
         call_method_identity_signed!(self, set_signature_public_key_id, public_key_id)
     }
 
+    /// Check the scope when the signing API receives the identity key metadata.
+    /// Raw signing primitives cannot check bounds without that metadata.
     #[cfg(feature = "state-transition-signing")]
-    pub async fn sign_external<S: Signer<IdentityPublicKey>>(
-        &mut self,
+    fn verify_identity_key_scope(
+        &self,
         identity_public_key: &IdentityPublicKey,
-        signer: &S,
-        get_data_contract_security_level_requirement: Option<
-            impl Fn(Identifier, String) -> Result<SecurityLevel, ProtocolError>,
-        >,
-    ) -> Result<(), ProtocolError> {
-        self.sign_external_with_options(
-            identity_public_key,
-            signer,
-            get_data_contract_security_level_requirement,
-            StateTransitionSigningOptions::default(),
-        )
-        .await
-    }
-
-    #[cfg(feature = "state-transition-signing")]
-    pub async fn sign_external_with_options<S: Signer<IdentityPublicKey>>(
-        &mut self,
-        identity_public_key: &IdentityPublicKey,
-        signer: &S,
-        get_data_contract_security_level_requirement: Option<
-            impl Fn(Identifier, String) -> Result<SecurityLevel, ProtocolError>,
-        >,
-        options: StateTransitionSigningOptions,
     ) -> Result<(), ProtocolError> {
         if let Some(crate::identity::contract_bounds::ContractBounds::Scoped(scope)) =
             identity_public_key.contract_bounds()
@@ -1334,6 +1313,38 @@ impl StateTransition {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "state-transition-signing")]
+    pub async fn sign_external<S: Signer<IdentityPublicKey>>(
+        &mut self,
+        identity_public_key: &IdentityPublicKey,
+        signer: &S,
+        get_data_contract_security_level_requirement: Option<
+            impl Fn(Identifier, String) -> Result<SecurityLevel, ProtocolError>,
+        >,
+    ) -> Result<(), ProtocolError> {
+        self.sign_external_with_options(
+            identity_public_key,
+            signer,
+            get_data_contract_security_level_requirement,
+            StateTransitionSigningOptions::default(),
+        )
+        .await
+    }
+
+    #[cfg(feature = "state-transition-signing")]
+    pub async fn sign_external_with_options<S: Signer<IdentityPublicKey>>(
+        &mut self,
+        identity_public_key: &IdentityPublicKey,
+        signer: &S,
+        get_data_contract_security_level_requirement: Option<
+            impl Fn(Identifier, String) -> Result<SecurityLevel, ProtocolError>,
+        >,
+        options: StateTransitionSigningOptions,
+    ) -> Result<(), ProtocolError> {
+        self.verify_identity_key_scope(identity_public_key)?;
         match self {
             StateTransition::DataContractCreate(st) => {
                 st.verify_public_key_level_and_purpose(identity_public_key, options)?;
@@ -1509,6 +1520,7 @@ impl StateTransition {
         bls: &impl BlsModule,
         options: StateTransitionSigningOptions,
     ) -> Result<(), ProtocolError> {
+        self.verify_identity_key_scope(identity_public_key)?;
         call_errorable_method_identity_signed!(
             self,
             verify_public_key_level_and_purpose,
@@ -1999,6 +2011,81 @@ mod tests {
     // -----------------------------------------------------------------------
     // StateTransitionSigningOptions tests
     // -----------------------------------------------------------------------
+
+    #[cfg(all(feature = "state-transition-signing", feature = "bls-signatures"))]
+    #[test]
+    fn should_enforce_scope_before_private_key_signing() {
+        use crate::consensus::signature::{ScopedKeyNonBatchError, ScopedKeyOutOfScopeError};
+        use crate::identity::contract_bounds::authentication_scope::{
+            permissions, AuthenticationScope, AuthenticationScopeV0, ContractScope,
+        };
+        use crate::identity::contract_bounds::ContractBounds;
+        use crate::identity::identity_public_key::v0::IdentityPublicKeyV0;
+
+        let private_key = [1; 32];
+        let bls = crate::bls::native_bls::NativeBlsModule;
+        let scope = AuthenticationScopeV0 {
+            contracts: vec![ContractScope {
+                id: Identifier::from([2; 32]),
+                document_types: Some(vec!["preorder".to_string()]),
+            }],
+            permissions: permissions::DOCUMENT_DELETE,
+            expires_at: None,
+        };
+        let mut key = IdentityPublicKeyV0 {
+            id: 7,
+            purpose: Purpose::AUTHENTICATION,
+            security_level: SecurityLevel::HIGH,
+            key_type: KeyType::ECDSA_SECP256K1,
+            data: get_compressed_public_ec_key(&private_key)
+                .unwrap()
+                .to_vec()
+                .into(),
+            contract_bounds: Some(ContractBounds::Scoped(AuthenticationScope::V0(
+                scope.clone(),
+            ))),
+            ..Default::default()
+        };
+        sample_batch_st_with_delete()
+            .sign(&key.clone().into(), &private_key, &bls)
+            .expect("allowed document delete must sign");
+
+        let err = sample_transfer_st()
+            .sign(&key.clone().into(), &private_key, &bls)
+            .unwrap_err();
+        assert!(matches!(err, ProtocolError::ConsensusError(error)
+            if *error == ScopedKeyNonBatchError::new(key.id).into()));
+
+        for mismatch in ["contract", "document type", "operation"] {
+            let mut denied = scope.clone();
+            match mismatch {
+                "contract" => denied.contracts[0].id = Identifier::from([3; 32]),
+                "document type" => denied.contracts[0].document_types = Some(vec!["other".into()]),
+                "operation" => denied.permissions = permissions::DOCUMENT_CREATE,
+                _ => unreachable!(),
+            }
+            key.contract_bounds = Some(ContractBounds::Scoped(AuthenticationScope::V0(denied)));
+            let mut transition = sample_batch_st_with_delete();
+            let original = transition.clone();
+            let err = transition
+                .sign(&key.clone().into(), &private_key, &bls)
+                .unwrap_err();
+            assert!(
+                matches!(err, ProtocolError::ConsensusError(error)
+                if *error == ScopedKeyOutOfScopeError::new(key.id).into()),
+                "{mismatch}"
+            );
+            assert_eq!(
+                transition, original,
+                "rejection must preserve the transition"
+            );
+        }
+
+        key.contract_bounds = None;
+        sample_batch_st_with_delete()
+            .sign(&key.into(), &private_key, &bls)
+            .expect("unscoped keys must still sign");
+    }
 
     #[test]
     fn test_signing_options_default() {
