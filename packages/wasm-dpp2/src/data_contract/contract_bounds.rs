@@ -5,12 +5,12 @@ use crate::impl_try_from_js_value;
 use crate::impl_wasm_conversions_inner;
 use crate::impl_wasm_type_info;
 use dpp::identity::contract_bounds::{
-    authentication_scope::permissions, AuthenticationScope, ContractBounds,
+    AuthenticationScope, ContractBounds, authentication_scope::permissions,
 };
 use dpp::prelude::Identifier;
 use dpp::serialization::JsonConvertible;
-use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::JsValue;
+use wasm_bindgen::prelude::wasm_bindgen;
 
 /// Combine explicitly granted actions with bitwise OR.
 #[wasm_bindgen]
@@ -231,7 +231,7 @@ impl ContractBoundsWasm {
             ContractBounds::Scoped(_) => {
                 return Err(WasmDppError::invalid_argument(
                     "replace the complete scope to change scoped bounds",
-                ))
+                ));
             }
             ContractBounds::SingleContract { .. } => {
                 ContractBounds::SingleContract { id: contract_id }
@@ -256,7 +256,7 @@ impl ContractBoundsWasm {
             ContractBounds::Scoped(_) => {
                 return Err(WasmDppError::invalid_argument(
                     "replace the complete scope to change scoped bounds",
-                ))
+                ));
             }
             ContractBounds::SingleContract { .. } => self.clone().0,
             ContractBounds::SingleContractDocumentType { id, .. } => {
