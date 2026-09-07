@@ -381,6 +381,7 @@ abstract class NativePersistenceBridge {
         contractBoundsKind: Byte,
         contractBoundsId: ByteArray,
         contractBoundsDocumentType: String?,
+        contractBoundsScope: ByteArray = ByteArray(0),
     ): Int = 0
 
     /** One `(identityId, keyId)` removal. Descriptor `([B[BI)I`. */
@@ -1106,9 +1107,10 @@ class ContactRequestRestoreData(
  * `keyType` / `purpose` / `securityLevel` are DPP `repr(u8)` discriminants
  * (out-of-range = 255 sentinel → Rust drops the row rather than coercing to
  * MASTER/AUTHENTICATION, matching the Swift loader's `UInt8.max` fallback).
- * `contractBoundsKind`: 0 none, 1 SingleContract, 2 SingleContractDocumentType;
- * `contractBoundsId` is 32 bytes (or empty for kind 0);
+ * `contractBoundsKind`: 0 none, 1 SingleContract, 2 SingleContractDocumentType, 3 Scoped;
+ * `contractBoundsId` is 32 bytes (or empty for kinds 0 and 3);
  * `contractBoundsDocumentType` is non-null only for kind 2.
+ * Kind 3 carries the complete versioned DPP bytes in `contractBoundsScope`.
  */
 class IdentityKeyRestoreData(
     @JvmField val keyId: Int,
@@ -1120,6 +1122,7 @@ class IdentityKeyRestoreData(
     @JvmField val contractBoundsKind: Byte,
     @JvmField val contractBoundsId: ByteArray,
     @JvmField val contractBoundsDocumentType: String?,
+    @JvmField val contractBoundsScope: ByteArray = ByteArray(0),
 )
 
 /** Mirror of `ShieldedNoteRestoreFFI`. */

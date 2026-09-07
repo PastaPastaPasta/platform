@@ -25,6 +25,7 @@ use crate::rpc::core::CoreRPCLike;
 
 use crate::execution::validation::state_transition::identity_update::basic_structure::v0::IdentityUpdateStateTransitionStructureValidationV0;
 use crate::execution::validation::state_transition::identity_update::state::v0::IdentityUpdateStateTransitionStateValidationV0;
+use crate::execution::validation::state_transition::identity_update::state::v1::IdentityUpdateStateTransitionStateValidationV1;
 use crate::execution::validation::state_transition::processor::basic_structure::StateTransitionBasicStructureValidationV0;
 use crate::execution::validation::state_transition::processor::state::StateTransitionStateValidation;
 use crate::execution::validation::state_transition::transformer::StateTransitionActionTransformer;
@@ -95,8 +96,8 @@ impl StateTransitionStateValidation for IdentityUpdateTransition {
         _action: Option<StateTransitionAction>,
         platform: &PlatformRef<C>,
         _validation_mode: ValidationMode,
-        _block_info: &BlockInfo,
-        _execution_context: &mut StateTransitionExecutionContext,
+        block_info: &BlockInfo,
+        execution_context: &mut StateTransitionExecutionContext,
         tx: TransactionArg,
     ) -> Result<ConsensusValidationResult<StateTransitionAction>, Error> {
         let platform_version = platform.state.current_platform_version()?;
@@ -108,9 +109,16 @@ impl StateTransitionStateValidation for IdentityUpdateTransition {
             .state
         {
             0 => self.validate_state_v0(platform, tx, platform_version),
+            1 => self.validate_state_v1(
+                platform,
+                block_info,
+                execution_context,
+                tx,
+                platform_version,
+            ),
             version => Err(Error::Execution(ExecutionError::UnknownVersionMismatch {
                 method: "identity update transition: validate_state".to_string(),
-                known_versions: vec![0],
+                known_versions: vec![0, 1],
                 received: version,
             })),
         }
@@ -374,6 +382,203 @@ mod tests {
                 verification_result
             );
         };
+    }
+
+    #[tokio::test]
+    async fn should_register_scoped_authentication_key_and_preserve_proof_metadata() {
+        let platform_version = PlatformVersion::latest();
+
+        let mut platform = TestPlatformBuilder::new()
+            .build_with_mock_rpc()
+            .set_genesis_state();
+
+        let (identity, signer, _, key) =
+            setup_identity_return_master_key(&mut platform, 958, dash_to_credits!(0.1));
+
+        use dpp::identity::contract_bounds::{
+            authentication_scope::permissions, AuthenticationScope, AuthenticationScopeV0,
+            ContractScope,
+        };
+        let dashpay = platform
+            .drive
+            .cache
+            .system_data_contracts
+            .load_dashpay(platform_version)
+            .unwrap();
+        let bounds = ContractBounds::Scoped(AuthenticationScope::V0(AuthenticationScopeV0 {
+            contracts: vec![ContractScope {
+                id: dashpay.id(),
+                document_types: None,
+            }],
+            permissions: permissions::DOCUMENT_CREATE | permissions::DOCUMENT_TOKEN_PAYMENT,
+            expires_at: Some(100),
+        }));
+        let platform_state = platform.state.load();
+
+        let secp = Secp256k1::new();
+
+        let mut rng = StdRng::seed_from_u64(292);
+
+        let new_key_pair = Keypair::new(&secp, &mut rng);
+
+        let mut new_key = IdentityPublicKeyInCreationV0 {
+            id: 2,
+            purpose: Purpose::AUTHENTICATION,
+            security_level: SecurityLevel::HIGH,
+            key_type: ECDSA_SECP256K1,
+            read_only: false,
+            data: new_key_pair.public_key().serialize().to_vec().into(),
+            signature: Default::default(),
+            contract_bounds: Some(bounds.clone()),
+        };
+
+        let update_transition: IdentityUpdateTransition = IdentityUpdateTransitionV0 {
+            identity_id: identity.id(),
+            revision: 1,
+            nonce: 1,
+            add_public_keys: vec![IdentityPublicKeyInCreation::V0(new_key.clone())],
+            disable_public_keys: vec![],
+            user_fee_increase: 0,
+            signature_public_key_id: key.id(),
+            signature: Default::default(),
+        }
+        .into();
+
+        let update_transition: StateTransition = update_transition.into();
+
+        let signable_bytes = update_transition
+            .signable_bytes()
+            .expect("expected signable bytes");
+
+        let secret = new_key_pair.secret_key();
+        let signature =
+            signer::sign(&signable_bytes, &secret.secret_bytes()).expect("expected to sign");
+
+        new_key.signature = signature.to_vec().into();
+
+        let update_transition: IdentityUpdateTransition = IdentityUpdateTransitionV0 {
+            identity_id: identity.id(),
+            revision: 1,
+            nonce: 1,
+            add_public_keys: vec![IdentityPublicKeyInCreation::V0(new_key)],
+            disable_public_keys: vec![],
+            user_fee_increase: 0,
+            signature_public_key_id: key.id(),
+            signature: Default::default(),
+        }
+        .into();
+
+        let mut update_transition: StateTransition = update_transition.into();
+
+        update_transition.set_signature(
+            signer
+                .sign(&key, signable_bytes.as_slice())
+                .await
+                .expect("expected to sign"),
+        );
+
+        let update_transition_bytes = update_transition
+            .serialize_to_bytes()
+            .expect("expected to serialize");
+
+        let transaction = platform.drive.grove.start_transaction();
+
+        let processing_result = platform
+            .platform
+            .process_raw_state_transitions(
+                &vec![update_transition_bytes.clone()],
+                &platform_state,
+                &BlockInfo::default(),
+                &transaction,
+                platform_version,
+                true,
+                None,
+            )
+            .expect("expected to process state transition");
+
+        assert_matches!(
+            processing_result.execution_results().as_slice(),
+            [StateTransitionExecutionResult::SuccessfulExecution { .. }]
+        );
+
+        platform
+            .drive
+            .grove
+            .commit_transaction(transaction)
+            .unwrap()
+            .expect("expected to commit transaction");
+
+        let proof_result = platform
+            .platform
+            .drive
+            .prove_state_transition(&update_transition, None, platform_version)
+            .map_err(|e| e.to_string())
+            .expect("expected to create proof");
+
+        if let Some(proof_error) = proof_result.first_error() {
+            panic!("proof_result is not valid with error {}", proof_error);
+        }
+
+        let proof_data = proof_result
+            .into_data()
+            .map_err(|e| e.to_string())
+            .expect("expected to get proof data");
+
+        let (_, verification_result) = Drive::verify_state_transition_was_executed_with_proof(
+            &update_transition,
+            &BlockInfo::default(),
+            &proof_data,
+            &|_id: &Identifier| Ok(None),
+            platform_version,
+        )
+        .map(|(root_hash, outcome)| (root_hash, outcome.into_result()))
+        .map_err(|e| e.to_string())
+        .expect("expected to verify state transition");
+
+        let StateTransitionProofResult::VerifiedPartialIdentity(document) = verification_result
+        else {
+            panic!(
+                "verification_result expected partial identity, but got: {:?}",
+                verification_result
+            );
+        };
+        assert_eq!(
+            document
+                .loaded_public_keys
+                .get(&2)
+                .unwrap()
+                .contract_bounds(),
+            Some(&bounds)
+        );
+        use drive::drive::identity::key::fetch::{
+            IdentityKeysRequest, KeyKindRequestType, KeyRequestType,
+        };
+        let indexed = platform
+            .drive
+            .fetch_identity_keys_as_partial_identity(
+                IdentityKeysRequest {
+                    identity_id: identity.id().to_buffer(),
+                    request_type: KeyRequestType::ContractBoundKey(
+                        dashpay.id().to_buffer(),
+                        Purpose::AUTHENTICATION,
+                        KeyKindRequestType::CurrentKeyOfKindRequest,
+                    ),
+                    limit: None,
+                    offset: None,
+                },
+                None,
+                platform_version,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            indexed
+                .loaded_public_keys
+                .get(&2)
+                .unwrap()
+                .contract_bounds(),
+            Some(&bounds)
+        );
     }
 
     #[tokio::test]

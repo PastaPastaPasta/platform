@@ -121,7 +121,7 @@ import org.dashfoundation.dashsdk.persistence.entities.WalletManagerMetadataEnti
  * owned, unlisted row until the first native marketplace sync refreshes it.
  */
 @Database(
-    version = 10,
+    version = 11,
     exportSchema = true,
     entities = [
         WalletEntity::class,
@@ -519,6 +519,13 @@ abstract class DashDatabase : RoomDatabase() {
             }
         }
 
+        /** v10 → v11: preserve versioned authentication scope bytes. */
+        val MIGRATION_10_11: Migration = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE public_keys ADD COLUMN contractBoundsScope BLOB")
+            }
+        }
+
         /** v9 → v10: additive DPNS marketplace state on legacy label rows. */
         val MIGRATION_9_10: Migration = object : Migration(9, 10) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -574,6 +581,7 @@ abstract class DashDatabase : RoomDatabase() {
                     MIGRATION_7_8,
                     MIGRATION_8_9,
                     MIGRATION_9_10,
+                    MIGRATION_10_11,
                 )
                 .build()
 

@@ -5947,8 +5947,8 @@ unsafe fn build_identity_public_keys(
         // inconsistency (the writer is supposed to demote to
         // kind=1 in that case — see identity_persistence.rs); we
         // demote it here too rather than fabricating an empty doc-
-        // type name. Invalid kind tags load as unbounded so a
-        // forward-compatible writer doesn't lock us out.
+        // type name. Unknown kinds and corrupt scoped payloads are skipped
+        // with a warning; they must never become unbounded keys.
         let contract_bounds: Option<ContractBounds> = match row.contract_bounds_kind {
             0 => None,
             1 => Some(ContractBounds::SingleContract {
@@ -5971,7 +5971,35 @@ unsafe fn build_identity_public_keys(
                     }
                 }
             }
-            _ => None,
+            3 => {
+                if row.contract_bounds_scope.is_null()
+                    || row.contract_bounds_scope_len == 0
+                    || row.contract_bounds_scope_len
+                        > dpp::identity::contract_bounds::authentication_scope::MAX_SCOPE_BYTES
+                {
+                    tracing::warn!(
+                        key_id = row.key_id,
+                        "Skipping key with invalid persisted scope buffer"
+                    );
+                    continue;
+                }
+                match dpp::identity::contract_bounds::AuthenticationScope::from_bytes(
+                    slice::from_raw_parts(row.contract_bounds_scope, row.contract_bounds_scope_len),
+                ) {
+                    Ok(scope) => Some(ContractBounds::Scoped(scope)),
+                    Err(error) => {
+                        tracing::warn!(key_id = row.key_id, %error, "Skipping key with corrupt persisted scope");
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    key_id = row.key_id,
+                    "Skipping key with unknown persisted bounds kind"
+                );
+                continue;
+            }
         };
 
         let pk = IdentityPublicKey::V0(IdentityPublicKeyV0 {
@@ -9307,5 +9335,58 @@ mod tests {
                 .all(|a| matches!(a.state, AddressState::Used)),
             "every emitted marked-used address must carry used == true"
         );
+    }
+}
+
+#[cfg(test)]
+mod scoped_key_restore_tests {
+    use super::*;
+    use dpp::identity::contract_bounds::{
+        AuthenticationScope, AuthenticationScopeV0, ContractBounds, ContractScope,
+    };
+    use dpp::identity::identity_public_key::accessors::v0::IdentityPublicKeyGettersV0;
+    use std::ptr;
+
+    #[test]
+    fn restore_retains_scope_and_never_widens_corrupt_scope() {
+        let scope = AuthenticationScope::V0(AuthenticationScopeV0 {
+            contracts: vec![ContractScope {
+                id: Identifier::from([7; 32]),
+                document_types: None,
+            }],
+            permissions: 65,
+            expires_at: Some(1_900_000_000_000),
+        });
+        let bytes = scope.to_bytes().unwrap();
+        let key_data = [2; 33];
+        let mut key = IdentityKeyRestoreFFI {
+            key_id: 5,
+            key_type: 0,
+            purpose: 0,
+            security_level: 2,
+            read_only: false,
+            data: key_data.as_ptr(),
+            data_len: key_data.len(),
+            contract_bounds_kind: 3,
+            contract_bounds_id: [0; 32],
+            contract_bounds_document_type: ptr::null(),
+            contract_bounds_scope: bytes.as_ptr(),
+            contract_bounds_scope_len: bytes.len(),
+        };
+        // The repr(C) restore envelope consists exclusively of integer and raw-pointer fields.
+        let mut spec: IdentityRestoreEntryFFI = unsafe { std::mem::zeroed() };
+        spec.keys = &key;
+        spec.keys_count = 1;
+        let restored = unsafe { build_identity_public_keys(&spec) };
+        assert_eq!(
+            restored[&5].contract_bounds(),
+            Some(&ContractBounds::Scoped(scope))
+        );
+        key.contract_bounds_scope_len -= 1;
+        spec.keys = &key;
+        assert!(unsafe { build_identity_public_keys(&spec) }.is_empty());
+        key.contract_bounds_kind = 255;
+        spec.keys = &key;
+        assert!(unsafe { build_identity_public_keys(&spec) }.is_empty());
     }
 }

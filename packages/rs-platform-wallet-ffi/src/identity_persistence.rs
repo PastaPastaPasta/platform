@@ -281,6 +281,9 @@ pub struct IdentityKeyEntryFFI {
     //     C-string are meaningful. Doc-type string is released by
     //     [`free_identity_key_entry_ffi`].
     //
+    //   * `contract_bounds_kind == 3` — versioned AuthenticationScope bytes
+    //     owned by `contract_bounds_scope`, released by the same free helper.
+    //
     // Keeping the kind tag inline (vs. always nulling fields) lets
     // the Swift side switch on a single discriminant without
     // probing pointer values, matching how the rest of this struct
@@ -298,6 +301,10 @@ pub struct IdentityKeyEntryFFI {
     pub contract_bounds_kind: u8,
     pub contract_bounds_id: [u8; 32],
     pub contract_bounds_document_type: *const c_char,
+    /// Versioned AuthenticationScope bincode bytes for kind 3; null otherwise.
+    /// Ownership matches the other buffers in this struct.
+    pub contract_bounds_scope: *const u8,
+    pub contract_bounds_scope_len: usize,
 }
 
 /// Composite identifier for [`IdentityKeysChangeSet::removed`] entries
@@ -345,8 +352,10 @@ pub struct IdentityKeyRemovalFFI {
 //   169..=175 (padding to 8 for pointer alignment)
 //   176..=183 contract_bounds_document_type *const c_char
 //
-// Total size = 184, alignment = 8 (from u64 / pointer).
-const _: [u8; 184] = [0u8; std::mem::size_of::<IdentityKeyEntryFFI>()];
+//   184..=191 contract_bounds_scope *const u8
+//   192..=199 contract_bounds_scope_len usize
+// Total size = 200, alignment = 8 (from u64 / pointer).
+const _: [u8; 200] = [0u8; std::mem::size_of::<IdentityKeyEntryFFI>()];
 const _: [u8; 8] = [0u8; std::mem::align_of::<IdentityKeyEntryFFI>()];
 
 // Compile-time guard for `IdentityEntryFFI`. Same rationale as the
@@ -689,6 +698,19 @@ impl IdentityKeyEntryFFI {
         // demoting to `SingleContract` is the closest faithful
         // representation — the document-type qualifier is the
         // only thing lost, the contract id is preserved.
+        let scope_bytes = match entry.public_key.contract_bounds() {
+            Some(ContractBounds::Scoped(scope)) => {
+                bincode::encode_to_vec(scope, bincode::config::standard())
+                    .expect("AuthenticationScope encoding into a Vec is infallible")
+            }
+            _ => Vec::new(),
+        };
+        let contract_bounds_scope_len = scope_bytes.len();
+        let contract_bounds_scope = if scope_bytes.is_empty() {
+            ptr::null()
+        } else {
+            Box::into_raw(scope_bytes.into_boxed_slice()) as *const u8
+        };
         let (contract_bounds_kind, contract_bounds_id, contract_bounds_document_type) =
             match entry.public_key.contract_bounds() {
                 Some(ContractBounds::SingleContract { id }) => (1u8, id.to_buffer(), ptr::null()),
@@ -699,6 +721,7 @@ impl IdentityKeyEntryFFI {
                     Ok(c) => (2u8, id.to_buffer(), c.into_raw() as *const c_char),
                     Err(_) => (1u8, id.to_buffer(), ptr::null()),
                 },
+                Some(ContractBounds::Scoped(_)) => (3u8, [0u8; 32], ptr::null()),
                 None => (0u8, [0u8; 32], ptr::null()),
             };
 
@@ -722,6 +745,8 @@ impl IdentityKeyEntryFFI {
             contract_bounds_kind,
             contract_bounds_id,
             contract_bounds_document_type,
+            contract_bounds_scope,
+            contract_bounds_scope_len,
         }
     }
 }
@@ -868,6 +893,15 @@ unsafe fn free_optional_c_string(slot: &mut *const c_char) {
 /// `entry` must have been produced by
 /// [`IdentityKeyEntryFFI::from_entry`] and not previously freed.
 pub unsafe fn free_identity_key_entry_ffi(entry: &mut IdentityKeyEntryFFI) {
+    if !entry.contract_bounds_scope.is_null() {
+        let raw = std::ptr::slice_from_raw_parts_mut(
+            entry.contract_bounds_scope as *mut u8,
+            entry.contract_bounds_scope_len,
+        );
+        drop(unsafe { Box::from_raw(raw) });
+        entry.contract_bounds_scope = ptr::null();
+        entry.contract_bounds_scope_len = 0;
+    }
     if !entry.public_key_data_ptr.is_null() && entry.public_key_data_len > 0 {
         // Reconstruct the boxed slice we created via `Box::into_raw`
         // on a `Box<[u8]>`. Using `Vec::from_raw_parts` would over-
@@ -1237,6 +1271,75 @@ mod tests {
         assert_eq!(ffi.disabled_at, 1_700_000_000);
         assert_eq!(ffi.contract_bounds_kind, 0);
         assert!(ffi.contract_bounds_document_type.is_null());
+        unsafe { free_identity_key_entry_ffi(&mut ffi) };
+    }
+
+    #[test]
+    fn scoped_key_payload_survives_ffi_projection_and_registration_decode() {
+        use crate::identity_registration_with_signer::{decode_contract_bounds, IdentityPubkeyFFI};
+        use dpp::identity::contract_bounds::{
+            AuthenticationScope, AuthenticationScopeV0, ContractBounds, ContractScope,
+        };
+        let scope = AuthenticationScope::V0(AuthenticationScopeV0 {
+            contracts: vec![
+                ContractScope {
+                    id: Identifier::from([1; 32]),
+                    document_types: Some(vec!["post".into()]),
+                },
+                ContractScope {
+                    id: Identifier::from([2; 32]),
+                    document_types: None,
+                },
+            ],
+            permissions: 65,
+            expires_at: Some(1_900_000_000_000),
+        });
+        let entry = IdentityKeyEntry {
+            identity_id: Identifier::from([3; 32]),
+            key_id: 5,
+            public_key: IdentityPublicKey::V0(IdentityPublicKeyV0 {
+                id: 5,
+                purpose: Purpose::AUTHENTICATION,
+                security_level: SecurityLevel::HIGH,
+                contract_bounds: Some(ContractBounds::Scoped(scope.clone())),
+                key_type: KeyType::ECDSA_SECP256K1,
+                read_only: false,
+                data: BinaryData::new(vec![2; 33]),
+                disabled_at: None,
+            }),
+            public_key_hash: [0; 20],
+            wallet_id: None,
+            derivation_indices: None,
+        };
+        let mut ffi = IdentityKeyEntryFFI::from_entry(&entry);
+        assert_eq!(ffi.contract_bounds_kind, 3);
+        let row = IdentityPubkeyFFI {
+            key_id: ffi.key_id,
+            key_type: ffi.key_type,
+            purpose: ffi.purpose,
+            security_level: ffi.security_level,
+            pubkey_bytes: ffi.public_key_data_ptr,
+            pubkey_len: ffi.public_key_data_len,
+            read_only: ffi.read_only,
+            contract_bounds_kind: ffi.contract_bounds_kind,
+            contract_bounds_id: ptr::null(),
+            contract_bounds_document_type: ptr::null(),
+            contract_bounds_scope: ffi.contract_bounds_scope,
+            contract_bounds_scope_len: ffi.contract_bounds_scope_len,
+        };
+        let decoded = unsafe { decode_contract_bounds(&row, Purpose::AUTHENTICATION, 0, "keys") };
+        assert!(matches!(decoded, Ok(Some(ContractBounds::Scoped(value))) if value == scope));
+        let invalid_row = IdentityPubkeyFFI {
+            contract_bounds_scope_len: row.contract_bounds_scope_len - 1,
+            ..row
+        };
+        assert!(unsafe {
+            decode_contract_bounds(&invalid_row, Purpose::AUTHENTICATION, 0, "keys")
+        }
+        .is_err());
+        unsafe { free_identity_key_entry_ffi(&mut ffi) };
+        assert!(ffi.contract_bounds_scope.is_null());
+        assert_eq!(ffi.contract_bounds_scope_len, 0);
         unsafe { free_identity_key_entry_ffi(&mut ffi) };
     }
 

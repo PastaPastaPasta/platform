@@ -1307,6 +1307,33 @@ impl StateTransition {
         >,
         options: StateTransitionSigningOptions,
     ) -> Result<(), ProtocolError> {
+        if let Some(crate::identity::contract_bounds::ContractBounds::Scoped(scope)) =
+            identity_public_key.contract_bounds()
+        {
+            use crate::state_transition::batch_transition::accessors::DocumentsBatchTransitionAccessorsV0;
+            match self {
+                StateTransition::Batch(batch)
+                    if batch
+                        .transitions_iter()
+                        .all(|transition| scope.allows_transition(transition)) => {}
+                StateTransition::Batch(_) => {
+                    return Err(ProtocolError::ConsensusError(Box::new(
+                        crate::consensus::signature::ScopedKeyOutOfScopeError::new(
+                            identity_public_key.id(),
+                        )
+                        .into(),
+                    )))
+                }
+                _ => {
+                    return Err(ProtocolError::ConsensusError(Box::new(
+                        crate::consensus::signature::ScopedKeyNonBatchError::new(
+                            identity_public_key.id(),
+                        )
+                        .into(),
+                    )))
+                }
+            }
+        }
         match self {
             StateTransition::DataContractCreate(st) => {
                 st.verify_public_key_level_and_purpose(identity_public_key, options)?;
