@@ -359,7 +359,7 @@ abstract class NativePersistenceBridge {
 
     // ── Identity keys ─────────────────────────────────────────────────
 
-    /** One `IdentityKeyEntryFFI` upsert. Descriptor `([B[BIBBBZZJ[B[BZ[BZIIB[BLjava/lang/String;)I`. */
+    /** One `IdentityKeyEntryFFI` upsert. Descriptor `([B[BIBBBZZJ[B[BZ[BZIIB[BLjava/lang/String;[B)I`. */
     @Suppress("LongParameterList")
     open fun onPersistIdentityKeyUpsert(
         walletId: ByteArray,

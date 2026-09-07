@@ -1088,6 +1088,9 @@ unsafe extern "C" fn tramp_persist_identity_keys(
     })
 }
 
+// Shared with descriptor verification so the smoke check resolves the actual call signature.
+const IDENTITY_KEY_UPSERT_DESCRIPTOR: &str = "([B[BIBBBZZJ[B[BZ[BZIIB[BLjava/lang/String;[B)I";
+
 unsafe fn persist_identity_key_upsert(
     env: &mut JNIEnv,
     bridge: &JObject,
@@ -1104,7 +1107,7 @@ unsafe fn persist_identity_key_upsert(
     env.call_method(
         bridge,
         "onPersistIdentityKeyUpsert",
-        "([B[BIBBBZZJ[B[BZ[BZIIB[BLjava/lang/String;[B)I",
+        IDENTITY_KEY_UPSERT_DESCRIPTOR,
         &[
             wid.into(),
             (&identity_id).into(),
@@ -4294,10 +4297,7 @@ const BRIDGE_METHOD_TABLE: &[(&str, &str)] = &[
         "([B[B[BZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;\
          [BZ[BZLjava/lang/String;J)I",
     ),
-    (
-        "onPersistIdentityKeyUpsert",
-        "([B[BIBBBZZJ[B[BZ[BZIIB[BLjava/lang/String;)I",
-    ),
+    ("onPersistIdentityKeyUpsert", IDENTITY_KEY_UPSERT_DESCRIPTOR),
     ("onPersistIdentityKeyRemoval", "([B[BI)I"),
     ("onPersistTokenBalanceUpsert", "([B[B[BJ)I"),
     ("onPersistTokenBalanceRemoval", "([B[B[B)I"),
