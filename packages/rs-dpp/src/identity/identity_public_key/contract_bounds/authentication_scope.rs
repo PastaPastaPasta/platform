@@ -268,6 +268,104 @@ mod tests {
         scope.contracts[0].document_types = Some(vec!["a".repeat(MAX_SCOPE_BYTES)]);
         assert!(AuthenticationScope::V0(scope).validate().is_err());
         assert!(AuthenticationScope::from_bytes(&vec![0; MAX_SCOPE_BYTES + 1]).is_err());
+
+        let AuthenticationScope::V0(mut scope) = fixture();
+        scope.contracts = (0..16)
+            .map(|id| ContractScope {
+                id: Identifier::from([id; 32]),
+                document_types: None,
+            })
+            .collect();
+        assert!(AuthenticationScope::V0(scope.clone()).validate().is_ok());
+        scope.contracts.push(ContractScope {
+            id: Identifier::from([16; 32]),
+            document_types: None,
+        });
+        assert!(AuthenticationScope::V0(scope.clone()).validate().is_err());
+        scope.contracts.clear();
+        assert!(AuthenticationScope::V0(scope).validate().is_err());
+
+        let AuthenticationScope::V0(mut scope) = fixture();
+        let names = (0..16).map(|n| format!("type{n:02}")).collect::<Vec<_>>();
+        scope.contracts[0].document_types = Some(names.clone());
+        assert!(AuthenticationScope::V0(scope.clone()).validate().is_ok());
+        scope.contracts[0]
+            .document_types
+            .as_mut()
+            .unwrap()
+            .push("type16".into());
+        assert!(AuthenticationScope::V0(scope.clone()).validate().is_err());
+        scope.contracts[0].document_types = Some(names);
+        scope.permissions = 0;
+        assert!(AuthenticationScope::V0(scope).validate().is_err());
+    }
+
+    #[cfg(feature = "state-transitions")]
+    #[test]
+    fn should_require_each_token_permission_independently_and_reject_foreign_contracts() {
+        use crate::state_transition::batch_transition::batched_transition::{
+            token_transfer_transition::TokenTransferTransitionV0, BatchedTransitionRef,
+            TokenTransition,
+        };
+        use permissions::*;
+
+        let cases = [
+            (TokenTransition::Burn(Default::default()), TOKEN_BURN),
+            (TokenTransition::Mint(Default::default()), TOKEN_MINT),
+            (
+                TokenTransition::Transfer(TokenTransferTransitionV0::default().into()),
+                TOKEN_TRANSFER,
+            ),
+            (TokenTransition::Freeze(Default::default()), TOKEN_FREEZE),
+            (
+                TokenTransition::Unfreeze(Default::default()),
+                TOKEN_UNFREEZE,
+            ),
+            (
+                TokenTransition::DestroyFrozenFunds(Default::default()),
+                TOKEN_DESTROY_FROZEN_FUNDS,
+            ),
+            (TokenTransition::Claim(Default::default()), TOKEN_CLAIM),
+            (
+                TokenTransition::EmergencyAction(Default::default()),
+                TOKEN_EMERGENCY_ACTION,
+            ),
+            (
+                TokenTransition::ConfigUpdate(Default::default()),
+                TOKEN_CONFIG_UPDATE,
+            ),
+            (
+                TokenTransition::DirectPurchase(Default::default()),
+                TOKEN_DIRECT_PURCHASE,
+            ),
+            (
+                TokenTransition::SetPriceForDirectPurchase(Default::default()),
+                TOKEN_SET_PRICE,
+            ),
+        ];
+        // Only the operation and contract are relevant to the authorization policy;
+        // amounts, recipients and other action fields are validated separately.
+        for (transition, required) in cases {
+            let member = BatchedTransitionRef::Token(&transition);
+            let mut scope = AuthenticationScopeV0 {
+                contracts: vec![ContractScope {
+                    id: Identifier::from([0; 32]),
+                    document_types: None,
+                }],
+                permissions: required,
+                expires_at: None,
+            };
+            assert!(AuthenticationScope::V0(scope.clone()).allows_transition(member));
+            scope.permissions = ALL & !required;
+            assert!(!AuthenticationScope::V0(scope.clone()).allows_transition(member),
+                "all other permissions, including document token fees, must not authorize {transition:?}");
+            scope.permissions = ALL;
+            scope.contracts[0].id = Identifier::from([1; 32]);
+            assert!(
+                !AuthenticationScope::V0(scope).allows_transition(member),
+                "no permission may escape its contract"
+            );
+        }
     }
 
     #[cfg(all(feature = "json-conversion", feature = "value-conversion"))]
@@ -338,6 +436,7 @@ mod tests {
         use crate::address_funds::PlatformAddress;
         use crate::identity::{KeyType, Purpose, SecurityLevel};
         use crate::shielded::{
+            identity_create_from_shielded_extra_sighash_data as versioned,
             identity_create_from_shielded_extra_sighash_data_v0 as old,
             identity_create_from_shielded_extra_sighash_data_v1 as new,
         };
@@ -355,11 +454,38 @@ mod tests {
             contract_bounds: None,
         };
         let fallback = PlatformAddress::P2pkh([2; 20]);
-        let legacy: IdentityPublicKeyInCreation = key.clone().into();
-        assert_eq!(
-            old(&[1; 32], 1, &fallback, std::slice::from_ref(&legacy)).unwrap(),
-            new(&[1; 32], 1, &fallback, &[legacy]).unwrap()
-        );
+        for address in [fallback, PlatformAddress::P2sh([3; 20])] {
+            for bounds in [
+                None,
+                Some(ContractBounds::SingleContract {
+                    id: Identifier::from([4; 32]),
+                }),
+                Some(ContractBounds::SingleContractDocumentType {
+                    id: Identifier::from([4; 32]),
+                    document_type_name: "legacy".into(),
+                }),
+            ] {
+                key.contract_bounds = bounds;
+                let legacy: IdentityPublicKeyInCreation = key.clone().into();
+                let keys = std::slice::from_ref(&legacy);
+                let frozen = old(&[1; 32], 1, &address, keys).unwrap();
+                assert_eq!(frozen, new(&[1; 32], 1, &address, keys).unwrap());
+                for protocol in [13, 14] {
+                    assert_eq!(
+                        frozen,
+                        versioned(
+                            &[1; 32],
+                            1,
+                            &address,
+                            keys,
+                            crate::version::PlatformVersion::get(protocol).unwrap()
+                        )
+                        .unwrap(),
+                        "legacy key preimage must remain stable under protocol {protocol}"
+                    );
+                }
+            }
+        }
         key.contract_bounds = Some(ContractBounds::Scoped(fixture()));
         assert!(old(&[1; 32], 1, &fallback, &[key.clone().into()]).is_err());
         let original = new(&[1; 32], 1, &fallback, &[key.clone().into()]).unwrap();

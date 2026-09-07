@@ -582,6 +582,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_refresh_every_scoped_key_reference_after_revocation() {
+        use dpp::identity::contract_bounds::{
+            authentication_scope::permissions, AuthenticationScope, AuthenticationScopeV0,
+            ContractScope,
+        };
+        use drive::drive::identity::key::fetch::{
+            IdentityKeysRequest, KeyKindRequestType, KeyRequestType,
+        };
+        let version = PlatformVersion::latest();
+        let mut platform = TestPlatformBuilder::new()
+            .with_latest_protocol_version()
+            .build_with_mock_rpc()
+            .set_genesis_state();
+        let (mut identity, mut signer, _, master) =
+            setup_identity_return_master_key(&mut platform, 958, dash_to_credits!(0.1));
+        let dashpay = platform
+            .drive
+            .cache
+            .system_data_contracts
+            .load_dashpay(version)
+            .unwrap();
+        let dpns = platform
+            .drive
+            .cache
+            .system_data_contracts
+            .load_dpns(version)
+            .unwrap();
+        let mut contracts = vec![
+            ContractScope {
+                id: dashpay.id(),
+                document_types: None,
+            },
+            ContractScope {
+                id: dpns.id(),
+                document_types: Some(vec!["preorder".into()]),
+            },
+        ];
+        contracts.sort_by_key(|entry| entry.id);
+        let bounds = ContractBounds::Scoped(AuthenticationScope::V0(AuthenticationScopeV0 {
+            contracts,
+            permissions: permissions::DOCUMENT_CREATE,
+            expires_at: None,
+        }));
+        let key = setup_add_key_to_identity(
+            &mut platform,
+            &mut identity,
+            &mut signer,
+            4,
+            2,
+            Purpose::AUTHENTICATION,
+            SecurityLevel::HIGH,
+            KeyType::ECDSA_SECP256K1,
+            Some(bounds.clone()),
+        );
+        let mut update: StateTransition =
+            IdentityUpdateTransition::from(IdentityUpdateTransitionV0 {
+                identity_id: identity.id(),
+                revision: 1,
+                nonce: 1,
+                add_public_keys: vec![],
+                disable_public_keys: vec![key.id()],
+                user_fee_increase: 0,
+                signature_public_key_id: master.id(),
+                signature: Default::default(),
+            })
+            .into();
+        update.set_signature(
+            signer
+                .sign(&master, &update.signable_bytes().unwrap())
+                .await
+                .unwrap(),
+        );
+        let block = BlockInfo {
+            time_ms: 1001,
+            ..Default::default()
+        };
+        let transaction = platform.drive.grove.start_transaction();
+        let state = platform.state.load();
+        let result = platform
+            .platform
+            .process_raw_state_transitions(
+                &vec![update.serialize_to_bytes().unwrap()],
+                &state,
+                &block,
+                &transaction,
+                version,
+                true,
+                None,
+            )
+            .unwrap();
+        assert_matches!(
+            result.execution_results().as_slice(),
+            [StateTransitionExecutionResult::SuccessfulExecution { .. }]
+        );
+        platform
+            .drive
+            .grove
+            .commit_transaction(transaction)
+            .unwrap()
+            .unwrap();
+
+        // Both current-key references must resolve to the updated key, not its old hash.
+        for request_type in [
+            KeyRequestType::ContractBoundKey(
+                dashpay.id().to_buffer(),
+                Purpose::AUTHENTICATION,
+                KeyKindRequestType::CurrentKeyOfKindRequest,
+            ),
+            KeyRequestType::ContractDocumentTypeBoundKey(
+                dpns.id().to_buffer(),
+                "preorder".into(),
+                Purpose::AUTHENTICATION,
+                KeyKindRequestType::CurrentKeyOfKindRequest,
+            ),
+        ] {
+            let fetched = platform
+                .drive
+                .fetch_identity_keys_as_partial_identity(
+                    IdentityKeysRequest {
+                        identity_id: identity.id().to_buffer(),
+                        request_type,
+                        limit: None,
+                        offset: None,
+                    },
+                    None,
+                    version,
+                )
+                .unwrap()
+                .unwrap();
+            let refreshed = fetched
+                .loaded_public_keys
+                .get(&key.id())
+                .expect("scoped key reference");
+            assert_eq!(refreshed.disabled_at(), Some(block.time_ms));
+            assert_eq!(refreshed.contract_bounds(), Some(&bounds));
+        }
+        assert!(
+            platform
+                .drive
+                .grove
+                .visualize_verify_grovedb(None, true, false, &version.drive.grove_version,)
+                .unwrap()
+                .is_empty(),
+            "revocation must leave no stale GroveDB references"
+        );
+    }
+
+    #[tokio::test]
     async fn test_identity_update_that_disables_an_encryption_key() {
         let platform_config = PlatformConfig {
             testing_configs: PlatformTestConfig {
