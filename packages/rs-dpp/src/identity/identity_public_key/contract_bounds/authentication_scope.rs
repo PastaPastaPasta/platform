@@ -357,7 +357,7 @@ mod tests {
         let fallback = PlatformAddress::P2pkh([2; 20]);
         let legacy: IdentityPublicKeyInCreation = key.clone().into();
         assert_eq!(
-            old(&[1; 32], 1, &fallback, &[legacy.clone()]).unwrap(),
+            old(&[1; 32], 1, &fallback, std::slice::from_ref(&legacy)).unwrap(),
             new(&[1; 32], 1, &fallback, &[legacy]).unwrap()
         );
         key.contract_bounds = Some(ContractBounds::Scoped(fixture()));
