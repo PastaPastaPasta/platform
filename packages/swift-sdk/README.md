@@ -59,6 +59,9 @@ application-supplied context provider with a suitable trust anchor.
 verified mode, document operations fetch missing contracts through verified
 Platform queries before caching them.
 
+See the [Apple proof-verification size report](PROOF_SIZE_REPORT.md) for measured
+shipping download sizes, packaging savings, and validation scope.
+
 ## API Reference
 
 ### Identity Operations

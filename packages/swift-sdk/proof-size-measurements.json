@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "measurement_date": "2026-09-08",
+  "unit": "bytes",
+  "artifact": "DashSDKFFI.xcframework.zip (iOS arm64, macOS arm64, iOS simulator arm64)",
+  "environment": {
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)\nbinary: rustc\ncommit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234\ncommit-date: 2025-12-08\nhost: aarch64-apple-darwin\nrelease: 1.92.0\nLLVM version: 21.1.3",
+    "cargo": "cargo 1.92.0 (344c4567c 2025-10-21)",
+    "xcode": "Xcode 26.6\nBuild version 17F113",
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t26.5\nBuildVersion:\t\t25F71",
+    "arch": "arm64",
+    "profile": "release-ios",
+    "features": [
+      "shielded"
+    ],
+    "targets": [
+      "aarch64-apple-ios",
+      "aarch64-apple-ios-sim",
+      "aarch64-apple-darwin"
+    ],
+    "packaging": [
+      "xcodebuild -create-xcframework",
+      "ditto -c -k --sequesterRsrc --keepParent"
+    ],
+    "deployment": {
+      "IPHONEOS_DEPLOYMENT_TARGET": "17.0",
+      "IPHONESIMULATOR_DEPLOYMENT_TARGET": "17.0",
+      "MACOSX_DEPLOYMENT_TARGET": "15.0"
+    },
+    "base_commit": "64f94838d2e1f2fa2eecb890a7ff6f97efd265c6",
+    "source_paths": {
+      "aarch64-apple-ios": "/private/tmp/platform-proof-ios-baseline",
+      "aarch64-apple-ios-sim": "/private/tmp/platform-proof-apple-secondary",
+      "aarch64-apple-darwin": "/private/tmp/platform-proof-apple-secondary"
+    },
+    "notes": [
+      "Each before/after target is compiled from the identical source path with the same compiler, deployment versions, profile and features.",
+      "macOS and iOS simulator use a second worktree to permit baseline compilation while measuring device changes.",
+      "ZIP timestamps are not deterministic; exact measured artifact SHA256 values are recorded."
+    ]
+  },
+  "source_validation": {
+    "source_commit": "6babdb452c91b2f0ace8faa6d79b0e0f8a04fd7e",
+    "native_snapshot_patch_sha256": "796885eaf1dfbd8326af24163af9fcededee252696eb866f386f87d6dcc45e2c",
+    "rust_manifest_mismatches": [],
+    "shipping_script_sha256": "d657e34f13e430cf5c3c6088eb9221876d580ce20362bd96ee23c0680d2725c4"
+  },
+  "build_invocation": "cargo build -p rs-unified-sdk-ffi --profile release-ios --target TARGET --features shielded",
+  "build_targets_invoked_separately": true,
+  "profile": {
+    "opt_level": 3,
+    "lto": "fat",
+    "codegen_units": 1,
+    "panic": "abort",
+    "strip": "symbols"
+  },
+  "shipping_strip_command": "xcrun strip -x DashSDKFFI.xcframework/SLICE/librs_unified_sdk_ffi.a",
+  "variants": {
+    "production-base": {
+      "bytes": 71337491,
+      "sha256": "06b35b78cbc107eaefd23235cef7a81d419a0ad6f38e2de170942102fdc475e9",
+      "slices": {
+        "ios-arm64": {
+          "raw": 62428480,
+          "gzip9": 23527820,
+          "sha256": "58b8f87b4b9030dcc1111ca32d8a4b5f826f07fb08dd001f2b6fdb69b92ed16a",
+          "xcframework_zip": 23800891,
+          "zip_sha256": "e1135dd34a914df6c0b43b0c84c737d4b5b011e99d0e417d638168140d8c418b"
+        },
+        "macos-arm64": {
+          "raw": 62056408,
+          "gzip9": 23511936,
+          "sha256": "309671a49fd6da12f2a67ecd9fe8f515c8ffaa8a6b139d11b115f0d2b782c864",
+          "xcframework_zip": 23782885,
+          "zip_sha256": "8ae3ecc03cdca2259d11f54b9acbf92a1df0d8e930e795a147fd0e6939416179"
+        },
+        "ios-arm64-simulator": {
+          "raw": 62193256,
+          "gzip9": 23480271,
+          "sha256": "43a7f60f689947300722791dcc3dc456f4204008dab6e2764c18242758c42168",
+          "xcframework_zip": 23756292,
+          "zip_sha256": "bfb252ba9529bc982503eff83b064b4dc720b52a6294908ef3eb039642349f56"
+        }
+      }
+    },
+    "production": {
+      "bytes": 72065916,
+      "sha256": "8380f753e253ee1b9a2c6f91ab1dc3e7dae9eeee36e36b2cdf48d3c8a5356c0f",
+      "slices": {
+        "ios-arm64": {
+          "raw": 62991544,
+          "gzip9": 23782185,
+          "sha256": "a577c511ef1d629361bb572d210ffdfd67cf347b3a70a67fe967e9df8639251a",
+          "xcframework_zip": 24053288,
+          "zip_sha256": "24de41fb780dd8d2252d3470baa402608f8cf04e2b488e4c72ff205d4eb385fc"
+        },
+        "macos-arm64": {
+          "raw": 62613272,
+          "gzip9": 23748324,
+          "sha256": "1aa8d1699a29caf575205c35fbbf6d44563c87da3e5eada33d441a6b1bd28369",
+          "xcframework_zip": 24016837,
+          "zip_sha256": "64f78bb04ed015c8684d3836333d71e118d5a8562f591fc6f43c1cad9d80f8fa"
+        },
+        "ios-arm64-simulator": {
+          "raw": 62751280,
+          "gzip9": 23724494,
+          "sha256": "fb7d6a0145e4c70e0024d5be371a1ae309636782e66b1b48cf11ca68b961c775",
+          "xcframework_zip": 23998370,
+          "zip_sha256": "a910c0987c21c3d3022ea31244d838e3c094574b79072797c4eae7cc68f36add"
+        }
+      }
+    },
+    "production-base-stripped": {
+      "bytes": 63438519,
+      "sha256": "1e636acb57030fe4ca3c22626169065a2f7ba3946c11dc84cb3c7d5532fd7850",
+      "slices": {
+        "ios-arm64": {
+          "raw": 51679432,
+          "gzip9": 20935445,
+          "sha256": "de8c3fa438b02b96d471da65c6c997ed2b4a007edcaee645fd646f98ee547fca",
+          "preserved_defined_global_symbols": 2276
+        },
+        "macos-arm64": {
+          "raw": 51479296,
+          "gzip9": 20916565,
+          "sha256": "e7ca1b967d389effbde76d2881bdb736cda89368035a84b2c20dbd0cec116e71",
+          "preserved_defined_global_symbols": 2275
+        },
+        "ios-arm64-simulator": {
+          "raw": 51467080,
+          "gzip9": 20897402,
+          "sha256": "c3044769b9265bad51e2fd12aeb51c3493329e8f93cad5f0089bd600cc8c27db",
+          "preserved_defined_global_symbols": 2275
+        }
+      }
+    },
+    "production-stripped": {
+      "bytes": 64100888,
+      "sha256": "a0a3c3cc3795b55aedd26ea1749a458b6174c39449d8843f7cb05c212149b40e",
+      "slices": {
+        "ios-arm64": {
+          "raw": 52148536,
+          "gzip9": 21161854,
+          "sha256": "0cf79300d3102be89f4fb71f0afa7a83a6d20566db090fb55d3f6f1141d5ebb6",
+          "preserved_defined_global_symbols": 2276
+        },
+        "macos-arm64": {
+          "raw": 51942272,
+          "gzip9": 21134001,
+          "sha256": "68d7a061ab808b8aec127df6cf0fe5e7354220d8251cb0326f78413b3cf27c84",
+          "preserved_defined_global_symbols": 2275
+        },
+        "ios-arm64-simulator": {
+          "raw": 51930968,
+          "gzip9": 21117034,
+          "sha256": "cf454fe2f66a775d7ca42cb283bb25a2d0fa21e5d1623491c66b6a5acd0b5f42",
+          "preserved_defined_global_symbols": 2275
+        }
+      }
+    }
+  },
+  "deltas": {
+    "shipping_vs_unchanged_baseline": -7236603,
+    "source_change_with_identical_stripping": 662369,
+    "source_change_with_original_packaging": 728425,
+    "packaging_savings_on_updated_sdk": -7965028
+  },
+  "download_increase_limit_bytes": 500000,
+  "shipping_download_gate_passed": true,
+  "isolated_three_slice_source_delta_below_limit": false,
+  "validation": {
+    "all_three_release_targets_built": true,
+    "defined_global_symbol_multisets_preserved": true,
+    "swift_runtime_platform": "macOS arm64",
+    "swift_selected_tests_passed": 8,
+    "swift_selected_tests_failed": 0,
+    "ios_device_runtime_tested": false,
+    "full_swift_suite_run": false,
+    "ffi_unit_tests": {
+      "passed": 328,
+      "failed": 0,
+      "ignored": 1
+    },
+    "core_proof_tests": {
+      "native_passed": 3,
+      "node_wasm_passed": 3
+    },
+    "kotlin_lifecycle_tests_passed": 4,
+    "jni_native_check_passed": true
+  },
+  "artifact_root_local": "/tmp/platform-mining-ios-measurements",
+  "limitations": [
+    "Archive metadata/timestamps are not deterministic; SHA256 identifies exact measured artifacts.",
+    "The download gate uses the complete shipping ZIP including packaging savings; isolated proof/integration overhead across all three slices exceeds 500,000 bytes.",
+    "These measurements do not establish Android package size or installed application size."
+  ]
+}

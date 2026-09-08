@@ -26,13 +26,18 @@ Recorded local results:
 
 - Core: complete Apple ARM64 build after merging `develop` at `30a87486af47`;
   six proof unit tests; RPC verification and index/restart functional test;
-  format-string and suite-name lint.
+  format-string, suite-name, circular-dependency and cppcheck lint;
+  rebuilt with thread-safety warnings treated as errors after CI feedback.
 - Shared Rust verifier: native and Node WebAssembly fixture/adversarial tests.
 - DAPI: 308 unit tests.
 - Shared trusted/verified context provider: 22 native tests and one streamed
   WebAssembly transport test.
 - Rust SDK: 188 unit tests, including verified defaults and explicit trusted
   provider precedence; native SDK and WASM SDK compile checks.
+- Native/mobile: 328 FFI tests (one additional test ignored), JNI compile check,
+  Kotlin compilation and four lifecycle tests; eight Swift runtime tests relinked
+  against the exact stripped release XCFramework, including verified defaults on
+  both networks and mnemonic-derived ECDSA signing.
 - JavaScript: TypeScript build, production webpack build, 223 Node and 223 Chrome unit tests,
   targeted ESLint; gateway template rendering test.
 
@@ -81,3 +86,27 @@ artifacts, including snapshot constants and proof verification, not standalone
 verifier estimates. Exact artifact sizes and hashes are recorded in
 [mining-proof-wasm-sizes.json](mining-proof-wasm-sizes.json). Results apply to the
 recorded builds; SDK/toolchain updates should repeat this comparison.
+
+### Apple release package
+
+Exact sequential release builds use the same baseline commit and source path,
+with the existing production flags for iOS device, iOS simulator and macOS ARM64.
+The updated release packaging strips local symbols from archive copies inside
+the XCFramework. All defined global symbols are preserved; the packaged archives
+were relinked for the eight passing Swift runtime tests.
+
+| Three-slice XCFramework ZIP | Baseline bytes | Updated bytes | Change |
+| --- | ---: | ---: | ---: |
+| Actual old/new release packaging | 71,337,491 | 64,100,888 | -7,236,603 |
+| Both versions stripped identically | 63,438,519 | 64,100,888 | +662,369 |
+| Both versions without stripping | 71,337,491 | 72,065,916 | +728,425 |
+
+The actual Apple SDK download decreases, meeting the requested download budget.
+The isolated proof implementation across all three slices exceeds 500,000 bytes;
+the net decrease comes from release packaging savings. The device-only archive's
+gzip increase after identical stripping is 226,409 bytes. These measurements do
+not establish Android package or final application download sizes.
+
+Exact Apple artifact hashes, build provenance and runtime scope are recorded in
+[the Apple size report](../packages/swift-sdk/PROOF_SIZE_REPORT.md) and its linked
+measurement JSON.
