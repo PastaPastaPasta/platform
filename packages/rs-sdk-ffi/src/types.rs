@@ -66,7 +66,8 @@ pub struct DashSDKConfig {
     /// Network to connect to
     pub network: FFINetwork,
     /// Comma-separated list of DAPI addresses (e.g., "http://127.0.0.1:3000,http://127.0.0.1:3001")
-    /// If null or empty, will use mock SDK.
+    /// If null or empty, use the network seed addresses (mainnet/testnet).
+    /// Mock instances require the explicit mock constructor.
     ///
     /// This pointer is only read during the creation call; the string data is
     /// immediately copied into Rust-owned memory.
@@ -77,18 +78,15 @@ pub struct DashSDKConfig {
     pub request_retry_count: u32,
     /// Timeout for requests in milliseconds
     pub request_timeout_ms: u64,
-    /// Optional override for the trusted-context-provider quorum lookup base URL
-    /// (e.g., `"https://quorums.devnet.example.networks.dash.org"` or
-    /// `"http://127.0.0.1:22444"`). When null/empty, the provider uses the
-    /// default endpoint derived from `network` (mainnet/testnet only — devnet
-    /// needs an explicit URL, regtest defaults to the local sidecar).
+    /// Optional quorum proof/key service base URL (e.g.,
+    /// `"https://quorums.testnet.networks.dash.org"`). When null/empty,
+    /// verified mainnet/testnet use the default proof sources. Trusted mode
+    /// uses its network's quorum server; devnet requires an explicit URL,
+    /// and trusted regtest defaults to the local sidecar.
     ///
-    /// **Only honored on the `dash_sdk_create_trusted` path** — that's the
-    /// path that builds a `TrustedHttpContextProvider`, which is the
-    /// component that actually performs quorum lookups. The callback-based
-    /// path (`dash_sdk_create_with_callbacks`) uses `CallbackContextProvider`
-    /// and ignores this field entirely; non-null values there are silently
-    /// dropped.
+    /// In verified mode this selects an untrusted proof source. In trusted mode
+    /// it selects the quorum-key source. Explicit callback/context providers
+    /// own their data sources and ignore this field.
     ///
     /// Same lifetime contract as `dapi_addresses`: borrowed, copied
     /// immediately, caller may free after the FFI call returns.

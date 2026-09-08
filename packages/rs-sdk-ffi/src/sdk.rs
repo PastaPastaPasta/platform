@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use dash_sdk::dpp::serialization::PlatformDeserializableWithPotentialValidationFromVersionedStructure;
 use dash_sdk::sdk::AddressList;
@@ -39,9 +39,63 @@ fn apply_version(builder: SdkBuilder, platform_version: u32) -> Result<SdkBuilde
     }
 }
 
+/// Resolve transport seeds without implicitly enabling the mock SDK.
+unsafe fn configured_builder(config: &DashSDKConfig) -> Result<SdkBuilder, DashSDKError> {
+    let network: Network = config.network.into();
+    let addresses = if config.dapi_addresses.is_null() {
+        ""
+    } else {
+        CStr::from_ptr(config.dapi_addresses)
+            .to_str()
+            .map_err(|e| {
+                DashSDKError::new(
+                    DashSDKErrorCode::InvalidParameter,
+                    format!("Invalid DAPI addresses: {e}"),
+                )
+            })?
+    };
+    let builder = if addresses.is_empty() {
+        match network {
+            Network::Mainnet => SdkBuilder::new_mainnet(),
+            Network::Testnet => SdkBuilder::new_testnet(),
+            _ => {
+                return Err(DashSDKError::new(
+                    DashSDKErrorCode::InvalidParameter,
+                    format!("DAPI addresses must be supplied for {network:?}"),
+                ))
+            }
+        }
+    } else {
+        let addresses = AddressList::from_str(addresses).map_err(|e| {
+            DashSDKError::new(
+                DashSDKErrorCode::InvalidParameter,
+                format!("Invalid DAPI addresses: {e}"),
+            )
+        })?;
+        SdkBuilder::new(addresses).with_network(network)
+    };
+    let builder = if config.quorum_url.is_null() {
+        builder
+    } else {
+        let source = CStr::from_ptr(config.quorum_url).to_str().map_err(|e| {
+            DashSDKError::new(
+                DashSDKErrorCode::InvalidParameter,
+                format!("Invalid proof source URL: {e}"),
+            )
+        })?;
+        if source.is_empty() {
+            builder
+        } else {
+            builder.with_proof_sources(vec![source.to_owned()])
+        }
+    };
+    Ok(builder)
+}
+
 /// Internal SDK wrapper
 pub(crate) struct SDKWrapper {
     pub sdk: Sdk,
+    pub verification_mode: &'static str,
     pub runtime: Arc<BigStackRuntime>,
     pub trusted_provider: Option<Arc<rs_sdk_trusted_context_provider::TrustedHttpContextProvider>>,
 }
@@ -50,6 +104,7 @@ impl SDKWrapper {
     fn new(sdk: Sdk, runtime: Runtime) -> Self {
         SDKWrapper {
             sdk,
+            verification_mode: "mock",
             runtime: Arc::new(BigStackRuntime::new(runtime)),
             trusted_provider: None,
         }
@@ -63,9 +118,36 @@ impl SDKWrapper {
     ) -> Self {
         SDKWrapper {
             sdk,
+            verification_mode: "trusted",
             runtime: Arc::new(BigStackRuntime::new(runtime)),
             trusted_provider: Some(provider),
         }
+    }
+
+    /// Resolve contracts through the configured provider or a verified Platform query.
+    pub async fn data_contract(
+        &self,
+        id: dash_sdk::dpp::prelude::Identifier,
+    ) -> Result<Arc<dash_sdk::dpp::prelude::DataContract>, FFIError> {
+        use dash_sdk::platform::Fetch;
+        use drive_proof_verifier::ContextProvider;
+        if let Some(provider) = self.sdk.context_provider() {
+            if let Some(contract) = provider
+                .get_data_contract(&id, self.sdk.version())
+                .map_err(|e| FFIError::InternalError(format!("Failed to resolve contract: {e}")))?
+            {
+                return Ok(contract);
+            }
+        }
+        let contract = dash_sdk::dpp::prelude::DataContract::fetch(&self.sdk, id)
+            .await
+            .map_err(|e| FFIError::InternalError(format!("Failed to fetch contract: {e}")))?
+            .map(Arc::new)
+            .ok_or_else(|| FFIError::InternalError(format!("Contract {id} not found")))?;
+        if let Some(provider) = self.sdk.context_provider() {
+            provider.register_data_contract(Arc::clone(&contract));
+        }
+        Ok(contract)
     }
 
     #[cfg(test)]
@@ -77,6 +159,7 @@ impl SDKWrapper {
             .expect("Failed to create test SDK");
         SDKWrapper {
             sdk,
+            verification_mode: "mock",
             runtime,
             trusted_provider: None,
         }
@@ -97,7 +180,8 @@ fn init_or_get_runtime() -> Result<Arc<BigStackRuntime>, String> {
     Ok(arc)
 }
 
-/// Create a new SDK instance
+/// Create a new SDK instance with snapshot-backed quorum proof verification.
+/// Use `dash_sdk_create_trusted` to explicitly trust the quorum server instead.
 ///
 /// # Safety
 /// - `config` must be a valid pointer to a DashSDKConfig structure for the duration of the call.
@@ -113,9 +197,6 @@ pub unsafe extern "C" fn dash_sdk_create(config: *const DashSDKConfig) -> DashSD
 
     let config = &*config;
 
-    // Parse configuration
-    let network: Network = config.network.into();
-
     // Use shared runtime
     let runtime = match init_or_get_runtime() {
         Ok(rt) => rt,
@@ -124,38 +205,9 @@ pub unsafe extern "C" fn dash_sdk_create(config: *const DashSDKConfig) -> DashSD
         }
     };
 
-    // Parse DAPI addresses
-    let builder = if config.dapi_addresses.is_null() {
-        // Use mock SDK if no addresses provided
-        SdkBuilder::new_mock().with_network(network)
-    } else {
-        let addresses_str = match unsafe { CStr::from_ptr(config.dapi_addresses) }.to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                return DashSDKResult::error(DashSDKError::new(
-                    DashSDKErrorCode::InvalidParameter,
-                    format!("Invalid DAPI addresses string: {}", e),
-                ))
-            }
-        };
-
-        if addresses_str.is_empty() {
-            // Use mock SDK if addresses string is empty
-            SdkBuilder::new_mock().with_network(network)
-        } else {
-            // Parse the address list
-            let address_list = match AddressList::from_str(addresses_str) {
-                Ok(list) => list,
-                Err(e) => {
-                    return DashSDKResult::error(DashSDKError::new(
-                        DashSDKErrorCode::InvalidParameter,
-                        format!("Failed to parse DAPI addresses: {}", e),
-                    ))
-                }
-            };
-
-            SdkBuilder::new(address_list).with_network(network)
-        }
+    let builder = match configured_builder(config) {
+        Ok(builder) => builder,
+        Err(error) => return DashSDKResult::error(error),
     };
 
     let builder = match apply_version(builder, config.platform_version) {
@@ -171,6 +223,7 @@ pub unsafe extern "C" fn dash_sdk_create(config: *const DashSDKConfig) -> DashSD
             // Clone Arc<Runtime> into the wrapper
             let wrapper = Box::new(SDKWrapper {
                 sdk,
+                verification_mode: "verified",
                 runtime,
                 trusted_provider: None,
             });
@@ -201,9 +254,6 @@ pub unsafe extern "C" fn dash_sdk_create_extended(
     let config = &*config;
     let base_config = &config.base_config;
 
-    // Parse configuration
-    let network: Network = base_config.network.into();
-
     // Use shared runtime
     let runtime = match init_or_get_runtime() {
         Ok(rt) => rt,
@@ -212,50 +262,24 @@ pub unsafe extern "C" fn dash_sdk_create_extended(
         }
     };
 
-    // Parse DAPI addresses
-    let mut builder = if base_config.dapi_addresses.is_null() {
-        // Use mock SDK if no addresses provided
-        SdkBuilder::new_mock().with_network(network)
-    } else {
-        let addresses_str = match unsafe { CStr::from_ptr(base_config.dapi_addresses) }.to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                return DashSDKResult::error(DashSDKError::new(
-                    DashSDKErrorCode::InvalidParameter,
-                    format!("Invalid DAPI addresses string: {}", e),
-                ))
-            }
-        };
-
-        if addresses_str.is_empty() {
-            // Use mock SDK if addresses string is empty
-            SdkBuilder::new_mock().with_network(network)
-        } else {
-            // Parse the address list
-            let address_list = match AddressList::from_str(addresses_str) {
-                Ok(list) => list,
-                Err(e) => {
-                    return DashSDKResult::error(DashSDKError::new(
-                        DashSDKErrorCode::InvalidParameter,
-                        format!("Failed to parse DAPI addresses: {}", e),
-                    ))
-                }
-            };
-
-            SdkBuilder::new(address_list).with_network(network)
-        }
+    let mut builder = match configured_builder(base_config) {
+        Ok(builder) => builder,
+        Err(error) => return DashSDKResult::error(error),
     };
 
+    let mut verification_mode = "verified";
     // Check if context provider is provided
     if !config.context_provider.is_null() {
         let provider_wrapper = &*(config.context_provider as *const ContextProviderWrapper);
         builder = builder.with_context_provider(provider_wrapper.provider());
+        verification_mode = "custom";
     } else if !config.core_sdk_handle.is_null() {
         // Use registered global callbacks if available; otherwise return an error
         if let Some(callback_provider) =
             crate::context_callbacks::CallbackContextProvider::from_global()
         {
             builder = builder.with_context_provider(callback_provider);
+            verification_mode = "custom";
         } else {
             return DashSDKResult::error(DashSDKError::new(
                 DashSDKErrorCode::InternalError,
@@ -268,6 +292,7 @@ pub unsafe extern "C" fn dash_sdk_create_extended(
             crate::context_callbacks::CallbackContextProvider::from_global()
         {
             builder = builder.with_context_provider(callback_provider);
+            verification_mode = "custom";
         }
     }
 
@@ -283,6 +308,7 @@ pub unsafe extern "C" fn dash_sdk_create_extended(
         Ok(sdk) => {
             let wrapper = Box::new(SDKWrapper {
                 sdk,
+                verification_mode,
                 runtime,
                 trusted_provider: None,
             });
@@ -293,10 +319,11 @@ pub unsafe extern "C" fn dash_sdk_create_extended(
     }
 }
 
-/// Create a new SDK instance with trusted setup
+/// Create a new SDK instance with explicitly trusted quorum keys
 ///
 /// This creates an SDK with a trusted context provider that fetches quorum keys and
-/// data contracts from trusted endpoints instead of requiring proof verification.
+/// data contracts from trusted endpoints. Platform response proofs remain verified;
+/// this skips the Core proof chain authenticating the quorum keys.
 ///
 /// # Safety
 /// - `config` must be a valid pointer to a DashSDKConfig structure
@@ -492,21 +519,6 @@ pub unsafe extern "C" fn dash_sdk_create_trusted(config: *const DashSDKConfig) -
 
             let runtime_clone = runtime.handle().clone();
             runtime_clone.spawn(async move {
-                // First, try a simple HTTP test
-                debug!("dash_sdk_create_trusted: testing basic HTTP connectivity");
-                match reqwest::get("https://www.google.com").await {
-                    Ok(_) => debug!("dash_sdk_create_trusted: basic HTTP test successful (Google)"),
-                    Err(e) => warn!(error = %e, "dash_sdk_create_trusted: basic HTTP test failed"),
-                }
-
-                // Try the quorums endpoint directly
-                debug!("dash_sdk_create_trusted: testing quorums endpoint directly");
-                match reqwest::get("https://quorums.testnet.networks.dash.org/quorums").await {
-                    Ok(resp) => debug!(status = %resp.status(), "dash_sdk_create_trusted: direct quorums endpoint test successful"),
-                    Err(e) => warn!(error = %e, "dash_sdk_create_trusted: direct quorums endpoint test failed"),
-                }
-
-                // Now try through the provider
                 match provider_for_prefetch.update_quorum_caches().await {
                     Ok(_) => info!("dash_sdk_create_trusted: successfully prefetched quorums"),
                     Err(e) => warn!(error = %e, "dash_sdk_create_trusted: failed to prefetch quorums; continuing"),
@@ -515,6 +527,7 @@ pub unsafe extern "C" fn dash_sdk_create_trusted(config: *const DashSDKConfig) -
 
             let wrapper = Box::new(SDKWrapper {
                 sdk,
+                verification_mode: "trusted",
                 runtime,
                 trusted_provider: Some(provider_for_wrapper),
             });
@@ -825,6 +838,97 @@ pub unsafe extern "C" fn dash_sdk_create_handle_with_mock(
                 e
             );
             std::ptr::null_mut()
+        }
+    }
+}
+
+#[cfg(test)]
+mod proof_configuration_tests {
+    use super::*;
+    use std::ptr;
+
+    fn config(network: FFINetwork) -> DashSDKConfig {
+        DashSDKConfig {
+            network,
+            dapi_addresses: ptr::null(),
+            quorum_url: ptr::null(),
+            skip_asset_lock_proof_verification: false,
+            request_retry_count: 1,
+            request_timeout_ms: 8000,
+            platform_version: 0,
+        }
+    }
+
+    #[test]
+    fn missing_addresses_select_real_verified_testnet_sdk() {
+        unsafe {
+            let result = dash_sdk_create(&config(FFINetwork::Testnet));
+            assert!(result.error.is_null());
+            assert!(!result.data.is_null());
+            let wrapper = &*(result.data as *const SDKWrapper);
+            assert_eq!(wrapper.verification_mode, "verified");
+            assert!(wrapper.trusted_provider.is_none());
+            assert!(wrapper.sdk.context_provider().is_some());
+            assert!(wrapper.sdk.address_list().get_live_address().is_some());
+            dash_sdk_destroy(result.data as *mut SDKHandle);
+        }
+    }
+
+    #[test]
+    fn contract_cache_miss_uses_sdk_fetch_and_registers_result() {
+        use dash_sdk::dpp::data_contract::accessors::v0::{
+            DataContractV0Getters, DataContractV0Setters,
+        };
+        use dash_sdk::dpp::prelude::{DataContract, Identifier};
+        use dash_sdk::dpp::system_data_contracts::{load_system_data_contract, SystemDataContract};
+        use drive_proof_verifier::ContextProvider;
+
+        let provider = Arc::new(
+            rs_sdk_trusted_context_provider::TrustedHttpContextProvider::new(
+                Network::Testnet,
+                None,
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut wrapper = SDKWrapper::new_mock();
+        wrapper.sdk = SdkBuilder::new_mock()
+            .with_context_provider(Arc::clone(&provider))
+            .build()
+            .unwrap();
+        let mut contract =
+            load_system_data_contract(SystemDataContract::DPNS, wrapper.sdk.version()).unwrap();
+        let id = Identifier::from([42u8; 32]);
+        contract.set_id(id);
+        assert!(wrapper.trusted_provider.is_none());
+        assert!(provider
+            .get_data_contract(&id, wrapper.sdk.version())
+            .unwrap()
+            .is_none());
+        let runtime = Arc::clone(&wrapper.runtime);
+        runtime.block_on(async {
+            wrapper
+                .sdk
+                .mock()
+                .expect_fetch::<DataContract, _>(id, Some(contract))
+                .await
+                .unwrap();
+            let fetched = wrapper.data_contract(id).await.unwrap();
+            assert_eq!(fetched.id(), id);
+        });
+        assert!(provider
+            .get_data_contract(&id, wrapper.sdk.version())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn unsupported_network_without_addresses_fails_instead_of_using_mocks() {
+        unsafe {
+            let result = dash_sdk_create(&config(FFINetwork::Regtest));
+            assert!(!result.error.is_null());
+            assert_eq!((*result.error).code, DashSDKErrorCode::InvalidParameter);
+            crate::dash_sdk_error_free(result.error);
         }
     }
 }

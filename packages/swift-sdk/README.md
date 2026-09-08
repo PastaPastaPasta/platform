@@ -38,6 +38,27 @@ cargo build --release
 import SwiftDashSDK
 ```
 
+## Quorum verification
+
+Mainnet and testnet SDK instances authenticate quorum keys using Core proofs
+anchored in the SDK's embedded snapshot. Seeded nodes and configured proof
+servers are untrusted transports. Invalid or unavailable proofs return errors;
+there is no automatic switch to trusted mode.
+
+```swift
+let sdk = try SDK(network: .testnet)
+let trustedSDK = try SDK(network: .testnet, trusted: true)
+```
+
+The explicit trusted option accepts the configured server's quorum keys and
+skips downloading and verifying the Core proof chain. Both modes still verify
+Platform response proofs. Devnet/regtest require explicit trusted mode or an
+application-supplied context provider with a suitable trust anchor.
+
+`loadKnownContracts` remains an explicit trusted-mode cache operation. In
+verified mode, document operations fetch missing contracts through verified
+Platform queries before caching them.
+
 ## API Reference
 
 ### Identity Operations

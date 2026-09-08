@@ -7,6 +7,9 @@ license = "MIT"
 description = "Trusted HTTP-based context provider for Dash Platform SDK"
 
 [dependencies]
+dash-core-proof = { path = "../rs-core-proof" }
+dash-network-seeds = { workspace = true }
+futures-util = "0.3"
 
 dash-async = { path = "../rs-dash-async" }
 dash-context-provider = { path = "../rs-context-provider" }
@@ -50,11 +53,24 @@ token-history-contract = ["dpp/token-history-contract"]
 keywords-contract = ["dpp/keywords-contract"]
 document-history-contract = ["dpp/document-history-contract"]
 
-[target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+[target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
+reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "gzip", "rustls-tls-webpki-roots"] }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+send_wrapper = { version = "0.6", features = ["futures"] }
+reqwest = { version = "0.12", features = ["json"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "Request", "RequestInit", "Response", "Headers"] }
+wasm-streams = "0.5"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

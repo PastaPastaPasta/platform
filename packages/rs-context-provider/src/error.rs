@@ -21,6 +21,14 @@ pub enum ContextProviderError {
     #[error("invalid quorum: {0}")]
     InvalidQuorum(String),
 
+    /// A verified provider needs asynchronous proof acquisition before lookup.
+    #[error("quorum proof is not cached")]
+    QuorumNotCached {
+        quorum_type: u32,
+        quorum_hash: [u8; 32],
+        core_chain_locked_height: u32,
+    },
+
     /// Core Fork Error
     #[error("activation fork error: {0}")]
     ActivationForkError(String),

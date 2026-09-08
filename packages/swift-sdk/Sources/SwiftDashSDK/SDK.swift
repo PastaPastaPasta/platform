@@ -105,8 +105,8 @@ public final class SDK: @unchecked Sendable {
     return "http://127.0.0.1:2443"
   }
 
-  /// Optional caller-provided base URL for the trusted-context-provider's
-  /// quorum lookups. Read from UserDefaults key `platformQuorumURL`.
+  /// Optional proof source base URL (quorum-key source in trusted mode).
+  /// Read from UserDefaults key `platformQuorumURL`.
   /// Required to connect to devnets (no built-in default exists on the
   /// Rust side); also usable to override mainnet/testnet for staging
   /// shards. Returns nil when unset/empty.
@@ -241,11 +241,12 @@ public final class SDK: @unchecked Sendable {
     return active.map(\.dapiUrl).joined(separator: ",")
   }
 
-  /// Create a new SDK instance with trusted setup
+  /// Create an SDK that authenticates quorum keys from an embedded Core snapshot.
   ///
-  /// This uses a trusted context provider that fetches quorum keys and
-  /// data contracts from trusted HTTP endpoints instead of requiring proof verification.
-  /// This is suitable for mobile applications where proof verification would be resource-intensive.
+  /// Set `trusted` to true to use quorum keys supplied by the configured server,
+  /// avoiding Core proof downloads and verification. Platform response proofs
+  /// remain verified in both modes. Verification failures never enable trusted mode.
+  /// Devnet/regtest require explicit trusted mode or a custom context provider.
   ///
   /// `platformVersion`:
   /// - `0` (default) — let the Rust SDK seed at the per-network minimum
@@ -256,7 +257,7 @@ public final class SDK: @unchecked Sendable {
   ///   testnet floor 12 = V1), so this picks the right wire without a
   ///   Swift-side network→version map.
   /// - non-zero — pin the SDK to this exact `PlatformVersion`.
-  public init(network: Network, platformVersion: UInt32 = 0) throws {
+  public init(network: Network, platformVersion: UInt32 = 0, trusted: Bool = false) throws {
     var config = DashSDKConfig()
     config.network = network.ffiValue
     config.dapi_addresses = nil
@@ -271,7 +272,7 @@ public final class SDK: @unchecked Sendable {
     // versions. A non-zero value is an explicit pin via `with_version`.
     config.platform_version = platformVersion
 
-    // Create SDK with trusted setup. DAPI / quorum-URL overrides come from
+    // DAPI / quorum-URL overrides come from
     // UserDefaults and apply on:
     //
     //   * Regtest unconditionally — the Rust side has no built-in DAPI
@@ -345,7 +346,7 @@ public final class SDK: @unchecked Sendable {
       var mutableConfig = config
       if let addressesCStr { mutableConfig.dapi_addresses = addressesCStr }
       if let quorumCStr { mutableConfig.quorum_url = quorumCStr }
-      return dash_sdk_create_trusted(&mutableConfig)
+      return trusted ? dash_sdk_create_trusted(&mutableConfig) : dash_sdk_create(&mutableConfig)
     }
 
     // Check for errors

@@ -236,6 +236,12 @@
                       value: "Specified service version is not supported"
                 direct_response:
                   status: 204
+              # Compact Core snapshot proofs (same HTTP route as quorum servers)
+              - match:
+                  path: "/proofs"
+                route:
+                  cluster: rs_dapi_json_rpc
+                  timeout: 65s
               # JSON RPC endpoint
               - match:
                   path: "/"

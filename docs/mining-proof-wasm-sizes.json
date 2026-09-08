@@ -1,0 +1,45 @@
+{
+  "baseline_commit": "64f94838d2e1f2fa2eecb890a7ff6f97efd265c6",
+  "runtime": {
+    "wasm_sdk_bg.wasm": {
+      "baseline": {
+        "bytes": 21450589,
+        "gzip9": 7441638,
+        "sha256": "2d0e317f06dcc8607c596f75041647d9f1fe7f12ed861b81b37682afb4bc5484"
+      },
+      "current": {
+        "bytes": 21886562,
+        "gzip9": 7580151,
+        "sha256": "c86296072599e62428e1c8933314b44af7ee08c11d1701be7009f4d20a398829"
+      }
+    },
+    "wasm_sdk.js": {
+      "baseline": {
+        "bytes": 1205488,
+        "gzip9": 95342,
+        "sha256": "5a05adc3f5b6f7d3d8e499c5eb9d17482c0de45fcfba5a7fa737ed38ac4047e8"
+      },
+      "current": {
+        "bytes": 1207057,
+        "gzip9": 95631,
+        "sha256": "1d94b006c079dd650f2b200070280823bfa2b386fdf6cffbc61145e79b43712f"
+      }
+    }
+  },
+  "npm": {
+    "baseline": {
+      "size": 25685212,
+      "unpackedSize": 63966824,
+      "shasum": "9c8a7a50e59f784b652d95ff71849976b5e0624d",
+      "integrity": "sha512-eClJ23gFw7CMMPRFgzNqlMJf8B8YDkgCzn0ldM4e57P2cOXlMxWoE5AwcgWu2HmaJS1+9cTIq2XJSdBac5DmHw=="
+    },
+    "current": {
+      "size": 26175990,
+      "unpackedSize": 65171827,
+      "shasum": "e0580ef1ba3b6b0b39cd13d651294f5e603423ba",
+      "integrity": "sha512-NiTbhPXZd6LhavzvyoPul+CZGDKrsWGSJSvIrqsn0g2TTtIt6KJfOIaRIoAS1ju93Lf+lQuT9VHAu79BD2PMHQ=="
+    }
+  },
+  "npm_delta": 490778,
+  "runtime_gzip9_delta": 138802
+}

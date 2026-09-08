@@ -269,13 +269,17 @@ describe('EvoSDK', () => {
       expect(() => new EvoSDK({ network: 'devnet', trusted: true })).to.throw(/devnetName/);
     });
 
-    it('should reject quorumUrl when trusted is false', () => {
-      expect(() => new EvoSDK({
-        network: 'devnet',
-        devnetName: 'paloma',
-        addresses: [TEST_ADDRESS_1],
-        quorumUrl: 'https://custom',
-      })).to.throw(/quorumUrl/);
+    it('should use quorumUrl as an untrusted proof relay by default', () => {
+      const sdk = new EvoSDK({ network: 'testnet', quorumUrl: 'https://custom' });
+      expect(sdk.options.quorumUrl).to.equal('https://custom');
+      expect(sdk.options.trusted).to.be.false();
+    });
+
+    it('should preserve multiple untrusted proof sources', () => {
+      const sources = ['https://mn.example', 'https://quorums.example'];
+      const sdk = new EvoSDK({ proofSources: sources });
+      expect(sdk.options.proofSources).to.deep.equal(sources);
+      expect(sdk.options.trusted).to.be.false();
     });
 
     it('should accept quorumUrl on trusted testnet (override)', () => {

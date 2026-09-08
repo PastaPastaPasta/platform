@@ -10,6 +10,8 @@
 
 pub mod error;
 pub mod provider;
+pub mod verified;
+pub use verified::VerifiedHttpContextProvider;
 pub mod types;
 
 pub use error::TrustedContextProviderError;
@@ -70,3 +72,6 @@ pub fn get_quorum_base_url(
         )),
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+mod verified_http;

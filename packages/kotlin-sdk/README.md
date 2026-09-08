@@ -9,6 +9,23 @@ Android SDK and example app for Dash Platform — the Kotlin counterpart of
 - **KotlinExampleApp**: a Jetpack Compose app demonstrating the full surface,
   a one-for-one port of SwiftExampleApp
 
+## Quorum verification
+
+Mainnet and testnet authenticate quorum keys with Core proofs anchored in the
+SDK's embedded snapshot. Proof sources are untrusted transports, and failed
+verification returns an error without switching modes.
+
+```kotlin
+val sdk = Sdk.create(SdkConfig(network = Network.TESTNET))
+val trustedSdk = Sdk.create(SdkConfig(network = Network.TESTNET, trusted = true))
+```
+
+Explicit trusted mode accepts the quorum server's keys, avoiding Core proof
+chain downloads and verification. Both modes still verify Platform response
+proofs. Devnet/regtest require explicit trusted mode or an application-supplied
+context provider. The native JNI `createTrusted` entry point remains available
+for callers that explicitly select it.
+
 ## Layout
 
 ```

@@ -19,6 +19,7 @@ pub struct CoreClient {
     client: Arc<Client>,
     cache: LruResponseCache,
     access_guard: Arc<CoreRpcAccessGuard>,
+    proof_guard: Arc<Semaphore>,
 }
 
 impl CoreClient {
@@ -36,6 +37,7 @@ impl CoreClient {
             client: Arc::new(client),
             cache: LruResponseCache::with_capacity("core_client", cache_capacity_bytes),
             access_guard: Arc::new(CoreRpcAccessGuard::new(CORE_RPC_GUARD_PERMITS)),
+            proof_guard: Arc::new(Semaphore::new(2)),
         })
     }
 
@@ -81,6 +83,45 @@ impl CoreClient {
                 ))
             })?
             .map_err(DapiError::TaskJoin)
+    }
+
+    /// Relay bounded binary bootstrap evidence. The caller independently verifies it.
+    pub async fn get_quorum_proof(&self, request: &ProofRequest) -> DAPIResult<Vec<u8>> {
+        request.validate()?;
+        let key = make_cache_key("get_quorum_proof", request);
+        if let Some(bytes) = self
+            .cache
+            .get_with_ttl(&key, std::time::Duration::from_secs(15))
+        {
+            return Ok(bytes);
+        }
+        let permit = self
+            .proof_guard
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| DapiError::client("Proof generation busy"))?;
+        let client = self.client.clone();
+        let params = request.params();
+        // The worker owns the permit through RPC completion, even if HTTP times out.
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            client.call::<serde_json::Value>("getquorumproofchain", &params)
+        });
+        let value = timeout(std::time::Duration::from_secs(60), task)
+            .await
+            .map_err(|_| DapiError::timeout("Proof generation timed out"))?
+            .map_err(DapiError::TaskJoin)??;
+        let encoded = value
+            .get("bootstrap_hex")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| DapiError::invalid_data("Missing bootstrap proof"))?;
+        if encoded.is_empty() || encoded.len() > 2 * 1_048_576 {
+            return Err(DapiError::invalid_data("Invalid proof size"));
+        }
+        let bytes =
+            hex::decode(encoded).map_err(|_| DapiError::invalid_data("Invalid proof encoding"))?;
+        self.cache.put(key, &bytes);
+        Ok(bytes)
     }
 
     /// Retrieve the current block count from Dash Core as a `u32`.
@@ -475,5 +516,93 @@ impl CoreRpcAccessGuard {
             .acquire_owned()
             .await
             .expect("Core RPC access guard semaphore not closed")
+    }
+}
+
+/// Public HTTP relay request; hashes use conventional RPC display byte order.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProofRequest {
+    pub checkpoint: String,
+    #[serde(default)]
+    pub height: u32,
+    pub quorum_hash: String,
+    pub llmq_type: u8,
+    pub node_count: u8,
+}
+impl ProofRequest {
+    fn validate(&self) -> DAPIResult<()> {
+        let hash = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        if !hash(&self.checkpoint)
+            || !hash(&self.quorum_hash)
+            || !matches!(self.llmq_type, 4 | 6)
+            || self.node_count > 15
+            || self.height > i32::MAX as u32
+        {
+            return Err(DapiError::InvalidArgument("Invalid proof request".into()));
+        }
+        Ok(())
+    }
+    fn params(&self) -> Vec<serde_json::Value> {
+        vec![
+            self.checkpoint.clone().into(),
+            self.height.into(),
+            self.quorum_hash.clone().into(),
+            self.llmq_type.into(),
+            self.node_count.into(),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use super::*;
+    use axum::{Json, Router, routing::post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn should_relay_and_cache_exact_bootstrap_bytes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let evidence = include_bytes!("../../../rs-core-proof/tests/data/bootstrap.bin");
+        let app = Router::new().route("/", post(move |Json(value): Json<serde_json::Value>| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(value["method"], "getquorumproofchain");
+                Json(serde_json::json!({"result":{"bootstrap_hex":hex::encode(evidence)}, "error":null,"id":value["id"]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = CoreClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test".into(),
+            Zeroizing::new("test".into()),
+            2_097_152,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut request = ProofRequest {
+            checkpoint: "ab".repeat(32),
+            height: 1,
+            quorum_hash: "cd".repeat(32),
+            llmq_type: 6,
+            node_count: 4,
+        };
+        for _ in 0..2 {
+            assert_eq!(client.get_quorum_proof(&request).await.unwrap(), evidence);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        request.node_count = 16;
+        assert!(client.get_quorum_proof(&request).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        request.node_count = 4;
+        request.height = 2;
+        let _first = client.proof_guard.clone().acquire_owned().await.unwrap();
+        let _second = client.proof_guard.clone().acquire_owned().await.unwrap();
+        assert!(client.get_quorum_proof(&request).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 }

@@ -416,6 +416,7 @@ mod tests {
             .to_string();
         let wrapper = Box::new(crate::sdk::SDKWrapper {
             sdk,
+            verification_mode: "trusted",
             runtime: Arc::new(crate::runtime::BigStackRuntime::build_shared().expect("runtime")),
             trusted_provider: None,
         });

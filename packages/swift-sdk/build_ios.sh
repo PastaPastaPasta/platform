@@ -303,6 +303,14 @@ xcodebuild -create-xcframework \
   ${SIM_LIB:+-library "$SIM_LIB" -headers "$SIM_HEADERS"} \
   -output "$XCFRAMEWORK"
 
+if [ "$PROFILE" = "release-ios" ]; then
+  # Staticlibs retain local Rust symbols even with Cargo's strip setting.
+  # Strip only the shipping copies; -x preserves global/FFI linker symbols.
+  for library in "$XCFRAMEWORK"/*/*.a; do
+    xcrun strip -x "$library"
+  done
+fi
+
 log_info "XCFramework created: $XCFRAMEWORK"
 
 # -------------------------------

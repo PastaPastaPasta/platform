@@ -4,6 +4,7 @@ version.workspace = true
 edition = "2021"
 
 [dependencies]
+rs-sdk-trusted-context-provider = { path = "../rs-sdk-trusted-context-provider" }
 
 arc-swap = { version = "1.7.1" }
 chrono = { version = "0.4.38" }

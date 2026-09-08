@@ -185,9 +185,7 @@ pub unsafe extern "C" fn dash_sdk_token_claim(
 mod tests {
     use super::*;
     use crate::token::types::DashSDKTokenDistributionType;
-    use crate::types::{
-        DashSDKConfig, DashSDKPutSettings, DashSDKStateTransitionCreationOptions, SDKHandle,
-    };
+    use crate::types::{DashSDKPutSettings, DashSDKStateTransitionCreationOptions, SDKHandle};
     use crate::DashSDKErrorCode;
     use dash_sdk::dpp::identity::identity_public_key::v0::IdentityPublicKeyV0;
     use dash_sdk::dpp::identity::{KeyType, Purpose, SecurityLevel};
@@ -197,19 +195,9 @@ mod tests {
 
     // Helper function to create a mock SDK handle
     fn create_mock_sdk_handle() -> *mut SDKHandle {
-        let config = DashSDKConfig {
-            network: crate::types::FFINetwork::Regtest,
-            dapi_addresses: ptr::null(), // Use mock SDK
-            skip_asset_lock_proof_verification: false,
-            request_retry_count: 3,
-            request_timeout_ms: 5000,
-            quorum_url: ptr::null(),
-            platform_version: 0,
-        };
-
-        let result = unsafe { crate::sdk::dash_sdk_create(&config) };
-        assert!(result.error.is_null());
-        result.data as *mut SDKHandle
+        let handle = unsafe { crate::sdk::dash_sdk_create_handle_with_mock(ptr::null()) };
+        assert!(!handle.is_null());
+        handle
     }
 
     // Helper function to destroy mock SDK handle

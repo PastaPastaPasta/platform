@@ -4,6 +4,16 @@ import XCTest
 
 final class SDKMethodTests: XCTestCase {
 
+  func testDefaultConstructorUsesVerifiedNetworkSeeds() throws {
+    SDK.initialize()
+    for network in [Network.mainnet, Network.testnet] {
+      let sdk = try SDK(network: network)
+      let status: SDKStatus = try sdk.getStatus()
+      XCTAssertEqual(status.mode, "verified")
+      XCTAssertEqual(status.quorumCount, 0)
+    }
+  }
+
   func testSDKMethodsAvailability() {
     print("=== Testing SDK Methods Availability ===")
 

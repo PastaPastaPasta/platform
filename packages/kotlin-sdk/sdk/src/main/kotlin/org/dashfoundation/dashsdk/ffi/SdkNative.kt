@@ -26,6 +26,22 @@ internal object SdkNative {
     external fun version(): String
 
     /**
+     * Create an SDK with snapshot-backed quorum verification by default.
+     * Explicit [trusted] skips the Core quorum proof chain; verification
+     * failures never switch modes. Other parameters match [createTrusted].
+     */
+    external fun create(
+        network: Int,
+        dapiAddresses: String?,
+        quorumUrl: String?,
+        skipAssetLockProofVerification: Boolean,
+        requestRetryCount: Int,
+        requestTimeoutMs: Long,
+        platformVersion: Int,
+        trusted: Boolean,
+    ): Long
+
+    /**
      * Create a trusted-context SDK instance.
      *
      * @param network FFINetwork ordinal (0=Mainnet, 1=Testnet, 2=Devnet, 3=Regtest)
@@ -46,7 +62,7 @@ internal object SdkNative {
         platformVersion: Int,
     ): Long
 
-    /** Destroy a handle returned by [createTrusted]. Safe on 0. */
+    /** Destroy a handle returned by [create] or [createTrusted]. Safe on 0. */
     external fun destroy(handle: Long)
 
     /** FFINetwork ordinal of a live SDK handle. */

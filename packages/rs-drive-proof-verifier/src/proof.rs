@@ -118,9 +118,9 @@ use crate::error::MapGroveDbError;
 /// [DataContract], [Documents], etc. It is also implemented by several helper objects from [types] module.
 pub trait FromProof<Req> {
     /// Request type for which this trait is implemented.
-    type Request;
+    type Request: Clone;
     /// Response type for which this trait is implemented.
-    type Response;
+    type Response: Clone;
 
     /// Parse and verify the received proof and retrieve the requested object, if any.
     ///

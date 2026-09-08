@@ -21,7 +21,7 @@ data class SdkConfig(
      */
     val dapiAddresses: String? = null,
     /**
-     * Trusted-context-provider quorum lookup base URL. Required for devnet
+     * Quorum proof source (or key source in trusted mode). Required for devnet
      * (no built-in default exists on the Rust side); honored for regtest
      * and docker setups; never forwarded for plain mainnet/testnet.
      */
@@ -36,6 +36,13 @@ data class SdkConfig(
      * with auto-detect on; non-zero pins the exact platform version.
      */
     val platformVersion: Int = 0,
+    /**
+     * Accept the quorum server's keys without Core proof verification.
+     * False uses the embedded snapshot and verifies the quorum proof chain.
+     * Platform response proofs remain verified in both modes. Devnet/regtest
+     * require explicit trusted mode or an application-supplied context provider.
+     */
+    val trusted: Boolean = false,
 ) {
     companion object {
         /** Default local dashmate Platform DAPI address (iOS parity). */

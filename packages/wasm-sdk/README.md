@@ -54,7 +54,7 @@ console.log('Address:', address);
 await sdk.WasmSdk.setLogLevel('warn'); // or 'info' | 'debug' | full filter
 
 // Platform queries via a client
-let builder = sdk.WasmSdkBuilder.testnetTrusted();
+let builder = sdk.WasmSdkBuilder.testnet();
 builder = builder.withSettings(5000, 10000, 3, true);
 const client = await builder.withLogs('warn').build();
 
@@ -243,3 +243,21 @@ await sdk.tokenTransfer('contractId', 0, '1000', 'senderIdentityId', 'recipientI
 
 client.free();
 ```
+
+## Core snapshot proofs
+
+`WasmSdkBuilder.mainnet()` and `.testnet()` verify quorum keys from embedded Core
+snapshots by default. The SDK requests compact `/proofs` evidence from seeded
+EvoNodes and the network quorum server, verifies the complete certificate chain
+and requested quorum opening, then verifies the Platform response. A failed
+proof never falls back to trusted mode.
+
+Use `.withProofSources(["https://mn.example", "https://quorums.example"])` to
+choose untrusted proof relays. Explicit trusted builders/context providers retain
+the faster option that skips the Core proof stage. Custom devnet/local networks
+need their existing explicit context configuration.
+
+The serving Core/DAPI/quorum-server updates must be deployed before publishing
+this default. The proof assumes historical ChainLock keys remain honest; it does
+not replay DKG or full Core consensus. See
+[validation details](../../docs/mining-proof-validation.md).

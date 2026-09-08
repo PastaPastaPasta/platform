@@ -8,8 +8,8 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use rs_sdk_ffi::{
-    dash_sdk_create_trusted, dash_sdk_destroy, dash_sdk_enable_logging, dash_sdk_get_network,
-    dash_sdk_init, dash_sdk_version, DashSDKConfig, SDKHandle,
+    dash_sdk_create, dash_sdk_create_trusted, dash_sdk_destroy, dash_sdk_enable_logging,
+    dash_sdk_get_network, dash_sdk_init, dash_sdk_version, DashSDKConfig, SDKHandle,
 };
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -50,12 +50,12 @@ pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_version(
     })
 }
 
-/// Create a trusted-context SDK instance; returns the `SDKHandle` as jlong.
+/// Create an SDK; quorum keys are proof-verified unless `trusted` is true.
 ///
 /// `network`: 0=Mainnet, 1=Testnet, 2=Devnet, 3=Regtest (FFINetwork values).
 /// `dapiAddresses`/`quorumUrl` may be null (network defaults).
 #[no_mangle]
-pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_createTrusted(
+pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_create(
     mut env: JNIEnv,
     _class: JClass,
     network: jint,
@@ -65,6 +65,7 @@ pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_createTrust
     request_retry_count: jint,
     request_timeout_ms: jlong,
     platform_version: jint,
+    trusted: jboolean,
 ) -> jlong {
     guard(&mut env, 0, |env| {
         let dapi = to_c_string(env, &dapi_addresses);
@@ -86,12 +87,45 @@ pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_createTrust
         };
         // Config strings are borrowed by the call and copied immediately;
         // the CStrings drop after it returns, per the FFI lifetime contract.
-        let result = unsafe { dash_sdk_create_trusted(&config) };
+        let result = unsafe {
+            if trusted == JNI_TRUE {
+                dash_sdk_create_trusted(&config)
+            } else {
+                dash_sdk_create(&config)
+            }
+        };
         unsafe { unwrap_handle(env, result) }
     })
 }
 
-/// Destroy an SDK handle previously returned by `createTrusted`.
+/// Preserve the explicit trusted constructor's existing JNI descriptor.
+#[no_mangle]
+pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_createTrusted(
+    env: JNIEnv,
+    class: JClass,
+    network: jint,
+    dapi_addresses: JString,
+    quorum_url: JString,
+    skip_asset_lock_proof_verification: jboolean,
+    request_retry_count: jint,
+    request_timeout_ms: jlong,
+    platform_version: jint,
+) -> jlong {
+    Java_org_dashfoundation_dashsdk_ffi_SdkNative_create(
+        env,
+        class,
+        network,
+        dapi_addresses,
+        quorum_url,
+        skip_asset_lock_proof_verification,
+        request_retry_count,
+        request_timeout_ms,
+        platform_version,
+        JNI_TRUE,
+    )
+}
+
+/// Destroy an SDK handle returned by either constructor.
 #[no_mangle]
 pub extern "system" fn Java_org_dashfoundation_dashsdk_ffi_SdkNative_destroy(
     mut env: JNIEnv,

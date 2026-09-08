@@ -3,6 +3,8 @@
 resolver = "2"
 
 members = [
+    "packages/rs-core-proof",
+    "packages/rs-core-proof-x11",
     "packages/dapi-grpc",
     "packages/rs-dash-platform-macros",
     "packages/rs-dpp",

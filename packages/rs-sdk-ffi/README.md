@@ -12,6 +12,23 @@ This crate provides C-compatible FFI bindings for both the Dash Platform SDK (`r
 - **No Symbol Conflicts**: Intelligent header merging resolves type conflicts
 - **Cross-Platform**: Works on iOS, Android, and any platform supporting C interfaces
 
+## SDK verification modes
+
+`dash_sdk_create` uses the shared snapshot-backed Core proof verifier. A null or
+empty `dapi_addresses` selects mainnet/testnet seed addresses; it no longer
+creates a mock SDK. Use `dash_sdk_create_handle_with_mock` for offline fixtures.
+`quorum_url`, when supplied, selects an untrusted proof source.
+
+`dash_sdk_create_trusted` explicitly trusts the configured quorum server's keys,
+skipping the Core proof chain while retaining Platform response verification.
+`dash_sdk_create_extended` and callback constructors preserve explicit custom
+and SPV providers. Failed proof verification never selects the trusted provider.
+SDK status reports `verified`, `trusted`, `custom`, or `mock`.
+
+Document APIs resolve contracts through the active context provider and fetch
+missing contracts with verified Platform queries. Importing arbitrary serialized
+contracts through `dash_sdk_add_known_contracts` remains a trusted-mode operation.
+
 ## Building
 
 ### Prerequisites

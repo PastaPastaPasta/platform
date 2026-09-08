@@ -213,6 +213,7 @@ pub struct Sdk {
     ///
     /// Note that setting this to None can panic.
     context_provider: ArcSwapOption<Box<dyn ContextProvider>>,
+    verified_provider: ArcSwapOption<rs_sdk_trusted_context_provider::VerifiedHttpContextProvider>,
 
     /// Protocol version number detected from the network. Shared between clones.
     protocol_version: Arc<atomic::AtomicU32>,
@@ -254,6 +255,7 @@ impl Clone for Sdk {
             proofs: self.proofs,
             nonce_cache: Arc::clone(&self.nonce_cache),
             context_provider: ArcSwapOption::new(self.context_provider.load_full()),
+            verified_provider: ArcSwapOption::from(self.verified_provider.load_full()),
             cancel_token: self.cancel_token.clone(),
             protocol_version: Arc::clone(&self.protocol_version),
             version_pinned: self.version_pinned,
@@ -495,20 +497,26 @@ impl Sdk {
         method_name: &'static str,
     ) -> Result<(Option<O>, ResponseMetadata, Proof), Error>
     where
-        O::Request: Mockable,
+        O::Request: Mockable + Send,
+        O::Response: Send,
     {
         let provider = self
             .context_provider()
             .ok_or(drive_proof_verifier::Error::ContextProviderNotSet)?;
 
         let (object, metadata, proof) = match self.inner {
-            SdkInstance::Dapi { .. } => O::maybe_from_proof_with_metadata(
-                request,
-                response,
-                self.network,
-                self.version(),
-                &provider,
-            ),
+            SdkInstance::Dapi { .. } => {
+                self.with_quorum_proof(move || {
+                    O::maybe_from_proof_with_metadata(
+                        request.clone(),
+                        response.clone(),
+                        self.network,
+                        self.version(),
+                        &provider,
+                    )
+                })
+                .await
+            }
             #[cfg(feature = "mocks")]
             SdkInstance::Mock { ref mock, .. } => {
                 let guard = mock.lock().await;
@@ -526,6 +534,56 @@ impl Sdk {
             })?;
 
         Ok((object, metadata, proof))
+    }
+
+    /// Acquire a missing Core certificate proof asynchronously, including on
+    /// WASM, then repeat the complete Platform verification before returning.
+    pub(crate) fn with_quorum_proof<'a, T: 'a>(
+        &'a self,
+        verify: impl Fn() -> Result<T, drive_proof_verifier::Error> + Send + 'a,
+    ) -> futures::future::BoxFuture<'a, Result<T, drive_proof_verifier::Error>> {
+        Box::pin(async move {
+            use dash_context_provider::ContextProviderError::QuorumNotCached;
+            use drive_proof_verifier::Error::ContextProviderError;
+            let (provider, quorum_type, quorum_hash, core_chain_locked_height) = match verify() {
+                Err(ContextProviderError(QuorumNotCached {
+                    quorum_type,
+                    quorum_hash,
+                    core_chain_locked_height,
+                })) => {
+                    let Some(provider) = self.verified_provider.load_full() else {
+                        return Err(ContextProviderError(QuorumNotCached {
+                            quorum_type,
+                            quorum_hash,
+                            core_chain_locked_height,
+                        }));
+                    };
+                    (provider, quorum_type, quorum_hash, core_chain_locked_height)
+                }
+                result => return result,
+            };
+            provider
+                .ensure_quorum(quorum_type, quorum_hash, core_chain_locked_height)
+                .await?;
+            let result = verify();
+            if result.is_ok() {
+                self.add_verified_endpoints(&provider)?;
+            }
+            result
+        })
+    }
+
+    fn add_verified_endpoints(
+        &self,
+        provider: &rs_sdk_trusted_context_provider::VerifiedHttpContextProvider,
+    ) -> Result<(), dash_context_provider::ContextProviderError> {
+        let mut addresses = self.address_list().clone();
+        for endpoint in provider.verified_endpoints()? {
+            if let Ok(address) = endpoint.parse() {
+                addresses.add(address);
+            }
+        }
+        Ok(())
     }
 
     /// Return [ContextProvider] used by the SDK.
@@ -655,6 +713,7 @@ impl Sdk {
     ///
     /// Note that this will overwrite any previous context provider.
     pub fn set_context_provider<C: ContextProvider + 'static>(&self, context_provider: C) {
+        self.verified_provider.store(None);
         self.context_provider
             .swap(Some(Arc::new(Box::new(context_provider))));
     }
@@ -825,6 +884,7 @@ pub struct SdkBuilder {
 
     /// Context provider used by the SDK.
     context_provider: Option<Box<dyn ContextProvider>>,
+    proof_sources: Vec<String>,
 
     /// How many blocks difference is allowed between the last seen metadata height and the height received in response
     /// metadata.
@@ -883,6 +943,7 @@ impl Default for SdkBuilder {
                 .expect("quorum public keys cache size must be positive"),
 
             context_provider: None,
+            proof_sources: Vec::new(),
 
             cancel_token: CancellationToken::new(),
 
@@ -1149,6 +1210,13 @@ impl SdkBuilder {
         self
     }
 
+    /// Set untrusted Core-proof HTTP sources. Empty selects seeded nodes and the
+    /// network quorum server. Explicit context providers take precedence.
+    pub fn with_proof_sources(mut self, sources: Vec<String>) -> Self {
+        self.proof_sources = sources;
+        self
+    }
+
     /// Build the Sdk instance.
     ///
     /// This method will create the Sdk instance based on the configuration provided to the builder.
@@ -1156,7 +1224,21 @@ impl SdkBuilder {
     /// # Errors
     ///
     /// This method will return an error if the Sdk cannot be created.
-    pub fn build(self) -> Result<Sdk, Error> {
+    pub fn build(mut self) -> Result<Sdk, Error> {
+        let mut verified_provider = None;
+        if self.context_provider.is_none()
+            && self.addresses.is_some()
+            && matches!(self.network, Network::Mainnet | Network::Testnet)
+        {
+            let provider = rs_sdk_trusted_context_provider::VerifiedHttpContextProvider::new(
+                self.network,
+                self.proof_sources.clone(),
+                std::num::NonZeroUsize::new(DEFAULT_QUORUM_PUBLIC_KEYS_CACHE_SIZE)
+                    .expect("nonzero cache"),
+            )?;
+            self.context_provider = Some(Box::new(provider.clone()));
+            verified_provider = Some(provider);
+        }
         let is_network_sdk = self.addresses.is_some();
         let has_height_anchor = self
             .trusted_initial_height
@@ -1203,6 +1285,7 @@ impl SdkBuilder {
                     inner:SdkInstance::Dapi { dapi },
                     proofs:self.proofs,
                     context_provider: ArcSwapOption::new( self.context_provider.map(Arc::new)),
+                    verified_provider: ArcSwapOption::from(verified_provider.map(Arc::new)),
                     cancel_token: self.cancel_token,
                     nonce_cache: Default::default(),
                     // Seed atomic with the initial version; whether the version is
@@ -1279,6 +1362,7 @@ impl SdkBuilder {
                     protocol_version: Arc::new(atomic::AtomicU32::new(initial_version.protocol_version)),
                     version_pinned: self.version_pinned,
                     context_provider: ArcSwapOption::new(Some(Arc::new(context_provider))),
+                    verified_provider: ArcSwapOption::empty(),
                     cancel_token: self.cancel_token,
                     metadata_last_seen_height: Arc::new(atomic::AtomicU64::new(
                         self.trusted_initial_height.unwrap_or(0),
@@ -1522,6 +1606,34 @@ mod test {
             "expected >=10 testnet bootstrap addresses, got {}",
             testnet.len()
         );
+    }
+
+    #[test]
+    fn network_builders_verify_quorums_unless_context_is_explicit() {
+        for builder in [SdkBuilder::new_mainnet(), SdkBuilder::new_testnet()] {
+            let sdk = builder.build().expect("network SDK");
+            assert!(sdk.verified_provider.load_full().is_some());
+            assert!(sdk.clone().verified_provider.load_full().is_some());
+            let trusted = rs_sdk_trusted_context_provider::TrustedHttpContextProvider::new(
+                sdk.network,
+                None,
+                std::num::NonZeroUsize::new(16).unwrap(),
+            )
+            .unwrap();
+            sdk.set_context_provider(trusted);
+            assert!(sdk.verified_provider.load_full().is_none());
+        }
+        let trusted = rs_sdk_trusted_context_provider::TrustedHttpContextProvider::new(
+            Network::Testnet,
+            None,
+            std::num::NonZeroUsize::new(16).unwrap(),
+        )
+        .unwrap();
+        let sdk = SdkBuilder::new_testnet()
+            .with_context_provider(trusted)
+            .build()
+            .unwrap();
+        assert!(sdk.verified_provider.load_full().is_none());
     }
 
     #[test]

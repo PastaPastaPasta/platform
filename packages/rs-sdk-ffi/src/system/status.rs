@@ -39,8 +39,8 @@ pub unsafe extern "C" fn dash_sdk_get_status(sdk_handle: *const SDKHandle) -> Da
         );
         ("trusted", count)
     } else {
-        // If no trusted provider, we're in SPV mode
-        ("spv", 0)
+        // Custom SPV/callback providers retain their distinct configuration.
+        (wrapper.verification_mode, 0)
     };
 
     // Create status JSON

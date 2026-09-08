@@ -186,3 +186,38 @@ in `packages/rs-dapi-client/src/transport/grpc.rs`.
     Running without arguments regenerates **all** vectors — avoid this unless intentional.
     The script executes matching tests with `--features generate-test-vectors` against the running devnet,
     saving responses as test vectors in `packages/rs-sdk/tests/vectors/`.
+
+## Core snapshot verification
+
+Mainnet and testnet network builders verify quorum keys from embedded Core
+snapshots by default. Seeded EvoNodes and the network quorum server are untrusted
+proof relays. The SDK fetches `/proofs` when a Platform response needs an uncached
+quorum, verifies the Core certificate chain and record openings, then verifies
+the Platform signature and GroveDB proof. Failed evidence never enables trusted
+mode. Authenticated EvoNode records add DAPI connection candidates.
+
+```rust,ignore
+let sdk = SdkBuilder::new_testnet().build()?;
+let custom = SdkBuilder::new_testnet()
+    .with_proof_sources(vec!["https://mn.example".into(), "https://quorums.example".into()])
+    .build()?;
+```
+
+For explicit trusted operation, install `TrustedHttpContextProvider` using
+`with_context_provider`. It skips the Core proof download and certificate-chain
+verification, while the SDK still verifies Platform proofs when enabled. An
+application-supplied context provider always takes precedence. Devnet and regtest
+require explicit context configuration; they have no embedded release snapshot.
+
+The proof assumes historical ChainLock quorums remain honest. It does not
+reconstruct DKG, full Core consensus, or exact signer eligibility. Snapshot trust
+is part of the SDK release. Successful verification establishes authenticity under
+that model, while the SDK's existing signed-time/height checks enforce response
+freshness. A proof is not evidence that a relay disclosed the globally newest tip.
+
+Serve the matching Core RPC behind DAPI or the quorum server before releasing
+this default to users. Core requires unpruned history and `-quorumproofindex`;
+startup indexing must complete. Each decoded response is limited to 1 MiB, with
+at most 4,096 certificates and 4,096 ancestor headers. Checkpoint and key caches
+currently live for the SDK session; applications should not persist relay-supplied
+roots as trusted configuration without verifying their provenance.

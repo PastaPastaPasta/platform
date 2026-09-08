@@ -928,7 +928,7 @@ impl ContextProvider for TrustedHttpContextProvider {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
@@ -1015,6 +1015,12 @@ mod tests {
         let handle = thread::spawn(move || {
             for (expected_path, status, body) in responses {
                 let mut stream = accept_before(&listener, Instant::now() + Duration::from_secs(5));
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking mock response socket");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("bounded mock response read");
                 let mut reader =
                     BufReader::new(stream.try_clone().expect("clone quorum request stream"));
                 let mut request_line = String::new();

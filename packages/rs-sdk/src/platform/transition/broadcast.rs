@@ -384,18 +384,22 @@ impl WaitForOutcome for StateTransition {
                 .inner;
 
             trace!("wait: verifying proof and quorum signature");
-            let (maybe_outcome, metadata, _proof) = <StateTransitionProofOutcome as FromProof<
+            let (maybe_outcome, metadata, _proof) = sdk
+                .with_quorum_proof(|| {
+                    <StateTransitionProofOutcome as FromProof<
                 BroadcastStateTransitionRequest,
             >>::maybe_from_proof_with_metadata(
-                request,
+                request.clone(),
                 grpc_response.clone(),
                 sdk.network,
                 sdk.version(),
                 &context_provider,
             )
-            .map_err(Error::from)
-            .wrap_to_execution_result(&response)?
-            .inner;
+                })
+                .await
+                .map_err(Error::from)
+                .wrap_to_execution_result(&response)?
+                .inner;
 
             // The current `FromProof` impl always yields `Some`; this guards only a future
             // impl change, so it stays a typed error rather than an unwrap.

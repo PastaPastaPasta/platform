@@ -34,6 +34,11 @@ impl DapiServer {
 
         let mut app = Router::new()
             .route("/", post(handle_jsonrpc_request))
+            .route(
+                "/proofs",
+                post(handle_proof_request).layer(axum::extract::DefaultBodyLimit::max(1024)),
+            )
+            .layer(tower_http::compression::CompressionLayer::new())
             .with_state(app_state);
 
         app = app.layer(MetricsLayer::new());
@@ -234,5 +239,30 @@ mod tests {
             json_rpc_method_label("unsupported_0002").as_str(),
             "jsonrpc_unknown"
         );
+    }
+}
+
+async fn handle_proof_request(
+    State(state): State<JsonRpcAppState>,
+    Json(request): Json<crate::clients::core_client::ProofRequest>,
+) -> Response {
+    match state
+        .core_service
+        .core_client
+        .get_quorum_proof(&request)
+        .await
+    {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(crate::DapiError::InvalidArgument(_)) => {
+            axum::http::StatusCode::BAD_REQUEST.into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Core proof relay failed");
+            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }

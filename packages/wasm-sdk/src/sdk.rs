@@ -1,6 +1,7 @@
 use crate::context_provider::{WasmContext, WasmTrustedContext};
 use crate::error::WasmSdkError;
 use dash_sdk::dpp::version::PlatformVersion;
+use dash_sdk::platform::ContextProvider;
 use dash_sdk::platform::{DataContract, Identifier};
 use dash_sdk::sdk::Uri;
 use dash_sdk::{Sdk, SdkBuilder};
@@ -99,8 +100,8 @@ impl WasmSdk {
         &self,
         contract: &dash_sdk::dpp::data_contract::DataContract,
     ) -> Result<(), crate::error::WasmSdkError> {
-        if let Some(ref context) = self.trusted_context {
-            context.add_known_contract(contract.clone());
+        if let Some(context) = self.sdk.context_provider() {
+            context.register_data_contract(std::sync::Arc::new(contract.clone()));
         }
         Ok(())
     }
@@ -119,15 +120,17 @@ impl WasmSdk {
         &self,
         contract_id: &dash_sdk::platform::Identifier,
     ) -> Option<std::sync::Arc<dash_sdk::platform::DataContract>> {
-        self.trusted_context
-            .as_ref()
-            .and_then(|ctx| ctx.get_known_contract(contract_id))
+        self.sdk.context_provider().and_then(|ctx| {
+            ctx.get_data_contract(contract_id, self.sdk.version())
+                .ok()
+                .flatten()
+        })
     }
 
     /// Cache a contract in the trusted context
     pub(crate) fn cache_contract(&self, contract: dash_sdk::platform::DataContract) {
-        if let Some(ref context) = self.trusted_context {
-            context.add_known_contract(contract);
+        if let Some(context) = self.sdk.context_provider() {
+            context.register_data_contract(std::sync::Arc::new(contract));
         }
     }
 
@@ -304,9 +307,10 @@ impl WasmSdkBuilder {
         };
 
         let address_list = dash_sdk::sdk::AddressList::from_iter(parsed_addresses);
-        let sdk_builder = SdkBuilder::new(address_list)
-            .with_network(network)
-            .with_context_provider(WasmContext {});
+        let mut sdk_builder = SdkBuilder::new(address_list).with_network(network);
+        if !matches!(network, Network::Mainnet | Network::Testnet) {
+            sdk_builder = sdk_builder.with_context_provider(WasmContext {});
+        }
 
         Ok(Self {
             inner: sdk_builder,
@@ -315,9 +319,16 @@ impl WasmSdkBuilder {
         })
     }
 
+    /// Configure untrusted HTTP relays for snapshot proofs.
+    #[wasm_bindgen(js_name = "withProofSources")]
+    pub fn with_proof_sources(mut self, sources: Vec<String>) -> Self {
+        self.inner = self.inner.with_proof_sources(sources);
+        self
+    }
+
     #[wasm_bindgen(js_name = "mainnet")]
     pub fn new_mainnet() -> Self {
-        let sdk_builder = SdkBuilder::new_mainnet().with_context_provider(WasmContext {});
+        let sdk_builder = SdkBuilder::new_mainnet();
 
         Self {
             inner: sdk_builder,
@@ -328,7 +339,7 @@ impl WasmSdkBuilder {
 
     #[wasm_bindgen(js_name = "testnet")]
     pub fn new_testnet() -> Self {
-        let sdk_builder = SdkBuilder::new_testnet().with_context_provider(WasmContext {});
+        let sdk_builder = SdkBuilder::new_testnet();
 
         Self {
             inner: sdk_builder,
@@ -563,7 +574,7 @@ impl WasmSdk {
 /// can be registered as a shared in-flight fetch.
 async fn fetch_contract_into_cache(
     sdk: Sdk,
-    trusted_context: Option<WasmTrustedContext>,
+    _trusted_context: Option<WasmTrustedContext>,
     contract_id: Identifier,
 ) -> Result<DataContract, WasmSdkError> {
     use dash_sdk::platform::Fetch;
@@ -572,8 +583,8 @@ async fn fetch_contract_into_cache(
         .await?
         .ok_or_else(|| WasmSdkError::not_found("Data contract not found"))?;
 
-    if let Some(context) = trusted_context {
-        context.add_known_contract(contract.clone());
+    if let Some(context) = sdk.context_provider() {
+        context.register_data_contract(std::sync::Arc::new(contract.clone()));
     }
 
     Ok(contract)

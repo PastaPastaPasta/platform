@@ -279,3 +279,19 @@ Feel free to dive in! [Open an issue](https://github.com/dashpay/platform/issues
 ## License
 
 [MIT](LICENSE) &copy; Dash Core Group, Inc.
+
+### Snapshot proofs by default
+
+`new EvoSDK({ network: 'testnet' })` authenticates Platform quorum keys from its
+embedded Core snapshot. It obtains compact proofs from seeded MNs and the network
+quorum server. To select your own untrusted relays, use
+`proofSources: ['https://mn.example', 'https://quorums.example']`; `quorumUrl` is
+also accepted as a single proof source in verified mode. These URLs do not supply
+trusted replacement snapshots or keys.
+
+Explicit `trusted: true` uses the trusted quorum service and skips Core bootstrap
+proof traffic and verification. It does not automatically disable Platform proof
+verification. A failed compact proof never switches the SDK to trusted mode.
+Deploy the matching Core RPC and `/proofs` endpoints before distributing the new
+default. The certificate model assumes historical quorum honesty; it does not
+independently reconstruct full consensus or exact signing-quorum eligibility.

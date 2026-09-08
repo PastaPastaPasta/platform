@@ -43,18 +43,21 @@ export interface EvoSDKOptions extends ConnectionOptions {
   // explicit `addresses` are mandatory and `devnetName` alone is not sufficient
   // — no masternode addresses can be discovered without a trusted context.
   devnetName?: string;
-  // Optional override for the trusted-context quorum base URL. When omitted,
+  // Optional quorum service URL: trusted key service in trusted mode,
+  // untrusted /proofs relay in verified mode. When omitted,
   // the URL is the network's default (e.g.
   // `https://quorums.<devnetName>.networks.dash.org` for devnet,
   // `https://quorums.testnet.networks.dash.org` for testnet, etc.).
-  // Only consulted when trusted === true. Useful for pointing at a staging,
+  // Useful for pointing at a staging,
   // self-hosted, or not-yet-deployed quorums endpoint.
   quorumUrl?: string;
+  // Untrusted proof relays (MNs and/or servers). Empty selects release defaults.
+  proofSources?: string[];
 }
 
 export class EvoSDK {
   private wasmSdk?: wasm.WasmSdk;
-  private options: Required<Pick<EvoSDKOptions, 'network' | 'trusted'>> & ConnectionOptions & { addresses?: string[]; devnetName?: string; quorumUrl?: string };
+  private options: Required<Pick<EvoSDKOptions, 'network' | 'trusted'>> & ConnectionOptions & { addresses?: string[]; devnetName?: string; quorumUrl?: string; proofSources?: string[] };
 
   public addresses!: AddressesFacade;
   public documents!: DocumentsFacade;
@@ -71,7 +74,7 @@ export class EvoSDK {
   public shielded!: ShieldedFacade;
   constructor(options: EvoSDKOptions = {}) {
     // Apply defaults while preserving any future connection options
-    const { network = 'testnet', trusted = false, addresses, devnetName, quorumUrl, ...connection } = options;
+    const { network = 'testnet', trusted = false, addresses, devnetName, quorumUrl, proofSources, ...connection } = options;
 
     if (network === 'devnet') {
       const hasAddresses = !!(addresses && addresses.length > 0);
@@ -87,11 +90,8 @@ export class EvoSDK {
       // — devnetName has no effect outside network === 'devnet'.
       throw new Error("EvoSDK: devnetName is only valid when network === 'devnet'");
     }
-    if (quorumUrl && !trusted) {
-      throw new Error("EvoSDK: quorumUrl is only meaningful when trusted === true");
-    }
 
-    this.options = { network, trusted, addresses, devnetName, quorumUrl, ...connection };
+    this.options = { network, trusted, addresses, devnetName, quorumUrl, proofSources, ...connection };
 
     this.addresses = new AddressesFacade(this);
     this.documents = new DocumentsFacade(this);
@@ -130,7 +130,9 @@ export class EvoSDK {
     }
     await initWasm();
 
-    const { network, trusted, version, proofs, settings, logs, addresses, devnetName, quorumUrl } = this.options;
+    const {
+      network, trusted, version, proofs, settings, logs, addresses, devnetName, quorumUrl, proofSources,
+    } = this.options;
 
     // Prefetch trusted context only when trusted mode is requested
     let context: wasm.WasmTrustedContext | undefined;
@@ -174,6 +176,10 @@ export class EvoSDK {
       builder = wasm.WasmSdkBuilder.newDevnet();
     } else {
       throw new Error(`Unknown network: ${network}`);
+    }
+
+    if (!trusted && (proofSources || quorumUrl)) {
+      builder = builder.withProofSources(proofSources ?? [quorumUrl!]);
     }
 
     // Attach trusted context for proof verification and discovered addresses

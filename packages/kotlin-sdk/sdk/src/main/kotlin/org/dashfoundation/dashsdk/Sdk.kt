@@ -427,8 +427,9 @@ class Sdk private constructor(
         }
 
         /**
-         * Create an SDK instance with trusted setup — port of
-         * `SDK.init(network:platformVersion:)` including the override
+         * Create an SDK with snapshot-backed quorum verification. Set
+         * [SdkConfig.trusted] to explicitly accept server-supplied quorum keys.
+         * Matches `SDK.init(network:platformVersion:trusted:)`, including override
          * gating and devnet auto-discovery policy:
          *
          * - Regtest: DAPI/quorum overrides applied unconditionally (Rust
@@ -458,7 +459,7 @@ class Sdk private constructor(
             }
 
             val handle = mapNativeErrors {
-                SdkNative.createTrusted(
+                SdkNative.create(
                     network = network.ffiValue,
                     dapiAddresses = dapiAddresses,
                     quorumUrl = quorumUrl,
@@ -466,6 +467,7 @@ class Sdk private constructor(
                     requestRetryCount = config.requestRetryCount,
                     requestTimeoutMs = config.requestTimeoutMs,
                     platformVersion = config.platformVersion,
+                    trusted = config.trusted,
                 )
             }
             Sdk(handle, network)

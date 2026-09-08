@@ -34,3 +34,23 @@ EXAMPLES:
   rs-dapi -vv start                          # Start with trace logging
   rs-dapi config                             # Show current configuration
   rs-dapi --help                             # Show this help
+
+### Compact Core proof relay
+
+`POST /proofs` on the JSON-RPC HTTP server returns a binary Core bootstrap proof.
+Dashmate's public gateway routes this path to the same server. Requests are JSON
+with `checkpoint` (RPC block hash), `height` (minimum target height, zero for latest
+archived), `quorumHash`, `llmqType` (4 mainnet / 6 testnet), and `nodeCount` (0–15).
+Successful responses use `application/octet-stream`; HTTP gzip is supported.
+
+The configured Core node must support `getquorumproofchain` and run unpruned with
+`-quorumproofindex`. Startup scans its historical blocks. Clients independently
+verify the returned evidence against their own release snapshot. This endpoint
+never supplies trusted roots or silently falls back to trusted quorum keys.
+
+Request bodies are limited to 1 KiB and decoded proof responses to 1 MiB. There
+are at most two blocking proof-generation RPC workers, retained through RPC
+completion even after caller timeout. Proof responses use the existing weighted
+Core response cache with a 15-second lifetime. Invalid fields return 400,
+malformed schemas 422, oversized bodies 413, and unavailable/busy Core proof
+service 503. Deploy Core and this route before releasing SDKs that require proofs.
