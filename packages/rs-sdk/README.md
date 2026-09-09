@@ -216,8 +216,48 @@ that model, while the SDK's existing signed-time/height checks enforce response
 freshness. A proof is not evidence that a relay disclosed the globally newest tip.
 
 Serve the matching Core RPC behind DAPI or the quorum server before releasing
-this default to users. Core requires unpruned history and `-quorumproofindex`;
-startup indexing must complete. Each decoded response is limited to 1 MiB, with
+this default to users. Core reads retained historical blocks on demand; no extra
+index or startup scan is required. The SDK allows 65 seconds per proof source,
+covering the quorum server's 60-second Core RPC deadline and HTTP delivery.
+Each decoded response is limited to 1 MiB, with
 at most 4,096 certificates and 4,096 ancestor headers. Checkpoint and key caches
 currently live for the SDK session; applications should not persist relay-supplied
 roots as trusted configuration without verifying their provenance.
+
+### Testing a running proof server
+
+Build the native integration example from the workspace root:
+
+```sh
+cargo build --locked -p dash-sdk --example verify_proof_server \
+  --features wallet,shielded,dpns-contract,dashpay-contract
+```
+
+Run a Core node with retained history and `getquorumproofchain`, then configure
+the quorum server's RPC connection to that node. With the server listening at
+`http://127.0.0.1:3000`, fetch a live Platform epoch using the default verified
+SDK provider and network DAPI seeds:
+
+```sh
+target/debug/examples/verify_proof_server --network testnet \
+  --source http://127.0.0.1:3000 platform
+```
+
+Use `--network mainnet` for mainnet. The `platform` subcommand also accepts
+`--address <DAPI URL>`. Success requires the Core bootstrap, Platform signature,
+GroveDB proof, and normal SDK freshness checks to pass. No trusted context
+provider is installed by this example.
+
+To check a specific quorum against independently collected Core RPC evidence:
+
+```sh
+target/debug/examples/verify_proof_server --network testnet \
+  --source http://127.0.0.1:3000 quorum \
+  --quorum-hash <RPC-display-order-hash> --height <minimum-Core-height> \
+  --expected-key <quorum-public-key-hex>
+```
+
+The `quorum` subcommand accepts `--checkpoint <state.json>` for an independently
+trusted historical snapshot. For fault-injection tests, point `--source` at an
+HTTP proxy and supply `--expect-error <substring>`; the example also checks that
+rejected evidence publishes no quorum key, advanced state, or endpoints.

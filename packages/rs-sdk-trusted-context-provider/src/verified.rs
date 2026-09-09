@@ -24,6 +24,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// Core may need tens of seconds to construct a cold, year-long proof. Allow
+// the relay's 60-second generation deadline plus HTTP delivery time.
+pub(super) const PROOF_REQUEST_TIMEOUT_MS: u32 = 65_000;
+
 #[derive(Clone)]
 pub struct VerifiedHttpContextProvider {
     network: Network,
@@ -163,7 +167,7 @@ impl VerifiedHttpContextProvider {
         let response = self
             .client
             .post(format!("{}/proofs", source.trim_end_matches('/')))
-            .timeout(Duration::from_secs(15))
+            .timeout(Duration::from_millis(PROOF_REQUEST_TIMEOUT_MS.into()))
             .json(request)
             .send()
             .await
@@ -202,6 +206,7 @@ impl VerifiedHttpContextProvider {
     }
 
     /// Network I/O runs here, outside synchronous Platform verification.
+    /// `hash` uses Platform/ContextProvider byte order (Core RPC display order).
     /// Erasing this large future keeps every generic SDK query from embedding it.
     pub fn ensure_quorum(
         &self,
@@ -250,7 +255,7 @@ impl VerifiedHttpContextProvider {
             let request = ProofRequest {
                 checkpoint: rpc_hash(&anchor.block_hash),
                 height: minimum.max(anchor.height + 1),
-                quorum_hash: rpc_hash(&hash),
+                quorum_hash: hex::encode(hash),
                 llmq_type: kind,
                 node_count: 4,
             };
@@ -290,10 +295,15 @@ impl VerifiedHttpContextProvider {
             match record.kind {
                 RecordKind::Quorum => {
                     let commitment = parse_commitment(record.leaf).map_err(error)?;
-                    if commitment.kind as u32 == kind && commitment.quorum_hash == hash {
-                        if key.replace(commitment.public_key).is_some() {
-                            return Err(error("Duplicate quorum opening"));
-                        }
+                    // Commitment serialization uses Core's internal hash order;
+                    // ContextProvider and Tenderdash use RPC display order.
+                    let mut quorum_hash = commitment.quorum_hash;
+                    quorum_hash.reverse();
+                    if commitment.kind as u32 == kind
+                        && quorum_hash == hash
+                        && key.replace(commitment.public_key).is_some()
+                    {
+                        return Err(error("Duplicate quorum opening"));
                     }
                 }
                 RecordKind::Masternode => endpoints.extend(decode_endpoints(record.leaf)?),
@@ -487,6 +497,16 @@ mod tests {
             reader.read_exact(&mut request).unwrap();
             let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
             assert_eq!(request["llmqType"], 6);
+            if body == ENVELOPE {
+                assert_eq!(
+                    request["quorumHash"],
+                    "000000a65e119b239f71212edd1c15cc111d349f69ed4138d3b9c49fec2a14f8"
+                );
+                assert_eq!(
+                    request["checkpoint"],
+                    "000000a99c2dac4616bca1f27301f1f99684a96102c97ef1d645569c529b55b7"
+                );
+            }
             let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", declared_size.unwrap_or(body.len()));
             socket.write_all(header.as_bytes()).unwrap();
             let _ = socket.write_all(&body);
@@ -506,21 +526,24 @@ mod tests {
         .unwrap();
         let record = bootstrap::verify(ENVELOPE, &provider.anchor, 0).unwrap();
         let commitment = parse_commitment(record.records()[0].leaf).unwrap();
+        let platform_hash =
+            hex::decode("000000a65e119b239f71212edd1c15cc111d349f69ed4138d3b9c49fec2a14f8")
+                .unwrap()
+                .try_into()
+                .unwrap();
         provider
-            .ensure_quorum(6, commitment.quorum_hash, record.state().height)
+            .ensure_quorum(6, platform_hash, record.state().height)
             .await
             .unwrap();
         bad_server.join().unwrap();
         good_server.join().unwrap();
         // Both HTTP servers are gone: this must use the authenticated cache.
         provider
-            .ensure_quorum(6, commitment.quorum_hash, record.state().height)
+            .ensure_quorum(6, platform_hash, record.state().height)
             .await
             .unwrap();
         assert_eq!(
-            provider
-                .get_quorum_public_key(6, commitment.quorum_hash, 0)
-                .unwrap(),
+            provider.get_quorum_public_key(6, platform_hash, 0).unwrap(),
             commitment.public_key
         );
     }
@@ -545,29 +568,32 @@ mod tests {
         let provider = provider();
         let verified = bootstrap::verify(ENVELOPE, &provider.anchor, 0).unwrap();
         let commitment = parse_commitment(verified.records()[0].leaf).unwrap();
+        let platform_hash =
+            hex::decode("000000a65e119b239f71212edd1c15cc111d349f69ed4138d3b9c49fec2a14f8")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let anchor = provider.verified_state().unwrap();
         let mut corrupt = ENVELOPE.to_vec();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(provider
-            .accept(&corrupt, &anchor, 0, 6, commitment.quorum_hash)
+            .accept(&corrupt, &anchor, 0, 6, platform_hash)
             .is_err());
         assert_eq!(provider.verified_state().unwrap(), anchor);
         assert!(provider.verified_endpoints().unwrap().is_empty());
         assert!(provider.accept(ENVELOPE, &anchor, 0, 6, [1; 32]).is_err());
-        assert!(provider
-            .get_quorum_public_key(6, commitment.quorum_hash, 0)
-            .is_err());
+        assert!(provider.get_quorum_public_key(6, platform_hash, 0).is_err());
         provider
-            .accept(ENVELOPE, &anchor, 0, 6, commitment.quorum_hash)
+            .accept(ENVELOPE, &anchor, 0, 6, platform_hash)
             .unwrap();
         assert_eq!(
             provider
-                .get_quorum_public_key(6, commitment.quorum_hash, verified.state().height)
+                .get_quorum_public_key(6, platform_hash, verified.state().height)
                 .unwrap(),
             commitment.public_key
         );
         assert!(provider
-            .get_quorum_public_key(6, commitment.quorum_hash, verified.state().height + 1)
+            .get_quorum_public_key(6, platform_hash, verified.state().height + 1)
             .is_err());
         assert!(!provider.verified_endpoints().unwrap().is_empty());
     }
@@ -655,16 +681,19 @@ mod browser_tests {
         .unwrap();
         let verified = bootstrap::verify(envelope, &provider.anchor, 0).unwrap();
         let commitment = parse_commitment(verified.records()[0].leaf).unwrap();
+        let platform_hash =
+            hex::decode("000000a65e119b239f71212edd1c15cc111d349f69ed4138d3b9c49fec2a14f8")
+                .unwrap()
+                .try_into()
+                .unwrap();
         let valid = format!("if (request.method !== 'POST' || !request.url.endsWith('/proofs')) throw Error('unexpected trusted request'); return Promise.resolve(new Response(new Uint8Array({}), {{status:200}}));", serde_json::to_string(envelope.as_slice()).unwrap());
         let guard = mock_fetch(&valid);
         provider
-            .ensure_quorum(6, commitment.quorum_hash, verified.state().height)
+            .ensure_quorum(6, platform_hash, verified.state().height)
             .await
             .unwrap();
         assert_eq!(
-            provider
-                .get_quorum_public_key(6, commitment.quorum_hash, 0)
-                .unwrap(),
+            provider.get_quorum_public_key(6, platform_hash, 0).unwrap(),
             commitment.public_key
         );
         drop(guard);
@@ -676,10 +705,7 @@ mod browser_tests {
         .unwrap();
         // No Content-Length: the streaming cap must enforce the decoded bound.
         let _guard = mock_fetch("return Promise.resolve(new Response(new ReadableStream({start(c) { c.enqueue(new Uint8Array(1048577)); c.close(); }}))); ");
-        assert!(fresh
-            .ensure_quorum(6, commitment.quorum_hash, 0)
-            .await
-            .is_err());
+        assert!(fresh.ensure_quorum(6, platform_hash, 0).await.is_err());
         assert_eq!(fresh.verified_state().unwrap(), fresh.anchor);
     }
 }

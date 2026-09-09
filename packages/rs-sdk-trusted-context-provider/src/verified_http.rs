@@ -1,7 +1,7 @@
 //! Browser streaming transport shares wasm-streams 0.5 with the DAPI client.
 //! Enabling reqwest 0.12's stream feature on WASM would link a second, incompatible
 //! wasm-streams version with duplicate wasm-bindgen exports.
-use super::verified::ProofRequest;
+use super::verified::{ProofRequest, PROOF_REQUEST_TIMEOUT_MS};
 use dash_context_provider::ContextProviderError;
 use dash_core_proof::MAX_WITNESS;
 use futures_util::{
@@ -87,7 +87,7 @@ pub(super) async fn download(
         }
         Ok(bytes)
     };
-    let deadline = gloo_timers::future::TimeoutFuture::new(15_000);
+    let deadline = gloo_timers::future::TimeoutFuture::new(PROOF_REQUEST_TIMEOUT_MS);
     pin_mut!(receive, deadline);
     match select(receive, deadline).await {
         Either::Left((result, _)) => result,
