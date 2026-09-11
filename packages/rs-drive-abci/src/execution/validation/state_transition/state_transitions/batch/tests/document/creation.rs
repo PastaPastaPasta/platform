@@ -2219,9 +2219,20 @@ mod creation_tests {
 
     #[tokio::test]
     async fn should_reject_reused_entropy_for_contested_and_non_contested_creates() {
-        let platform_version = PlatformVersion::latest();
+        run_reused_entropy_collision_test(PlatformVersion::latest()).await;
+    }
+
+    #[tokio::test]
+    async fn should_allow_reused_entropy_collision_at_protocol_version_13() {
+        run_reused_entropy_collision_test(
+            PlatformVersion::get(13).expect("expected protocol version 13"),
+        )
+        .await;
+    }
+
+    async fn run_reused_entropy_collision_test(platform_version: &'static PlatformVersion) {
         let mut platform = TestPlatformBuilder::new()
-            .with_latest_protocol_version()
+            .with_initial_protocol_version(platform_version.protocol_version)
             .build_with_mock_rpc()
             .set_genesis_state();
 
@@ -2706,15 +2717,25 @@ mod creation_tests {
             )
             .expect("expected to process state transition");
 
-        assert_matches!(
-            processing_result.execution_results().as_slice(),
-            [PaidConsensusError {
-                error: ConsensusError::StateError(
-                    StateError::DocumentContestDocumentWithSameIdAlreadyPresentError { .. }
-                ),
-                ..
-            }]
-        );
+        if platform_version.protocol_version >= 14 {
+            assert_matches!(
+                processing_result.execution_results().as_slice(),
+                [PaidConsensusError {
+                    error: ConsensusError::StateError(
+                        StateError::DocumentContestDocumentWithSameIdAlreadyPresentError { .. }
+                    ),
+                    ..
+                }]
+            );
+        } else {
+            assert_eq!(processing_result.valid_count(), 1);
+            platform
+                .drive
+                .grove
+                .commit_transaction(transaction)
+                .unwrap()
+                .expect("expected to commit transaction");
+        }
 
         // Now let's run a query for the vote totals
 
