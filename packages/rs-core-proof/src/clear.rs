@@ -159,14 +159,39 @@ impl MiningWitness {
     }
 }
 
-/// Core's quorum special transaction has empty vin/vout, locktime zero, and
-/// a v1 payload containing the mining height and complete final commitment.
+/// Consume a serialized transaction's inputs, outputs and lock time. Consensus
+/// only requires a special transaction version and type for a mined commitment;
+/// the inputs, outputs and lock time are unconstrained (Core commit 725f7221bf),
+/// so this reads whatever shape a miner produced. The blob is bounded by
+/// [`crate::MAX_TX`] before this runs.
+fn skip_inputs_outputs_locktime(r: &mut Reader<'_>) -> Result<()> {
+    for _ in 0..r.compact(crate::MAX_TX as u64)? {
+        r.take(36)?; // prevout hash and index
+        let n = r.compact(crate::MAX_TX as u64)?;
+        r.take(n)?; // scriptSig
+        r.u32()?; // sequence
+    }
+    for _ in 0..r.compact(crate::MAX_TX as u64)? {
+        r.u64()?; // value
+        let n = r.compact(crate::MAX_TX as u64)?;
+        r.take(n)?; // scriptPubKey
+    }
+    r.u32()?; // lock time
+    Ok(())
+}
+
+/// Core's quorum special transaction: any special-transaction version (>= 3),
+/// type 6, and a v1 payload containing the mining height and complete final
+/// commitment. Its inputs, outputs and lock time are not consensus-constrained.
 fn mining_commitment(bytes: &[u8], height: u32) -> Result<Commitment> {
     let mut r = Reader::new(bytes);
-    if r.u16()? != 3 || r.u16()? != 6 || r.compact(0)? != 0 || r.compact(0)? != 0 || r.u32()? != 0 {
+    // Core's nVersion is int16_t: 0x8000..=0xFFFF are negative and not special.
+    if (r.u16()? as i16) < 3 || r.u16()? != 6 {
         return Err("quorum transaction envelope");
     }
-    let size = r.compact(1024)?;
+    skip_inputs_outputs_locktime(&mut r)?;
+    // Payload = version (2) + height (4) + commitment; Core caps the commitment at 1024.
+    let size = r.compact(1024 + 6)?;
     let payload = r.take(size)?;
     r.finish()?;
     let mut p = Reader::new(payload);
@@ -294,5 +319,147 @@ impl ClearProof {
             target,
             target_coinbase,
         })
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn fixture() -> ClearProof {
+        serde_json::from_str(include_str!("../tests/data/short.json")).unwrap()
+    }
+
+    /// Split a real mined commitment into (payload, mining height) by parsing
+    /// the fixture's canonical empty-vin/vout shape.
+    fn fixture_commitment() -> (Vec<u8>, u32, [u8; 32]) {
+        let proof = fixture();
+        let link = &proof.links[0];
+        let height = link.certificate.height - link.witness.ancestors.len() as u32;
+        let tx = &link.witness.proof.transaction;
+        // version(2) type(2) vin(1)=0 vout(1)=0 locktime(4) payload_len(compact)
+        assert_eq!(
+            &tx[4..6],
+            &[0, 0],
+            "fixture commitment must have empty vin/vout"
+        );
+        let mut r = Reader::new(tx);
+        r.take(10).unwrap();
+        let n = r.compact(2048).unwrap();
+        let payload = r.take(n).unwrap().to_vec();
+        let expected = mining_commitment(tx, height).unwrap().quorum_hash;
+        (payload, height, expected)
+    }
+
+    fn compact(out: &mut Vec<u8>, n: usize) {
+        match n {
+            0..=252 => out.push(n as u8),
+            253..=65_535 => {
+                out.push(253);
+                out.extend((n as u16).to_le_bytes());
+            }
+            _ => unreachable!("test helper only encodes counts up to u16::MAX"),
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn accepts_every_consensus_valid_commitment_shape() {
+        // Core commit 725f7221bf: consensus only requires a special version and
+        // TRANSACTION_QUORUM_COMMITMENT; vin, vout and lock time are free.
+        let (payload, height, expected) = fixture_commitment();
+        let mut tx = Vec::new();
+        tx.extend(4u16.to_le_bytes()); // any special version >= 3
+        tx.extend(6u16.to_le_bytes());
+        compact(&mut tx, 1); // one input
+        tx.extend([0xAB; 32]);
+        tx.extend(1u32.to_le_bytes());
+        compact(&mut tx, 3);
+        tx.extend([0x51, 0x52, 0x53]);
+        tx.extend(0xFFFF_FFFEu32.to_le_bytes());
+        compact(&mut tx, 2); // two outputs
+        for _ in 0..2 {
+            tx.extend(1_000u64.to_le_bytes());
+            compact(&mut tx, 1);
+            tx.push(0x6a);
+        }
+        tx.extend(7u32.to_le_bytes()); // nonzero lock time
+        compact(&mut tx, payload.len());
+        tx.extend(&payload);
+        assert_eq!(
+            mining_commitment(&tx, height).unwrap().quorum_hash,
+            expected
+        );
+
+        // Still rejected: legacy (non-special) version, wrong type, wrong height.
+        let mut legacy = tx.clone();
+        legacy[0..2].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            mining_commitment(&legacy, height).unwrap_err(),
+            "quorum transaction envelope"
+        );
+        let mut wrong_type = tx.clone();
+        wrong_type[2..4].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(
+            mining_commitment(&wrong_type, height).unwrap_err(),
+            "quorum transaction envelope"
+        );
+        assert_eq!(
+            mining_commitment(&tx, height + 1).unwrap_err(),
+            "quorum payload height/version"
+        );
+    }
+
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn accepts_coinbase_with_more_than_4096_outputs_and_any_special_version() {
+        let proof = fixture();
+        let height = proof.target.height;
+        let tx = &proof.target_coinbase.transaction;
+        let expected = coinbase_roots(tx, height).unwrap();
+
+        // Re-serialize the real coinbase: version 4, 4,097 empty outputs, same input/payload.
+        let mut r = Reader::new(tx);
+        r.take(4).unwrap(); // version + type
+        r.compact(1).unwrap();
+        let input = r.take(36).unwrap().to_vec();
+        let script_len = r.compact(100).unwrap();
+        let script = r.take(script_len).unwrap().to_vec();
+        let sequence = r.u32().unwrap();
+        let outputs = r.compact(100_000).unwrap();
+        for _ in 0..outputs {
+            r.u64().unwrap();
+            let n = r.compact(100_000).unwrap();
+            r.take(n).unwrap();
+        }
+        let lock_time = r.u32().unwrap();
+        let n = r.compact(100_000).unwrap();
+        let payload = r.take(n).unwrap().to_vec();
+
+        let mut out = Vec::new();
+        out.extend(4u16.to_le_bytes());
+        out.extend(5u16.to_le_bytes());
+        compact(&mut out, 1);
+        out.extend(&input);
+        compact(&mut out, script.len());
+        out.extend(&script);
+        out.extend(sequence.to_le_bytes());
+        compact(&mut out, 4097);
+        for _ in 0..4097 {
+            out.extend(0u64.to_le_bytes());
+            compact(&mut out, 0);
+        }
+        out.extend(lock_time.to_le_bytes());
+        compact(&mut out, payload.len());
+        out.extend(&payload);
+        assert_eq!(coinbase_roots(&out, height).unwrap(), expected);
+
+        // Still rejected: legacy version, zero outputs, oversized scriptSig.
+        let mut legacy = out.clone();
+        legacy[0..2].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(
+            coinbase_roots(&legacy, height).unwrap_err(),
+            "coinbase transaction type/version"
+        );
     }
 }

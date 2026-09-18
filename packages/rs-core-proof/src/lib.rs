@@ -11,7 +11,7 @@ mod protocol;
 
 pub mod clear;
 
-const MAX_TX: usize = 100_000;
+pub(crate) const MAX_TX: usize = 100_000;
 pub use protocol::MerklePath;
 
 pub fn header_hash(header: &[u8; 80]) -> Hash {
@@ -116,13 +116,21 @@ pub fn parse_commitment(bytes: &[u8]) -> Result<Commitment> {
     })
 }
 
-/// Parse a complete v3 special coinbase, not a server-selected payload slice.
+/// Parse a complete special coinbase, not a server-selected payload slice.
+///
+/// Mirrors Core's `Coinbase()` in `llmq/quorumproofs.cpp`: any special
+/// transaction version (>= 3), type 5, one null-prevout input whose scriptSig
+/// is 1..100 bytes (the only coinbase bounds consensus enforces), at least one
+/// output with no upper count (Core commit 725f7221bf removed a 4,096 cap that
+/// consensus never had), and a `CCbTx` payload of version >= 3 carrying both
+/// roots, a ChainLock height diff below the block height and a signature.
 pub fn coinbase_roots(bytes: &[u8], height: u32) -> Result<(Hash, Hash)> {
     if bytes.len() > MAX_TX {
         return Err("coinbase size");
     }
     let mut r = Reader::new(bytes);
-    if r.u16()? != 3 || r.u16()? != 5 {
+    // Core's nVersion is int16_t: 0x8000..=0xFFFF are negative and not special.
+    if (r.u16()? as i16) < 3 || r.u16()? != 5 {
         return Err("coinbase transaction type/version");
     }
     if r.compact(1)? != 1 || r.array::<32>()? != [0; 32] || r.u32()? != u32::MAX {
@@ -134,7 +142,7 @@ pub fn coinbase_roots(bytes: &[u8], height: u32) -> Result<(Hash, Hash)> {
     }
     r.take(script_len)?;
     r.u32()?;
-    let outputs = r.compact(4096)?;
+    let outputs = r.compact(MAX_TX as u64)?;
     if outputs == 0 {
         return Err("coinbase outputs");
     }
@@ -144,14 +152,17 @@ pub fn coinbase_roots(bytes: &[u8], height: u32) -> Result<(Hash, Hash)> {
         r.take(n)?;
     }
     r.u32()?;
-    let n = r.compact(1024)?;
+    let n = r.compact(MAX_TX as u64)?;
     let mut payload = Reader::new(r.take(n)?);
     r.finish()?;
-    if payload.u16()? != 3 || payload.u32()? != height {
+    if payload.u16()? < 3 || payload.u32()? != height {
         return Err("coinbase payload version/height");
     }
     let mn = payload.array()?;
-    let quorums = payload.array()?;
+    let quorums: Hash = payload.array()?;
+    if quorums == [0; 32] {
+        return Err("coinbase quorum root");
+    }
     let diff = payload.compact(u32::MAX as u64)?;
     if diff >= height as usize {
         return Err("coinbase ChainLock height");
