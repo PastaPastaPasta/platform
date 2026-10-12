@@ -150,3 +150,5 @@ pub use jsonschema;
 pub use platform_serialization;
 pub use platform_serialization::de::{BorrowDecode, Decode, DefaultBorrowDecode, DefaultDecode};
 pub use platform_value;
+
+// fork-only: exercises the Tart macOS runner (Rust workspace tests)
