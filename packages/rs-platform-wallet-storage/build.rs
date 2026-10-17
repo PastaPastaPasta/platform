@@ -1,4 +1,5 @@
-//! Re-run the build whenever any file under `migrations/` changes.
+//! Re-run the build whenever any file under `migrations/` or
+//! `migrations_fork/` changes.
 //!
 //! `refinery::embed_migrations!("./migrations")` is a proc-macro
 //! evaluated at compile time. Cargo does not, by default, track
@@ -11,11 +12,13 @@ use std::path::Path;
 
 fn main() {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let migrations_dir = Path::new(&manifest).join("migrations");
-    println!("cargo:rerun-if-changed={}", migrations_dir.display());
-    if let Ok(entries) = std::fs::read_dir(&migrations_dir) {
-        for entry in entries.flatten() {
-            println!("cargo:rerun-if-changed={}", entry.path().display());
+    for dir in ["migrations", "migrations_fork"] {
+        let migrations_dir = Path::new(&manifest).join(dir);
+        println!("cargo:rerun-if-changed={}", migrations_dir.display());
+        if let Ok(entries) = std::fs::read_dir(&migrations_dir) {
+            for entry in entries.flatten() {
+                println!("cargo:rerun-if-changed={}", entry.path().display());
+            }
         }
     }
 }

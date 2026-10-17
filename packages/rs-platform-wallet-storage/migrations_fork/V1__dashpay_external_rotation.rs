@@ -1,5 +1,10 @@
 //! DashPay external-account rotation: retire the old pool, persist the stamp.
 //!
+//! Fork migration 1, recorded in `dw_fork_schema_history` rather than
+//! upstream's `refinery_schema_history` (`sqlite::migrations`). Builds before
+//! that recorded it as upstream version 19; the open moves such a row over
+//! (`reconcile_old_fork_history`). Its SQL is unchanged from then.
+//!
 //! A contact who rotates their payment xpub gets a new `DashpayExternalAccount`
 //! under the same account key. The registration upsert already replaces the
 //! account's xpub, but every pool row of the old xpub keeps its

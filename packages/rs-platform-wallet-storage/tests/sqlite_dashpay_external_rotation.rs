@@ -1,4 +1,4 @@
-//! A DashPay contact's payment-xpub rotation (V019).
+//! A DashPay contact's payment-xpub rotation (fork migration 1).
 //!
 //! The rotated contact's `DashpayExternalAccount` keeps its account key but
 //! derives a new pool. The registration flush retires the old xpub's pool rows
@@ -29,6 +29,7 @@ use platform_wallet::changeset::{
 };
 use platform_wallet::wallet::identity::{ContactRequest, EstablishedContact};
 use platform_wallet::wallet::platform_wallet::WalletId;
+use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
 use platform_wallet_storage::sqlite::schema::{contacts, core_pool};
 use platform_wallet_storage::{
     LoadCtx, SqlitePersister, SqlitePersisterConfig, WalletStorageError,
@@ -576,11 +577,11 @@ fn a_snapshot_of_an_unknown_xpub_still_conflicts() {
     assert!(retired(&persister, &w).is_empty());
 }
 
-/// A database written before V019 migrates in place: its established contact
-/// loads with no stamp (the sweep's "rebuild once" signal), its pool is
-/// untouched, and the history starts empty.
+/// A database written before fork migration 1 migrates in place: its
+/// established contact loads with no stamp (the sweep's "rebuild once"
+/// signal), its pool is untouched, and the history starts empty.
 #[test]
-fn a_pre_v019_database_migrates_with_no_stamp() {
+fn a_pre_fork_v1_database_migrates_with_no_stamp() {
     let (persister, _tmp, path) = fresh_persister();
     let w = wid(0xE7);
     ensure_wallet_meta(&persister, &w);
@@ -595,7 +596,7 @@ fn a_pre_v019_database_migrates_with_no_stamp() {
         conn.execute_batch(
             "DROP TABLE core_address_pool_retired;
              ALTER TABLE contacts DROP COLUMN external_account_reference;
-             DELETE FROM refinery_schema_history WHERE version = 19;",
+             DROP TABLE dw_fork_schema_history;",
         )
         .unwrap();
     }
@@ -618,6 +619,112 @@ fn a_pre_v019_database_migrates_with_no_stamp() {
             .collect::<BTreeSet<_>>(),
         scripts_of(a)
     );
+}
+
+/// A database an earlier fork build wrote recorded fork migration 1 in
+/// upstream's history as version 19. It opens: the row moves to the fork's
+/// history with its applied time, nothing re-runs, and the contact, its stamp,
+/// its pool and the retired generation load as stored.
+#[test]
+fn a_database_from_a_build_that_recorded_v019_opens_intact() {
+    let (persister, _tmp, path) = fresh_persister();
+    let w = wid(0xE8);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+    persister.store(w, registration(a, &[1])).unwrap();
+    persister.store(w, registration(b, &[])).unwrap();
+    store_stamp(&persister, &w, 6, Some(6));
+    drop(persister);
+
+    let applied_on: String = {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let applied_on = conn
+            .query_row(
+                &format!("SELECT applied_on FROM {FORK_HISTORY_TABLE} WHERE version = 1"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
+             VALUES (19, 'dashpay_external_rotation', ?1, ?2)",
+            rusqlite::params![applied_on, OLD_FORK_V019_CHECKSUM.to_string()],
+        )
+        .unwrap();
+        applied_on
+    };
+
+    let persister = reopen(&path);
+    assert_eq!(loaded_stamp(&persister, &w), Some(6));
+    assert_eq!(loaded_account(&persister, &w).0, b);
+    assert_eq!(live_scripts(&persister, &w), scripts_of(b));
+    assert_eq!(
+        retired(&persister, &w)
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        scripts_of(a)
+    );
+    let conn = persister.lock_conn_for_test();
+    let upstream_max: i64 = conn
+        .query_row(
+            "SELECT MAX(version) FROM refinery_schema_history",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(upstream_max, 18);
+    let fork: (i64, String, String) = conn
+        .query_row(
+            &format!("SELECT version, name, applied_on FROM {FORK_HISTORY_TABLE}"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(fork, (1, "dashpay_external_rotation".into(), applied_on));
+}
+
+/// A file a newer build wrote, with fork migrations this build does not
+/// have, is refused at open, typed, and left as it was.
+#[test]
+fn a_newer_fork_history_refuses_to_open() {
+    let (persister, _tmp, path) = fresh_persister();
+    drop(persister);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum)
+                 VALUES (2, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+    let err = SqlitePersister::open(SqlitePersisterConfig::new(&path))
+        .err()
+        .expect("a newer fork history is refused");
+    assert!(
+        matches!(
+            err,
+            WalletStorageError::ForkSchemaVersionUnsupported {
+                found: 2,
+                max_supported: 1
+            }
+        ),
+        "{err:?}"
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {FORK_HISTORY_TABLE}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 2);
 }
 
 /// The history never blocks a live write: a retired generation whose xpub no

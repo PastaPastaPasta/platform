@@ -42,7 +42,7 @@ Any `meta_*` row whose parent object does not exist — because it was never cre
 
 A future garbage-collection pass is expected to reap orphan metadata — rows with no live parent object older than approximately one week — but no such GC is implemented yet. Callers should not rely on orphan metadata persisting forever, nor assume it will be cleaned up promptly. `meta_global` is intentionally parentless and always survives.
 
-The tables are split into five domain diagrams below. `WALLETS` is the root anchor and appears in each diagram. The diagrams cover 21 of V001's 23 tables; `pending_contact_crypto` and `ignored_senders` appear in the [Tables](#tables) section but are not diagrammed. They show the V001 tables as amended in place by every later migration that changes one of them (the current `core_utxos`, `core_transactions`, `platform_addresses`, and `asset_locks` shapes). Ten tables added by later migrations are not yet diagrammed here: `core_address_pool`, `core_address_pool_retired` (V019), `meta_data_versions`, and `meta_store_generation` (V009, plus its V010–V011 `core_address_pool` columns), `invitations` (V003), `shielded_viewing_keys` (V013), `dpns_name_states` (V005), `tracked_masternodes` (V006), and the `identity_scan_states` / `identity_scan_failed_indices` pair (V017) — see the [Migrations](#migrations) log for what each adds in the meantime.
+The tables are split into five domain diagrams below. `WALLETS` is the root anchor and appears in each diagram. The diagrams cover 21 of V001's 23 tables; `pending_contact_crypto` and `ignored_senders` appear in the [Tables](#tables) section but are not diagrammed. They show the V001 tables as amended in place by every later migration that changes one of them (the current `core_utxos`, `core_transactions`, `platform_addresses`, and `asset_locks` shapes). Ten tables added by later migrations are not yet diagrammed here: `core_address_pool`, `core_address_pool_retired` (fork V1), `meta_data_versions`, and `meta_store_generation` (V009, plus its V010–V011 `core_address_pool` columns), `invitations` (V003), `shielded_viewing_keys` (V013), `dpns_name_states` (V005), `tracked_masternodes` (V006), and the `identity_scan_states` / `identity_scan_failed_indices` pair (V017) — see the [Migrations](#migrations) log for what each adds in the meantime.
 
 ## Diagram 1 — Core / L1 (Bitcoin/Dash layer)
 
@@ -193,7 +193,7 @@ erDiagram
         INTEGER is_hidden "established-only (NULL when pending)"
         BLOB accepted_accounts "bincode-encoded Vec u32; established-only"
         INTEGER payment_channel_broken "established-only; NULL = false"
-        INTEGER external_account_reference "established-only; NULL = not built (V019)"
+        INTEGER external_account_reference "established-only; NULL = not built (fork V1)"
         INTEGER updated_at "unixepoch() default"
     }
 ```
@@ -563,11 +563,11 @@ pending). The request columns hold a bincode-encoded `ContactRequest`;
 `accepted_accounts` holds a bincode-encoded `Vec<u32>`.
 `payment_channel_broken` is nullable and read as false when NULL; it is set
 when external-account registration permanently fails for a contact and
-cleared on a superseding rotation. `external_account_reference` (V019) is the
+cleared on a superseding rotation. `external_account_reference` (fork V1) is the
 `accountReference` of the incoming request the contact's
 `DashpayExternalAccount` was last built from; NULL means no build is
 recorded for the current request, which the sync sweep reads as "rebuild
-once" (every row written before V019 reads back NULL).
+once" (every row written before fork V1 reads back NULL).
 
 - PK: `(wallet_id, owner_id, contact_id)`.
 - FK: `wallet_id → wallets(wallet_id) ON DELETE CASCADE`.
@@ -875,4 +875,20 @@ table-rebuild migration, as V004 does.
 | V016 | `V016__identity_keys_null_scope_requires_existing_identity.rs` | Recreates the `identity_keys` null-scope trigger pair (see Triggers above) to also reject a NULL-scoped key naming an identity that does not exist at all, closing the gap where V008's guard caught only the wallet-owned case. |
 | V017 | `V017__identity_scan_state.rs` | Adds `identity_scan_states` (one row per wallet: the last gap-limit identity-scan verdict — `complete`, `probed_from`/`probed_through`, `unlocated_gap`) and `identity_scan_failed_indices` (indices probed without an answer, cascading from the verdict row via `wallet_id`). Purely additive; an upgraded database reads back "no verdict recorded" for every wallet until the next scan (dashpay/platform#4365). |
 | V018 | `V018__identity_hard_delete.rs` | Retires identity tombstoning. Adds `cascade_children_on_identity_delete` (brooms `identity_keys` / `contacts` / `ignored_senders` / `pending_contact_crypto` by the deleted identity id, covering the rows no live FK reaches) plus its access-path indexes `idx_contacts_owner`, `idx_ignored_senders_owner`, and `idx_pending_contact_crypto_owner`; purges every already-tombstoned identity and its dependents; drops `identities.tombstoned`. |
-| V019 | `V019__dashpay_external_rotation.rs` | Adds `core_address_pool_retired` (a rotated DashPay contact's old pool, keyed by the old xpub) so a new-xpub registration no longer fails as a typed-key conflict on every retry, and `contacts.external_account_reference` to persist the established contact's built-from stamp. Additive; existing contacts read back NULL and are rebuilt once by the next sweep. |
+
+### Fork migrations
+
+This fork's migrations live in `migrations_fork/` and keep their history in
+`dw_fork_schema_history`, a second refinery history table, applied after
+upstream's in the same transaction. Upstream's `refinery_schema_history` holds
+only upstream versions, so upstream can number its migrations freely, and an
+upstream build opens a fork database (it ignores the table and what the fork
+migrations add). A database whose fork history is newer than the build is
+refused with `ForkSchemaVersionUnsupported`. When upstream adopts a fork
+migration's schema, the pin bump that takes it adds a reconcile from the fork
+version to upstream's.
+
+| Fork version | File | Change |
+|---|---|---|
+| V1 | `migrations_fork/V1__dashpay_external_rotation.rs` | Adds `core_address_pool_retired` (a rotated DashPay contact's old pool, keyed by the old xpub) so a new-xpub registration no longer fails as a typed-key conflict on every retry, and `contacts.external_account_reference` to persist the established contact's built-from stamp. Additive; existing contacts read back NULL and are rebuilt once by the next sweep. | Builds before the fork history recorded it as upstream V019; the open moves that row (exact name and checksum only) into `dw_fork_schema_history`. |
+

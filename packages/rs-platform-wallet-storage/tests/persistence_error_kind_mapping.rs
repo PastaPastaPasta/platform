@@ -179,6 +179,13 @@ fn tc_code_004_b_fatal_variants_map_to_fatal_kind() {
             },
         ),
         (
+            "ForkSchemaVersionUnsupported",
+            WalletStorageError::ForkSchemaVersionUnsupported {
+                found: 2,
+                max_supported: 1,
+            },
+        ),
+        (
             "AutoBackupDisabled",
             WalletStorageError::AutoBackupDisabled {
                 operation: AutoBackupOperation::DeleteWallet,

@@ -167,6 +167,10 @@ fn samples() -> Vec<WalletStorageError> {
             found: 99,
             max_supported: 3,
         },
+        WalletStorageError::ForkSchemaVersionUnsupported {
+            found: 2,
+            max_supported: 1,
+        },
         WalletStorageError::AutoBackupDisabled {
             operation: AutoBackupOperation::DeleteWallet,
         },
@@ -390,6 +394,9 @@ fn tc_p2_005_is_transient_table() {
             WalletStorageError::SchemaHistoryMissing => (false, "schema_history_missing"),
             WalletStorageError::SchemaVersionUnsupported { .. } => {
                 (false, "schema_version_unsupported")
+            }
+            WalletStorageError::ForkSchemaVersionUnsupported { .. } => {
+                (false, "fork_schema_version_unsupported")
             }
             WalletStorageError::AutoBackupDisabled { .. } => (false, "auto_backup_disabled"),
             WalletStorageError::AutoBackupDirUnwritable { .. } => {

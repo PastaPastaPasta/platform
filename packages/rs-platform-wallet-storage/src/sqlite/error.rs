@@ -83,6 +83,15 @@ pub enum WalletStorageError {
     )]
     SchemaVersionUnsupported { found: i64, max_supported: i64 },
 
+    /// The database's fork migration history (`dw_fork_schema_history`)
+    /// carries a version beyond what this build can apply: a newer build of
+    /// the fork wrote it.
+    #[error(
+        "the wallet file was written by a newer build: fork schema version {found} is beyond \
+         the supported maximum {max_supported}"
+    )]
+    ForkSchemaVersionUnsupported { found: i64, max_supported: i64 },
+
     /// A destructive operation needed an automatic backup but the
     /// configuration disabled them.
     #[error("auto-backup is disabled for operation: {operation}")]
@@ -713,6 +722,7 @@ impl WalletStorageError {
             | Self::SourceOpenFailed { .. }
             | Self::SchemaHistoryMissing
             | Self::SchemaVersionUnsupported { .. }
+            | Self::ForkSchemaVersionUnsupported { .. }
             | Self::AutoBackupDisabled { .. }
             | Self::AutoBackupDirUnwritable { .. }
             | Self::InsecureParentDir { .. }
@@ -820,6 +830,7 @@ impl WalletStorageError {
             | Self::SourceOpenFailed { .. }
             | Self::SchemaHistoryMissing
             | Self::SchemaVersionUnsupported { .. }
+            | Self::ForkSchemaVersionUnsupported { .. }
             | Self::AutoBackupDisabled { .. }
             | Self::AutoBackupDirUnwritable { .. }
             | Self::InsecureParentDir { .. }
@@ -898,6 +909,7 @@ impl WalletStorageError {
             Self::SourceOpenFailed { .. } => "source_open_failed",
             Self::SchemaHistoryMissing => "schema_history_missing",
             Self::SchemaVersionUnsupported { .. } => "schema_version_unsupported",
+            Self::ForkSchemaVersionUnsupported { .. } => "fork_schema_version_unsupported",
             Self::AutoBackupDisabled { .. } => "auto_backup_disabled",
             Self::AutoBackupDirUnwritable { .. } => "auto_backup_dir_unwritable",
             Self::InsecureParentDir { .. } => "insecure_parent_dir",

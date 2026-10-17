@@ -326,6 +326,7 @@ fn run_restore(
         Err(
             err @ (WalletStorageError::NotAWalletDb { .. }
             | WalletStorageError::SchemaVersionUnsupported { .. }
+            | WalletStorageError::ForkSchemaVersionUnsupported { .. }
             | WalletStorageError::SchemaHistoryMalformed { .. }
             | WalletStorageError::SourceOpenFailed { .. }),
         ) => Err(CliError::validation(chain_message(&err))),

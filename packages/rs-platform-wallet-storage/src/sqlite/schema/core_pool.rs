@@ -335,7 +335,7 @@ pub(crate) fn apply_flush_pools(
 /// ones alone.
 ///
 /// Writes every row as given: V008's legacy conversion replays pools through
-/// here before V019 exists. A flush goes through [`apply_flush_pools`].
+/// here before fork V1 exists. A flush goes through [`apply_flush_pools`].
 pub fn apply_pools(
     tx: &Transaction<'_>,
     wallet_id: &WalletId,

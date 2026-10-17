@@ -428,9 +428,9 @@ fn bucket_contact_row(
                     // no column for it, so it restores empty and re-derives
                     // on the next contact-info sweep.
                     contact_account_label: None,
-                    // Rotation self-heal marker (V019): the request the
+                    // Rotation self-heal marker (fork V1): the request the
                     // external account was last built from. `NULL` (a row
-                    // from before V019, or an account not rebuilt since the
+                    // from before fork V1, or an account not rebuilt since the
                     // contact rotated) restores `None`, which makes the next
                     // sweep re-verify the account once and re-stamp it.
                     external_account_reference,

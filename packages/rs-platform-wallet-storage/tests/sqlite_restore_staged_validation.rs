@@ -69,6 +69,41 @@ fn forward_version_rejected_destination_unchanged() {
     );
 }
 
+/// The same for the fork's history: a source with fork migrations this
+/// build lacks is rejected and the destination is left untouched.
+#[test]
+fn forward_fork_version_rejected_destination_unchanged() {
+    let (persister, tmp, _path) = fresh_persister();
+    seed_one_row(&persister, &wid(0xF3));
+    let backup_path = persister.backup_to(tmp.path()).unwrap();
+    drop(persister);
+
+    {
+        let conn = rusqlite::Connection::open(&backup_path).unwrap();
+        conn.execute(
+            "INSERT INTO dw_fork_schema_history (version, name, applied_on, checksum) \
+             VALUES (2, 'future', '', '0')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let dest = tmp.path().join("dest.db");
+    fs::write(&dest, SENTINEL).unwrap();
+    let err = SqlitePersister::restore_from_skip_backup(&dest, &backup_path);
+    assert!(
+        matches!(
+            err,
+            Err(WalletStorageError::ForkSchemaVersionUnsupported {
+                found: 2,
+                max_supported: 1
+            })
+        ),
+        "expected ForkSchemaVersionUnsupported, got {err:?}"
+    );
+    assert_eq!(fs::read(&dest).unwrap(), SENTINEL);
+}
+
 /// A source lacking `refinery_schema_history` but otherwise
 /// integrity-valid is rejected and the destination is left untouched.
 #[test]

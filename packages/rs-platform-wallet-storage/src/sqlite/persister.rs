@@ -362,8 +362,10 @@ impl SqlitePersister {
         // migrated in place or panicking the runner.
         if had_schema_history {
             crate::sqlite::migrations::assert_schema_version_supported(&conn)?;
+            crate::sqlite::migrations::assert_fork_schema_version_supported(&conn)?;
             crate::sqlite::conn::assert_wallet_application_id_or_legacy(&conn)?;
             crate::sqlite::migrations::assert_schema_history_well_formed(&conn)?;
+            crate::sqlite::migrations::reconcile_old_fork_history(&mut conn)?;
         } else if crate::sqlite::migrations::db_has_objects(&conn)? {
             // A pre-existing file with schema objects but NO refinery history is
             // a foreign (non-wallet) SQLite DB. Migrating it in place would graft
@@ -373,7 +375,7 @@ impl SqlitePersister {
         }
         let pending = crate::sqlite::migrations::embedded_migrations();
         let pending_count = if had_schema_history {
-            count_pending(&mut conn, &pending)?
+            count_pending(&mut conn, &pending)? + crate::sqlite::migrations::fork_pending(&conn)?
         } else {
             pending.len()
         };
@@ -635,7 +637,7 @@ impl SqlitePersister {
     }
 
     /// The pool rows `wallet_id`'s accounts no longer derive from: DashPay
-    /// external pools a contact's rotation retired (V019), each with the
+    /// external pools a contact's rotation retired (fork V1), each with the
     /// xpub it came from. History for attribution; nothing here is payable,
     /// and `load()` never folds it into a pool.
     pub fn retired_pool_addresses(
@@ -2432,7 +2434,7 @@ mod tests {
             "meta_wallet",               // the kv object store
             "tracked_masternodes",       // load_tracked_masternodes
         ];
-        const INFRASTRUCTURE: &[&str] = &["refinery_schema_history"];
+        const INFRASTRUCTURE: &[&str] = &["refinery_schema_history", "dw_fork_schema_history"];
         // `load()` rehydrates these only with the `shielded` feature on, so
         // the classification follows the build rather than claiming one.
         #[cfg(feature = "shielded")]
