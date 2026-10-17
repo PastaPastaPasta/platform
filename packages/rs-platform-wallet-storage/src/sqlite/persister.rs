@@ -362,7 +362,6 @@ impl SqlitePersister {
         // migrated in place or panicking the runner.
         if had_schema_history {
             crate::sqlite::migrations::assert_schema_version_supported(&conn)?;
-            crate::sqlite::migrations::assert_fork_schema_version_supported(&conn)?;
             crate::sqlite::conn::assert_wallet_application_id_or_legacy(&conn)?;
             crate::sqlite::migrations::assert_schema_history_well_formed(&conn)?;
             crate::sqlite::migrations::reconcile_old_fork_history(&mut conn)?;

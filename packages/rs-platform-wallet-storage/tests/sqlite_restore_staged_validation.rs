@@ -15,6 +15,7 @@ use common::{ensure_wallet_meta, fresh_persister, wid};
 use platform_wallet::changeset::{
     CoreChangeSet, PlatformWalletChangeSet, PlatformWalletPersistence,
 };
+use platform_wallet_storage::sqlite::migrations::FORK_HISTORY_TABLE;
 use platform_wallet_storage::{SqlitePersister, WalletStorageError};
 
 fn seed_one_row(persister: &SqlitePersister, w: &[u8; 32]) {
@@ -81,8 +82,10 @@ fn forward_fork_version_rejected_destination_unchanged() {
     {
         let conn = rusqlite::Connection::open(&backup_path).unwrap();
         conn.execute(
-            "INSERT INTO dw_fork_schema_history (version, name, applied_on, checksum) \
-             VALUES (2, 'future', '', '0')",
+            &format!(
+                "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum) \
+                 VALUES (2, 'future', '', '0')"
+            ),
             [],
         )
         .unwrap();

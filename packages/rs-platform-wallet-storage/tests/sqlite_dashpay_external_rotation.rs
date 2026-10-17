@@ -29,7 +29,9 @@ use platform_wallet::changeset::{
 };
 use platform_wallet::wallet::identity::{ContactRequest, EstablishedContact};
 use platform_wallet::wallet::platform_wallet::WalletId;
-use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
+use platform_wallet_storage::sqlite::migrations::{
+    max_supported_version, FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM,
+};
 use platform_wallet_storage::sqlite::schema::{contacts, core_pool};
 use platform_wallet_storage::{
     LoadCtx, SqlitePersister, SqlitePersisterConfig, WalletStorageError,
@@ -593,11 +595,11 @@ fn a_pre_fork_v1_database_migrates_with_no_stamp() {
     // Rewind the file to the V018 schema: what V001..V018 left on disk.
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "DROP TABLE core_address_pool_retired;
              ALTER TABLE contacts DROP COLUMN external_account_reference;
-             DROP TABLE dw_fork_schema_history;",
-        )
+             DROP TABLE {FORK_HISTORY_TABLE};"
+        ))
         .unwrap();
     }
 
@@ -621,6 +623,67 @@ fn a_pre_fork_v1_database_migrates_with_no_stamp() {
     );
 }
 
+/// Rewinds the file at `path` to what builds before the fork history table
+/// recorded: fork migration 1 as upstream version 19. Returns its applied
+/// time.
+fn as_an_old_fork_build_recorded_it(path: &std::path::Path) -> String {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let applied_on: String = conn
+        .query_row(
+            &format!("SELECT applied_on FROM {FORK_HISTORY_TABLE} WHERE version = 1"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
+         VALUES (19, 'dashpay_external_rotation', ?1, ?2)",
+        rusqlite::params![applied_on, OLD_FORK_V019_CHECKSUM.to_string()],
+    )
+    .unwrap();
+    applied_on
+}
+
+/// A backup an earlier fork build made restores (the guards skip exactly
+/// the old row) and the restored file opens reconciled, data intact.
+#[test]
+fn a_backup_from_a_build_that_recorded_v019_restores_and_opens() {
+    let (persister, tmp, _path) = fresh_persister();
+    let w = wid(0xE9);
+    ensure_wallet_meta(&persister, &w);
+    let a = contact_xpub(0x0A);
+    persister.store(w, registration(a, &[1])).unwrap();
+    store_stamp(&persister, &w, 7, Some(7));
+    let backup = persister.backup_to(tmp.path()).unwrap();
+    drop(persister);
+    as_an_old_fork_build_recorded_it(&backup);
+
+    let dest = tmp.path().join("restored.db");
+    SqlitePersister::restore_from_skip_backup(&dest, &backup).unwrap();
+    let persister = reopen(&dest);
+    assert_eq!(loaded_stamp(&persister, &w), Some(7));
+    assert_eq!(live_scripts(&persister, &w), scripts_of(a));
+    let conn = persister.lock_conn_for_test();
+    let old_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 19",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_rows, 0);
+    let fork: i64 = conn
+        .query_row(
+            &format!("SELECT MAX(version) FROM {FORK_HISTORY_TABLE}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fork, 1);
+}
+
 /// A database an earlier fork build wrote recorded fork migration 1 in
 /// upstream's history as version 19. It opens: the row moves to the fork's
 /// history with its applied time, nothing re-runs, and the contact, its stamp,
@@ -636,25 +699,7 @@ fn a_database_from_a_build_that_recorded_v019_opens_intact() {
     store_stamp(&persister, &w, 6, Some(6));
     drop(persister);
 
-    let applied_on: String = {
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        let applied_on = conn
-            .query_row(
-                &format!("SELECT applied_on FROM {FORK_HISTORY_TABLE} WHERE version = 1"),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
-            .unwrap();
-        conn.execute(
-            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
-             VALUES (19, 'dashpay_external_rotation', ?1, ?2)",
-            rusqlite::params![applied_on, OLD_FORK_V019_CHECKSUM.to_string()],
-        )
-        .unwrap();
-        applied_on
-    };
+    let applied_on = as_an_old_fork_build_recorded_it(&path);
 
     let persister = reopen(&path);
     assert_eq!(loaded_stamp(&persister, &w), Some(6));
@@ -675,7 +720,7 @@ fn a_database_from_a_build_that_recorded_v019_opens_intact() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(upstream_max, 18);
+    assert_eq!(upstream_max, max_supported_version());
     let fork: (i64, String, String) = conn
         .query_row(
             &format!("SELECT version, name, applied_on FROM {FORK_HISTORY_TABLE}"),

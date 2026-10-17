@@ -201,17 +201,16 @@ fn run(cli: Cli) -> Result<ExitCode, CliError> {
         }
     }
 
-    // Migrate is done by `open`; capture pre/post versions to print
-    // "applied: N". A read failure must surface, not be read as 0.
+    // Migrate is done by `open`; count the recorded migrations of both
+    // histories before and after to print "applied: N" (moving an old fork
+    // row between them counts 0). A read failure must surface, not be read
+    // as 0.
     if let Cmd::Migrate(_) = &cli.cmd {
-        let pre_version =
-            peek_schema_version(&db).map_err(|e| CliError::runtime(chain_message(&e)))?;
+        let pre = peek_applied_migrations(&db).map_err(|e| CliError::runtime(chain_message(&e)))?;
         let _persister = SqlitePersister::open(config.clone()).map_err(map_open_err_for_cli)?;
-        let post_version =
-            peek_schema_version(&db).map_err(|e| CliError::runtime(chain_message(&e)))?;
-        let applied = post_version
-            .unwrap_or(0)
-            .saturating_sub(pre_version.unwrap_or(0)) as usize;
+        let post =
+            peek_applied_migrations(&db).map_err(|e| CliError::runtime(chain_message(&e)))?;
+        let applied = (post - pre).max(0);
         println!("applied: {applied}");
         return Ok(ExitCode::SUCCESS);
     }
@@ -245,38 +244,38 @@ fn map_open_err_for_cli(err: WalletStorageError) -> CliError {
 /// DB has no `refinery_schema_history` row yet (fresh DB); a real open
 /// or query failure is propagated as `Err` so callers don't mistake a
 /// transient failure for "version 0".
-fn peek_schema_version(db: &Path) -> Result<Option<i64>, rusqlite::Error> {
+fn peek_applied_migrations(db: &Path) -> Result<i64, rusqlite::Error> {
     use rusqlite::{OpenFlags, OptionalExtension};
-    // A missing path is a normal fresh `migrate`: `Ok(None)` lets
+    // A missing path is a normal fresh `migrate`: `Ok(0)` lets
     // `SqlitePersister::open` create the file under the 0o600 invariant,
     // instead of materialising a stub here that bypasses it.
     if !db.exists() {
-        return Ok(None);
+        return Ok(0);
     }
     // READ-ONLY, URI parsing off (matches the open-conn choke-point) so a
     // `--db` path can't smuggle `file:` query params defeating read-only.
     let conn = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    // Pre-migration the history table may legitimately not exist.
-    let has_history = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'refinery_schema_history'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !has_history {
-        return Ok(None);
+    let mut applied = 0;
+    for table in [
+        "refinery_schema_history",
+        platform_wallet_storage::sqlite::FORK_HISTORY_TABLE,
+    ] {
+        // Pre-migration a history table may legitimately not exist.
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            applied += conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        }
     }
-    let v = conn
-        .query_row(
-            "SELECT MAX(version) FROM refinery_schema_history",
-            [],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(v)
+    Ok(applied)
 }
 
 fn run_backup(persister: &SqlitePersister, args: BackupArgs) -> Result<ExitCode, CliError> {
@@ -421,20 +420,20 @@ mod tests {
         );
     }
 
-    /// `peek_schema_version` on a missing path must not materialise a stub
+    /// `peek_applied_migrations` on a missing path must not materialise a stub
     /// file (opening READ-ONLY) that would lack the 0o600 invariant.
     #[test]
-    fn peek_schema_version_on_missing_db_does_not_create_stub() {
+    fn peek_applied_migrations_on_missing_db_does_not_create_stub() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let typo = tmp.path().join("absent.db");
         assert!(!typo.exists(), "precondition: path must not exist");
 
-        let v = peek_schema_version(&typo).expect("must succeed with Ok(None)");
-        assert_eq!(v, None);
+        let v = peek_applied_migrations(&typo).expect("must succeed with Ok(0)");
+        assert_eq!(v, 0);
 
         assert!(
             !typo.exists(),
-            "peek_schema_version silently created a stub at {}",
+            "peek_applied_migrations silently created a stub at {}",
             typo.display()
         );
     }

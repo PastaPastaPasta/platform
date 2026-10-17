@@ -289,7 +289,6 @@ pub(crate) fn restore_from(
         return Err(WalletStorageError::SchemaHistoryMissing);
     }
     crate::sqlite::migrations::assert_schema_version_supported(&src)?;
-    crate::sqlite::migrations::assert_fork_schema_version_supported(&src)?;
     crate::sqlite::conn::assert_wallet_application_id_or_legacy(&src)?;
     crate::sqlite::migrations::assert_schema_history_well_formed(&src)?;
     drop(src);
@@ -371,7 +370,6 @@ pub(crate) fn restore_from(
             return Err(WalletStorageError::SchemaHistoryMissing);
         }
         crate::sqlite::migrations::assert_schema_version_supported(&staged)?;
-        crate::sqlite::migrations::assert_fork_schema_version_supported(&staged)?;
         crate::sqlite::conn::assert_wallet_application_id_or_legacy(&staged)?;
         crate::sqlite::migrations::assert_schema_history_well_formed(&staged)?;
     }

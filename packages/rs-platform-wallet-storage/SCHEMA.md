@@ -884,11 +884,19 @@ upstream's in the same transaction. Upstream's `refinery_schema_history` holds
 only upstream versions, so upstream can number its migrations freely, and an
 upstream build opens a fork database (it ignores the table and what the fork
 migrations add). A database whose fork history is newer than the build is
-refused with `ForkSchemaVersionUnsupported`. When upstream adopts a fork
-migration's schema, the pin bump that takes it adds a reconcile from the fork
-version to upstream's.
+refused with `ForkSchemaVersionUnsupported`. Every migration run checks that
+each applied fork migration's schema is still there, and fails, rolled back,
+when an upstream migration removed it. When upstream adopts a fork migration's
+schema, the pin bump that takes it adds a reconcile from the fork version to
+upstream's.
 
-| Fork version | File | Change |
-|---|---|---|
+Builds before the fork history recorded fork V1 as upstream V019. The open
+moves that row into `dw_fork_schema_history` with its applied time, for the
+exact name and checksum only; the same version and name with another checksum
+is refused (`SchemaHistoryMalformed`). The move is one-way: such a build cannot
+open the file afterwards (its V019 fails, rolled back).
+
+| Fork version | File | Change | Notes |
+|---|---|---|---|
 | V1 | `migrations_fork/V1__dashpay_external_rotation.rs` | Adds `core_address_pool_retired` (a rotated DashPay contact's old pool, keyed by the old xpub) so a new-xpub registration no longer fails as a typed-key conflict on every retry, and `contacts.external_account_reference` to persist the established contact's built-from stamp. Additive; existing contacts read back NULL and are rebuilt once by the next sweep. | Builds before the fork history recorded it as upstream V019; the open moves that row (exact name and checksum only) into `dw_fork_schema_history`. |
 
