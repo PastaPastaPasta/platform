@@ -449,12 +449,16 @@ serialization) so successive rotations never collide. The registration
 flush that replaces the account's xpub copies the old rows here (keeping
 their `used` flags) and deletes them from `core_address_pool` in the same
 transaction, so the new pool can claim the same `(pool_type,
-address_index)` slots. A later pool snapshot of the retired xpub (an SPV
-pass that started before the rotation) updates the matching row here
-instead of tripping the typed-key conflict. Read only by
-`SqlitePersister::retired_pool_addresses`, for history and attribution:
-`load()` never derives a pool or the used-address set from it, so nothing
-here is payable.
+address_index)` slots; a rotation back to an xpub the account had moves
+that generation's rows back to the live pool. A flush writes a DashPay
+external pool row by the xpub it derives from: the registered one's to
+`core_address_pool`, an earlier one's (retired, or registered earlier in
+the same flush) here, merging `used`; a row of an xpub the account never
+had is still a typed-key conflict. So a pool snapshot taken before a
+rotation and flushed after it, of any length, never reaches the live
+pool. Read only by `SqlitePersister::retired_pool_addresses`, for history
+and attribution: `load()` never derives a pool or the used-address set
+from it, so nothing here is payable.
 
 - PK: `(wallet_id, account_type, account_index, key_class, user_identity_id, friend_identity_id, account_xpub, pool_type, address_index)`.
 - FK: `wallet_id → wallets(wallet_id) ON DELETE CASCADE`.

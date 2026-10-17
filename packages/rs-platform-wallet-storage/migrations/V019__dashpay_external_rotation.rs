@@ -11,8 +11,10 @@
 //! `core_address_pool_retired` keeps the rows an account derived from an xpub
 //! it no longer has, keyed by that xpub (so a second rotation never collides
 //! with the first). They stay known for history and attribution; nothing that
-//! builds a payable pool reads them. Rows only move here inside the flush that
-//! replaces the account's xpub (see `accounts::apply_registrations`).
+//! builds a payable pool reads them. Rows move here inside the flush that
+//! replaces the account's xpub (see `accounts::apply_registrations`), and a
+//! flush stores a pool row of an earlier xpub here rather than in the live
+//! pool (see `core_pool::apply_flush_pools`).
 //!
 //! `contacts.external_account_reference` persists
 //! `EstablishedContact::external_account_reference`: the `accountReference` of

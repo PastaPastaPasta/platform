@@ -2195,7 +2195,12 @@ fn apply_changeset_to_tx(
     // to its owning account by matching the outpoint's script against a
     // freshly-written `core_address_pool` row.
     if !cs.account_address_pools.is_empty() {
-        schema::core_pool::apply_pools(tx, wallet_id, &cs.account_address_pools)?;
+        schema::core_pool::apply_flush_pools(
+            tx,
+            wallet_id,
+            &cs.account_address_pools,
+            &cs.account_registrations,
+        )?;
     }
     if !cs.pending_contact_crypto_added.is_empty() || !cs.pending_contact_crypto_cleared.is_empty()
     {

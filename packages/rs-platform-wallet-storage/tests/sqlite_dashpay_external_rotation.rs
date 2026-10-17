@@ -11,11 +11,13 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{ensure_identity, ensure_wallet_meta, fresh_persister, wid};
+use common::{
+    ensure_identity, ensure_wallet_meta, fresh_persister, fresh_persister_with_mode, wid, FlushMode,
+};
 use dpp::prelude::Identifier;
 use key_wallet::account::AccountType;
 use key_wallet::bip32::ExtendedPubKey;
-use key_wallet::managed_account::address_pool::AddressState;
+use key_wallet::managed_account::address_pool::{AddressState, KeySource};
 use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
 use key_wallet::managed_account::ManagedCoreFundsAccount;
 use key_wallet::wallet::initialization::WalletAccountCreationOptions;
@@ -63,6 +65,16 @@ fn contact_xpub(seed_byte: u8) -> ExtendedPubKey {
 /// The pool entries `register_external_contact_account` persists for `xpub`,
 /// with the addresses at `used` marked used.
 fn pool_entries(xpub: ExtendedPubKey, used: &[u32]) -> Vec<AccountAddressPoolEntry> {
+    pool_entries_extended(xpub, used, 0)
+}
+
+/// [`pool_entries`] with `extra` more addresses, as a pool its gap limit
+/// extended after payments snapshots it.
+fn pool_entries_extended(
+    xpub: ExtendedPubKey,
+    used: &[u32],
+    extra: u32,
+) -> Vec<AccountAddressPoolEntry> {
     let account = Account {
         parent_wallet_id: None,
         account_type: external_account(),
@@ -70,7 +82,13 @@ fn pool_entries(xpub: ExtendedPubKey, used: &[u32]) -> Vec<AccountAddressPoolEnt
         account_xpub: xpub,
         is_watch_only: true,
     };
-    let managed = ManagedCoreFundsAccount::from_account(&account);
+    let mut managed = ManagedCoreFundsAccount::from_account(&account);
+    if extra > 0 {
+        for pool in managed.managed_account_type_mut().address_pools_mut() {
+            pool.generate_addresses(extra, &KeySource::Public(xpub), true)
+                .expect("extend the pool");
+        }
+    }
     let entries: Vec<AccountAddressPoolEntry> = managed
         .managed_account_type()
         .address_pools()
@@ -413,9 +431,18 @@ fn a_failure_mid_flush_rolls_the_rotation_back() {
     );
 }
 
-/// A pool snapshot of the retired xpub that arrives after the rotation (the
-/// SPV path marking an old address used) updates the history instead of
-/// failing the flush, and never re-enters the live pool.
+fn pools_only(entries: Vec<AccountAddressPoolEntry>) -> PlatformWalletChangeSet {
+    PlatformWalletChangeSet {
+        account_address_pools: entries,
+        ..Default::default()
+    }
+}
+
+/// A pool snapshot of the retired xpub that arrives after the rotation (taken
+/// before it, flushed after) updates the history instead of failing the
+/// flush. It is longer than the new pool (the old one's gap limit grew with
+/// its payments), and none of its rows enters the live pool, so the new pool
+/// still grows past them.
 #[test]
 fn a_late_snapshot_of_the_retired_xpub_lands_in_history() {
     let (persister, _tmp, _path) = fresh_persister();
@@ -425,30 +452,102 @@ fn a_late_snapshot_of_the_retired_xpub_lands_in_history() {
     persister.store(w, registration(a, &[])).unwrap();
     persister.store(w, registration(b, &[])).unwrap();
 
-    persister
-        .store(
-            w,
-            PlatformWalletChangeSet {
-                account_address_pools: pool_entries(a, &[3]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let late = pool_entries_extended(a, &[3, 12], 5);
+    persister.store(w, pools_only(late.clone())).unwrap();
 
     assert_eq!(live_scripts(&persister, &w), scripts_of(b));
     let history = retired(&persister, &w);
-    for info in infos(&pool_entries(a, &[])) {
-        assert_eq!(
-            history[&info.script_pubkey.to_bytes()].1,
-            info.index == 3,
-            "index {}",
-            info.index
-        );
+    assert_eq!(history.len(), infos(&late).len());
+    for info in infos(&late) {
+        let (xpub, used) = &history[&info.script_pubkey.to_bytes()];
+        assert_eq!(xpub, &a.encode().to_vec());
+        assert_eq!(*used, matches!(info.index, 3 | 12), "index {}", info.index);
     }
+
+    // The new pool grows over the indices the late rows had.
+    let grown = pool_entries_extended(b, &[11], 5);
+    persister.store(w, pools_only(grown.clone())).unwrap();
+    let grown_scripts: BTreeSet<_> = infos(&grown)
+        .iter()
+        .map(|i| i.script_pubkey.to_bytes())
+        .collect();
+    assert_eq!(live_scripts(&persister, &w), grown_scripts);
+}
+
+/// Manual mode merges buffered changesets, so one flush can carry a stale
+/// pool snapshot ahead of the rotation that retires it, and two rotations of
+/// one account. Every row lands by the xpub it derives from: the last
+/// registration's live, each earlier one's in its history.
+#[test]
+fn rotations_merged_into_one_flush_land_by_derivation() {
+    let (persister, _tmp, _path) = fresh_persister_with_mode(FlushMode::Manual);
+    let w = wid(0xE8);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b, c) = (contact_xpub(0x0A), contact_xpub(0x0B), contact_xpub(0x0C));
+    persister.store(w, registration(a, &[])).unwrap();
+    persister.flush(w).unwrap();
+
+    persister
+        .store(w, pools_only(pool_entries_extended(a, &[4], 3)))
+        .unwrap();
+    persister.store(w, registration(b, &[2])).unwrap();
+    persister.store(w, registration(c, &[])).unwrap();
+    persister.flush(w).unwrap();
+
+    assert_eq!(live_scripts(&persister, &w), scripts_of(c));
+    let history = retired(&persister, &w);
+    let a_rows = infos(&pool_entries_extended(a, &[], 3))
+        .iter()
+        .map(|i| {
+            (
+                i.script_pubkey.to_bytes(),
+                (a.encode().to_vec(), i.index == 4),
+            )
+        })
+        .collect::<Vec<_>>();
+    let b_rows = infos(&pool_entries(b, &[]))
+        .iter()
+        .map(|i| {
+            (
+                i.script_pubkey.to_bytes(),
+                (b.encode().to_vec(), i.index == 2),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(history, a_rows.into_iter().chain(b_rows).collect());
+    assert_eq!(loaded_account(&persister, &w).0, c);
+}
+
+/// A contact rotating back to an xpub they had gets that generation's rows
+/// back, used flags included, and the history keeps only the xpub replaced.
+#[test]
+fn rotating_back_restores_the_earlier_generation() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w = wid(0xE9);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+    persister.store(w, registration(a, &[1])).unwrap();
+    persister.store(w, registration(b, &[0])).unwrap();
+    persister.store(w, registration(a, &[])).unwrap();
+
+    assert_eq!(live_scripts(&persister, &w), scripts_of(a));
+    let used = used_scripts(&persister, &w);
+    assert!(used.contains(&address_at(a, 1).script_pubkey.to_bytes()));
+    assert!(!used.contains(&address_at(b, 0).script_pubkey.to_bytes()));
+    let history = retired(&persister, &w);
+    assert_eq!(
+        history.keys().cloned().collect::<BTreeSet<_>>(),
+        scripts_of(b)
+    );
+    assert_eq!(
+        history[&address_at(b, 0).script_pubkey.to_bytes()],
+        (b.encode().to_vec(), true)
+    );
+    assert_eq!(loaded_account(&persister, &w).0, a);
 }
 
 /// A snapshot from an xpub the account never had is still a typed-key
-/// conflict: only rows the history already holds are rerouted.
+/// conflict: only rows of a generation the account had are history.
 #[test]
 fn a_snapshot_of_an_unknown_xpub_still_conflicts() {
     let (persister, _tmp, _path) = fresh_persister();
