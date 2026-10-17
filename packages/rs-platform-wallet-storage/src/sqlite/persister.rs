@@ -634,6 +634,19 @@ impl SqlitePersister {
         prune_backups_in(dir, policy)
     }
 
+    /// The pool rows `wallet_id`'s accounts no longer derive from: DashPay
+    /// external pools a contact's rotation retired (V019), each with the
+    /// xpub it came from. History for attribution; nothing here is payable,
+    /// and `load()` never folds it into a pool.
+    pub fn retired_pool_addresses(
+        &self,
+        wallet_id: &WalletId,
+        network: dashcore::Network,
+    ) -> Result<Vec<schema::core_pool::RetiredPoolAddress>, WalletStorageError> {
+        let conn = self.conn()?;
+        schema::core_pool::load_retired_pool_addresses(&conn, wallet_id, network)
+    }
+
     /// Read every identity that belongs to NO wallet, each already
     /// carrying its own persisted public keys.
     ///
@@ -2402,16 +2415,17 @@ mod tests {
         // Not rehydrated by `load()`, but read on demand by a production
         // entry point, so the state is reachable rather than abandoned.
         const READ_BY_A_DEDICATED_API: &[&str] = &[
-            "dpns_name_states",      // get_dpns_name_state
-            "meta_contact",          // the kv object store
-            "meta_data_versions",    // schema::versions
-            "meta_global",           // the kv object store
-            "meta_identity",         // the kv object store
-            "meta_platform_address", // the kv object store
-            "meta_store_generation", // schema::versions
-            "meta_token",            // the kv object store
-            "meta_wallet",           // the kv object store
-            "tracked_masternodes",   // load_tracked_masternodes
+            "core_address_pool_retired", // retired_pool_addresses
+            "dpns_name_states",          // get_dpns_name_state
+            "meta_contact",              // the kv object store
+            "meta_data_versions",        // schema::versions
+            "meta_global",               // the kv object store
+            "meta_identity",             // the kv object store
+            "meta_platform_address",     // the kv object store
+            "meta_store_generation",     // schema::versions
+            "meta_token",                // the kv object store
+            "meta_wallet",               // the kv object store
+            "tracked_masternodes",       // load_tracked_masternodes
         ];
         const INFRASTRUCTURE: &[&str] = &["refinery_schema_history"];
         // `load()` rehydrates these only with the `shielded` feature on, so

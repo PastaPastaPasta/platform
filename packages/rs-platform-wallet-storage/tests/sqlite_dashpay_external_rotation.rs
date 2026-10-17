@@ -1,0 +1,522 @@
+//! A DashPay contact's payment-xpub rotation (V019).
+//!
+//! The rotated contact's `DashpayExternalAccount` keeps its account key but
+//! derives a new pool. The registration flush retires the old xpub's pool rows
+//! to `core_address_pool_retired` in the same transaction that replaces the
+//! xpub, so the new pool lands, the old addresses stay known for history, and
+//! nothing payable is ever built from them. The contact's
+//! `external_account_reference` stamp persists alongside.
+
+mod common;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use common::{ensure_identity, ensure_wallet_meta, fresh_persister, wid};
+use dpp::prelude::Identifier;
+use key_wallet::account::AccountType;
+use key_wallet::bip32::ExtendedPubKey;
+use key_wallet::managed_account::address_pool::AddressState;
+use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
+use key_wallet::managed_account::ManagedCoreFundsAccount;
+use key_wallet::wallet::initialization::WalletAccountCreationOptions;
+use key_wallet::wallet::Wallet;
+use key_wallet::{Account, AddressInfo, Network};
+use platform_wallet::changeset::{
+    AccountAddressPoolEntry, AccountRegistrationEntry, ContactChangeSet, PersistenceError,
+    PlatformWalletChangeSet, PlatformWalletPersistence, SentContactRequestKey,
+};
+use platform_wallet::wallet::identity::{ContactRequest, EstablishedContact};
+use platform_wallet::wallet::platform_wallet::WalletId;
+use platform_wallet_storage::sqlite::schema::{contacts, core_pool};
+use platform_wallet_storage::{
+    LoadCtx, SqlitePersister, SqlitePersisterConfig, WalletStorageError,
+};
+
+const OWNER: [u8; 32] = [0x71; 32];
+const FRIEND: [u8; 32] = [0x72; 32];
+
+fn reopen(path: &std::path::Path) -> SqlitePersister {
+    SqlitePersister::open(SqlitePersisterConfig::new(path)).expect("reopen persister")
+}
+
+fn external_account() -> AccountType {
+    AccountType::DashpayExternalAccount {
+        index: 0,
+        user_identity_id: OWNER,
+        friend_identity_id: FRIEND,
+    }
+}
+
+/// A stand-in for the xpub a contact encrypts into their request.
+fn contact_xpub(seed_byte: u8) -> ExtendedPubKey {
+    Wallet::from_seed_bytes(
+        [seed_byte; 64],
+        Network::Testnet,
+        WalletAccountCreationOptions::Default,
+    )
+    .expect("wallet")
+    .get_bip44_account(0)
+    .expect("BIP44 account 0")
+    .account_xpub
+}
+
+/// The pool entries `register_external_contact_account` persists for `xpub`,
+/// with the addresses at `used` marked used.
+fn pool_entries(xpub: ExtendedPubKey, used: &[u32]) -> Vec<AccountAddressPoolEntry> {
+    let account = Account {
+        parent_wallet_id: None,
+        account_type: external_account(),
+        network: Network::Testnet,
+        account_xpub: xpub,
+        is_watch_only: true,
+    };
+    let managed = ManagedCoreFundsAccount::from_account(&account);
+    let entries: Vec<AccountAddressPoolEntry> = managed
+        .managed_account_type()
+        .address_pools()
+        .into_iter()
+        .filter(|pool| !pool.addresses.is_empty())
+        .map(|pool| AccountAddressPoolEntry {
+            account_type: external_account(),
+            pool_type: pool.pool_type,
+            addresses: pool
+                .addresses
+                .values()
+                .cloned()
+                .map(|mut info| {
+                    if used.contains(&info.index) {
+                        info.state = AddressState::Used;
+                    }
+                    info
+                })
+                .collect(),
+        })
+        .collect();
+    assert!(!entries.is_empty(), "the external account derives a pool");
+    entries
+}
+
+/// The changeset `register_external_contact_account` stores.
+fn registration(xpub: ExtendedPubKey, used: &[u32]) -> PlatformWalletChangeSet {
+    PlatformWalletChangeSet {
+        account_registrations: vec![AccountRegistrationEntry {
+            account_type: external_account(),
+            account_xpub: xpub,
+        }],
+        account_address_pools: pool_entries(xpub, used),
+        ..Default::default()
+    }
+}
+
+fn infos(entries: &[AccountAddressPoolEntry]) -> Vec<&AddressInfo> {
+    entries.iter().flat_map(|e| e.addresses.iter()).collect()
+}
+
+fn scripts_of(xpub: ExtendedPubKey) -> BTreeSet<Vec<u8>> {
+    infos(&pool_entries(xpub, &[]))
+        .into_iter()
+        .map(|info| info.script_pubkey.to_bytes())
+        .collect()
+}
+
+fn address_at(xpub: ExtendedPubKey, index: u32) -> AddressInfo {
+    infos(&pool_entries(xpub, &[]))
+        .into_iter()
+        .find(|info| info.index == index)
+        .cloned()
+        .expect("derived address at index")
+}
+
+fn live_scripts(persister: &SqlitePersister, w: &WalletId) -> BTreeSet<Vec<u8>> {
+    let conn = persister.lock_conn_for_test();
+    let mut stmt = conn
+        .prepare("SELECT script FROM core_address_pool WHERE wallet_id = ?1")
+        .unwrap();
+    stmt.query_map(rusqlite::params![w.as_slice()], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Retired rows by script: (the xpub they came from, used).
+fn retired(persister: &SqlitePersister, w: &WalletId) -> BTreeMap<Vec<u8>, (Vec<u8>, bool)> {
+    persister
+        .retired_pool_addresses(w, Network::Testnet)
+        .expect("read retired pool")
+        .into_iter()
+        .map(|row| {
+            let owner = &row.owner;
+            assert_eq!(owner.account_type, "dashpay_external");
+            assert_eq!(
+                (owner.user_identity_id, owner.friend_identity_id),
+                (OWNER, FRIEND)
+            );
+            (
+                row.address.script_pubkey().to_bytes(),
+                (row.account_xpub, row.used),
+            )
+        })
+        .collect()
+}
+
+/// The xpub and pool scripts `load()` rebuilds the external account from.
+fn loaded_account(
+    persister: &SqlitePersister,
+    w: &WalletId,
+) -> (ExtendedPubKey, BTreeSet<Vec<u8>>) {
+    let state = persister.load().expect("load");
+    let start = state.wallets.get(w).expect("wallet rehydrated");
+    let xpub = start
+        .wallet
+        .accounts
+        .account_of_type(external_account())
+        .expect("external account restored")
+        .account_xpub;
+    let managed = start
+        .wallet_info
+        .all_managed_accounts()
+        .into_iter()
+        .find(|m| m.managed_account_type().to_account_type() == external_account())
+        .expect("managed external account restored");
+    let scripts = managed
+        .managed_account_type()
+        .address_pools()
+        .into_iter()
+        .flat_map(|pool| pool.addresses.values().map(|i| i.script_pubkey.to_bytes()))
+        .collect();
+    (xpub, scripts)
+}
+
+fn used_scripts(persister: &SqlitePersister, w: &WalletId) -> BTreeSet<Vec<u8>> {
+    let conn = persister.lock_conn_for_test();
+    core_pool::load_used_addresses(&conn, w, Network::Testnet)
+        .expect("used addresses")
+        .into_iter()
+        .map(|(address, _)| address.script_pubkey().to_bytes())
+        .collect()
+}
+
+fn request(sender: [u8; 32], recipient: [u8; 32], account_reference: u32) -> ContactRequest {
+    ContactRequest {
+        sender_id: Identifier::from(sender),
+        recipient_id: Identifier::from(recipient),
+        sender_key_index: 1,
+        recipient_key_index: 2,
+        account_reference,
+        encrypted_account_label: None,
+        encrypted_public_key: vec![9; 96],
+        auto_accept_proof: None,
+        core_height_created_at: 42,
+        created_at: 7,
+    }
+}
+
+fn contact_key() -> SentContactRequestKey {
+    SentContactRequestKey {
+        owner_id: Identifier::from(OWNER),
+        recipient_id: Identifier::from(FRIEND),
+    }
+}
+
+/// The established row `note_external_account_registered` writes once the
+/// account built from the contact's request `reference` is stored.
+/// Store [`stamped_contact`] under an owner identity of `w` (`load()` refuses
+/// a contact whose owner it doesn't hold).
+fn store_stamp(persister: &SqlitePersister, w: &WalletId, reference: u32, stamp: Option<u32>) {
+    ensure_identity(persister, &OWNER, Some(w));
+    persister
+        .store(
+            *w,
+            PlatformWalletChangeSet {
+                contacts: Some(stamped_contact(reference, stamp)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+}
+
+fn stamped_contact(reference: u32, stamp: Option<u32>) -> ContactChangeSet {
+    let mut established = BTreeMap::new();
+    established.insert(
+        contact_key(),
+        EstablishedContact {
+            contact_identity_id: Identifier::from(FRIEND),
+            outgoing_request: request(OWNER, FRIEND, 0),
+            incoming_request: request(FRIEND, OWNER, reference),
+            alias: None,
+            note: None,
+            is_hidden: false,
+            accepted_accounts: vec![0],
+            payment_channel_broken: false,
+            contact_account_label: None,
+            external_account_reference: stamp,
+        },
+    );
+    ContactChangeSet {
+        established,
+        ..Default::default()
+    }
+}
+
+fn loaded_stamp(persister: &SqlitePersister, w: &WalletId) -> Option<u32> {
+    let conn = persister.lock_conn_for_test();
+    contacts::load_state_for_test(&conn, w, &LoadCtx::strict())
+        .expect("contacts load")
+        .established
+        .get(&contact_key())
+        .expect("established contact")
+        .external_account_reference
+}
+
+fn storage_error(err: PersistenceError) -> Box<WalletStorageError> {
+    match err {
+        PersistenceError::Backend { source, .. } => source
+            .downcast::<WalletStorageError>()
+            .unwrap_or_else(|source| panic!("expected WalletStorageError, got {source}")),
+        other => panic!("expected Backend {{ .. }}, got {other:?}"),
+    }
+}
+
+/// The contact rotates: the new xpub's pool replaces the old one, whose rows
+/// (with their used flags) move to history keyed by the old xpub.
+#[test]
+fn new_xpub_rotation_retires_the_old_pool() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w = wid(0xE1);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+
+    persister.store(w, registration(a, &[0, 2])).unwrap();
+    persister.store(w, registration(b, &[])).unwrap();
+
+    assert_eq!(live_scripts(&persister, &w), scripts_of(b));
+    let history = retired(&persister, &w);
+    assert_eq!(
+        history.keys().cloned().collect::<BTreeSet<_>>(),
+        scripts_of(a)
+    );
+    for info in infos(&pool_entries(a, &[])) {
+        let (xpub, used) = &history[&info.script_pubkey.to_bytes()];
+        assert_eq!(xpub, &a.encode().to_vec());
+        assert_eq!(*used, matches!(info.index, 0 | 2), "index {}", info.index);
+    }
+    let (xpub, scripts) = loaded_account(&persister, &w);
+    assert_eq!(xpub, b);
+    assert_eq!(scripts, scripts_of(b));
+
+    // A second rotation keys its history by its own xpub: no collision.
+    let c = contact_xpub(0x0C);
+    persister.store(w, registration(c, &[])).unwrap();
+    assert_eq!(live_scripts(&persister, &w), scripts_of(c));
+    let history = retired(&persister, &w);
+    assert_eq!(
+        history.keys().cloned().collect::<BTreeSet<_>>(),
+        &scripts_of(a) | &scripts_of(b)
+    );
+}
+
+/// The sweep rebuilding an account from the xpub it already has replaces
+/// nothing and retires nothing.
+#[test]
+fn same_xpub_rebuild_retires_nothing() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w = wid(0xE2);
+    ensure_wallet_meta(&persister, &w);
+    let a = contact_xpub(0x0A);
+
+    persister.store(w, registration(a, &[1])).unwrap();
+    persister.store(w, registration(a, &[])).unwrap();
+
+    assert_eq!(live_scripts(&persister, &w), scripts_of(a));
+    assert!(retired(&persister, &w).is_empty());
+    assert!(used_scripts(&persister, &w).contains(&address_at(a, 1).script_pubkey.to_bytes()));
+    assert_eq!(loaded_account(&persister, &w).0, a);
+}
+
+/// After a relaunch the account comes back on the new xpub with only the new
+/// pool, the stamp comes back with it, and an old address is neither in a pool
+/// nor used — it is only in the history.
+#[test]
+fn rotation_and_stamp_survive_a_relaunch() {
+    let (persister, _tmp, path) = fresh_persister();
+    let w = wid(0xE3);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+
+    persister.store(w, registration(a, &[1])).unwrap();
+    persister.store(w, registration(b, &[])).unwrap();
+    store_stamp(&persister, &w, 5, Some(5));
+    drop(persister);
+
+    let persister = reopen(&path);
+    let (xpub, scripts) = loaded_account(&persister, &w);
+    assert_eq!(xpub, b);
+    assert_eq!(scripts, scripts_of(b));
+    let old = address_at(a, 1).script_pubkey.to_bytes();
+    assert!(!scripts.contains(&old));
+    assert!(!used_scripts(&persister, &w).contains(&old));
+    assert_eq!(retired(&persister, &w)[&old], (a.encode().to_vec(), true));
+    assert_eq!(loaded_stamp(&persister, &w), Some(5));
+
+    // The re-key that precedes a rebuild clears the stamp; that persists too.
+    store_stamp(&persister, &w, 6, None);
+    drop(persister);
+    assert_eq!(loaded_stamp(&reopen(&path), &w), None);
+}
+
+/// A failure after the retire step rolls the whole flush back: the old
+/// account, its pool and an empty history are what a relaunch sees, and the
+/// retried registration then rotates cleanly.
+#[test]
+fn a_failure_mid_flush_rolls_the_rotation_back() {
+    let (persister, _tmp, path) = fresh_persister();
+    let w = wid(0xE4);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+    persister.store(w, registration(a, &[0])).unwrap();
+
+    // Fails the first new-pool insert: the retire copy, the live-row delete
+    // and the account upsert have all run inside the flush by then.
+    persister
+        .lock_conn_for_test()
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_new_pool AFTER INSERT ON core_address_pool \
+             BEGIN SELECT RAISE(ABORT, 'injected mid-flush failure'); END;",
+        )
+        .unwrap();
+    persister
+        .store(w, registration(b, &[]))
+        .expect_err("the injected failure fails the flush");
+    persister
+        .lock_conn_for_test()
+        .execute_batch("DROP TRIGGER fail_new_pool;")
+        .unwrap();
+
+    assert_eq!(live_scripts(&persister, &w), scripts_of(a));
+    assert!(retired(&persister, &w).is_empty());
+    drop(persister);
+
+    let persister = reopen(&path);
+    let (xpub, scripts) = loaded_account(&persister, &w);
+    assert_eq!(xpub, a);
+    assert_eq!(scripts, scripts_of(a));
+    assert!(used_scripts(&persister, &w).contains(&address_at(a, 0).script_pubkey.to_bytes()));
+
+    persister.store(w, registration(b, &[])).unwrap();
+    assert_eq!(live_scripts(&persister, &w), scripts_of(b));
+    assert_eq!(
+        retired(&persister, &w)
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        scripts_of(a)
+    );
+}
+
+/// A pool snapshot of the retired xpub that arrives after the rotation (the
+/// SPV path marking an old address used) updates the history instead of
+/// failing the flush, and never re-enters the live pool.
+#[test]
+fn a_late_snapshot_of_the_retired_xpub_lands_in_history() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w = wid(0xE5);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+    persister.store(w, registration(a, &[])).unwrap();
+    persister.store(w, registration(b, &[])).unwrap();
+
+    persister
+        .store(
+            w,
+            PlatformWalletChangeSet {
+                account_address_pools: pool_entries(a, &[3]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(live_scripts(&persister, &w), scripts_of(b));
+    let history = retired(&persister, &w);
+    for info in infos(&pool_entries(a, &[])) {
+        assert_eq!(
+            history[&info.script_pubkey.to_bytes()].1,
+            info.index == 3,
+            "index {}",
+            info.index
+        );
+    }
+}
+
+/// A snapshot from an xpub the account never had is still a typed-key
+/// conflict: only rows the history already holds are rerouted.
+#[test]
+fn a_snapshot_of_an_unknown_xpub_still_conflicts() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w = wid(0xE6);
+    ensure_wallet_meta(&persister, &w);
+    let (a, c) = (contact_xpub(0x0A), contact_xpub(0x0C));
+    persister.store(w, registration(a, &[])).unwrap();
+
+    let err = persister
+        .store(
+            w,
+            PlatformWalletChangeSet {
+                account_address_pools: pool_entries(c, &[]),
+                ..Default::default()
+            },
+        )
+        .expect_err("a foreign typed key conflicts");
+    assert!(
+        matches!(
+            *storage_error(err),
+            WalletStorageError::TypedPoolKeyConflict { .. }
+        ),
+        "expected TypedPoolKeyConflict"
+    );
+    assert_eq!(live_scripts(&persister, &w), scripts_of(a));
+    assert!(retired(&persister, &w).is_empty());
+}
+
+/// A database written before V019 migrates in place: its established contact
+/// loads with no stamp (the sweep's "rebuild once" signal), its pool is
+/// untouched, and the history starts empty.
+#[test]
+fn a_pre_v019_database_migrates_with_no_stamp() {
+    let (persister, _tmp, path) = fresh_persister();
+    let w = wid(0xE7);
+    ensure_wallet_meta(&persister, &w);
+    let a = contact_xpub(0x0A);
+    persister.store(w, registration(a, &[2])).unwrap();
+    store_stamp(&persister, &w, 5, Some(5));
+    drop(persister);
+
+    // Rewind the file to the V018 schema: what V001..V018 left on disk.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE core_address_pool_retired;
+             ALTER TABLE contacts DROP COLUMN external_account_reference;
+             DELETE FROM refinery_schema_history WHERE version = 19;",
+        )
+        .unwrap();
+    }
+
+    let persister = reopen(&path);
+    assert_eq!(loaded_stamp(&persister, &w), None);
+    assert_eq!(live_scripts(&persister, &w), scripts_of(a));
+    assert!(retired(&persister, &w).is_empty());
+    assert!(used_scripts(&persister, &w).contains(&address_at(a, 2).script_pubkey.to_bytes()));
+    assert_eq!(loaded_account(&persister, &w).0, a);
+
+    // The healed database rotates like a fresh one.
+    let b = contact_xpub(0x0B);
+    persister.store(w, registration(b, &[])).unwrap();
+    assert_eq!(live_scripts(&persister, &w), scripts_of(b));
+    assert_eq!(
+        retired(&persister, &w)
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        scripts_of(a)
+    );
+}
