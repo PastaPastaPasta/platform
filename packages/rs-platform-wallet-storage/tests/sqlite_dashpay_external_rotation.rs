@@ -619,3 +619,27 @@ fn a_pre_v019_database_migrates_with_no_stamp() {
         scripts_of(a)
     );
 }
+
+/// The history never blocks a live write: a retired generation whose xpub no
+/// longer decodes is skipped, and the contact's own pool still stores.
+#[test]
+fn a_corrupt_retired_xpub_does_not_block_live_writes() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w = wid(0xEA);
+    ensure_wallet_meta(&persister, &w);
+    let (a, b) = (contact_xpub(0x0A), contact_xpub(0x0B));
+    persister.store(w, registration(a, &[])).unwrap();
+    persister.store(w, registration(b, &[])).unwrap();
+    persister
+        .lock_conn_for_test()
+        .execute(
+            "UPDATE core_address_pool_retired SET account_xpub = X'00' WHERE wallet_id = ?1",
+            rusqlite::params![w.as_slice()],
+        )
+        .unwrap();
+
+    persister
+        .store(w, pools_only(pool_entries_extended(b, &[1], 2)))
+        .unwrap();
+    assert!(used_scripts(&persister, &w).contains(&address_at(b, 1).script_pubkey.to_bytes()));
+}

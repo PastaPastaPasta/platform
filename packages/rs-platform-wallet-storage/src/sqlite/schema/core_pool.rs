@@ -203,6 +203,13 @@ pub(crate) fn rotate_account_pool(
 /// account's registered one (the row is live), one it had before or that
 /// this flush registers ahead of it (the row is history, stored under that
 /// generation), or none it ever had.
+///
+/// An earlier xpub is known only by its retired rows or by a registration in
+/// the same flush: every emitter stores a DashPay external registration with
+/// its pool, so a registration stored alone and replaced before any pool row
+/// of it landed would leave that xpub's rows unknown. Rows are derived on the
+/// account's own pool type (key-wallet gives this account one `Absent`
+/// pool).
 struct DashpayGenerations {
     current: Account,
     earlier: Vec<(Vec<u8>, Account)>,
@@ -228,9 +235,8 @@ impl DashpayGenerations {
         };
         let network = wallets::network_of(tx, wallet_id)?;
         let account = |xpub| {
-            Account::new(None, *account_type, xpub, network).map_err(|_| {
-                WalletStorageError::blob_decode("account_registrations.account_xpub_bytes")
-            })
+            Account::new(None, *account_type, xpub, network)
+                .map_err(|_| WalletStorageError::blob_decode("DashPay external account xpub"))
         };
         let k = AccountKey::of(account_type);
         let mut xpubs: Vec<Vec<u8>> = tx
@@ -258,9 +264,16 @@ impl DashpayGenerations {
         xpubs.dedup();
         let mut earlier = Vec::with_capacity(xpubs.len());
         for bytes in xpubs {
-            let xpub = ExtendedPubKey::decode(&bytes).map_err(|_| {
-                WalletStorageError::blob_decode("core_address_pool_retired.account_xpub")
-            })?;
+            // History must not block live writes: a generation whose xpub no
+            // longer decodes is skipped, so only a stale row of it would
+            // fail, as unknown.
+            let Ok(xpub) = ExtendedPubKey::decode(&bytes) else {
+                tracing::warn!(
+                    account_type = k.label,
+                    "a retired DashPay xpub does not decode; its generation is skipped"
+                );
+                continue;
+            };
             earlier.push((bytes, account(xpub)?));
         }
         Ok(Some(Self {
