@@ -15,7 +15,7 @@ use common::{ensure_wallet_meta, fresh_persister, wid};
 use platform_wallet::changeset::{
     CoreChangeSet, PlatformWalletChangeSet, PlatformWalletPersistence,
 };
-use platform_wallet_storage::sqlite::migrations::FORK_HISTORY_TABLE;
+use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
 use platform_wallet_storage::{SqlitePersister, WalletStorageError};
 
 fn seed_one_row(persister: &SqlitePersister, w: &[u8; 32]) {
@@ -105,6 +105,49 @@ fn forward_fork_version_rejected_destination_unchanged() {
         "expected ForkSchemaVersionUnsupported, got {err:?}"
     );
     assert_eq!(fs::read(&dest).unwrap(), SENTINEL);
+}
+
+/// A source whose fork history refinery would refuse to read, or whose fork
+/// schema is gone or reshaped, is rejected before it replaces a healthy
+/// wallet, which stays byte for byte as it was.
+#[test]
+fn malformed_fork_history_rejected_healthy_destination_unchanged() {
+    // An old fork build's file (fork V1 recorded as upstream V019, no fork
+    // history table) whose fork column is gone.
+    let old_fork_file_reshaped = format!(
+        "DROP TABLE {FORK_HISTORY_TABLE};
+         INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
+             VALUES (19, 'dashpay_external_rotation', '2026-10-01T00:00:00Z', '{OLD_FORK_V019_CHECKSUM}');
+         ALTER TABLE contacts DROP COLUMN external_account_reference;"
+    );
+    for sql in [
+        "UPDATE dw_fork_schema_history SET checksum = 'not_a_u64'",
+        "UPDATE dw_fork_schema_history SET applied_on = 'not-a-timestamp'",
+        "UPDATE dw_fork_schema_history SET name = 'wrong_name'",
+        "UPDATE dw_fork_schema_history SET checksum = '1'",
+        "DROP TABLE core_address_pool_retired;
+         CREATE TABLE core_address_pool_retired (wallet_id BLOB);",
+        &old_fork_file_reshaped,
+    ] {
+        let (persister, tmp, dest) = fresh_persister();
+        seed_one_row(&persister, &wid(0xF4));
+        let backup_path = persister.backup_to(tmp.path()).unwrap();
+        drop(persister);
+        rusqlite::Connection::open(&backup_path)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
+
+        let before = fs::read(&dest).unwrap();
+        let err = SqlitePersister::restore_from_skip_backup(&dest, &backup_path);
+        assert!(
+            matches!(err, Err(WalletStorageError::SchemaHistoryMalformed { .. })),
+            "{sql}: expected SchemaHistoryMalformed, got {err:?}"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), before, "{sql}");
+        SqlitePersister::open(platform_wallet_storage::SqlitePersisterConfig::new(&dest))
+            .expect("the destination still opens");
+    }
 }
 
 /// A source lacking `refinery_schema_history` but otherwise

@@ -731,6 +731,42 @@ fn a_database_from_a_build_that_recorded_v019_opens_intact() {
     assert_eq!(fork, (1, "dashpay_external_rotation".into(), applied_on));
 }
 
+/// The reconcile runs in the open's migration transaction: an old fork
+/// build's file that the open then refuses (here, fork migration 1's column
+/// is gone) keeps its old history, with no fork history table.
+#[test]
+fn a_refused_open_keeps_an_old_fork_files_history() {
+    let (persister, _tmp, path) = fresh_persister();
+    drop(persister);
+    as_an_old_fork_build_recorded_it(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("ALTER TABLE contacts DROP COLUMN external_account_reference")
+        .unwrap();
+
+    let err = SqlitePersister::open(SqlitePersisterConfig::new(&path))
+        .err()
+        .expect("a missing fork column is refused");
+    assert!(format!("{err:?}").contains("is missing"), "{err:?}");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let old_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 19",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_rows, 1);
+    let fork_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            [FORK_HISTORY_TABLE],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(fork_tables, 0);
+}
+
 /// A file a newer build wrote, with fork migrations this build does not
 /// have, is refused at open, typed, and left as it was.
 #[test]

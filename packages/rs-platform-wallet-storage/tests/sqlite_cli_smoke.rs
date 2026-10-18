@@ -12,6 +12,13 @@ fn cli() -> Command {
     Command::cargo_bin("platform-wallet-storage").expect("bin built")
 }
 
+fn migrate(db: &std::path::Path) -> std::process::Output {
+    cli()
+        .args(["--db", db.to_str().unwrap(), "migrate"])
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn missing_db_is_usage_error_for_database_commands() {
     for args in [
@@ -162,13 +169,7 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
     use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
     let tmp = common::secure_tempdir().unwrap();
     let db = tmp.path().join("w.db");
-    let migrate = || {
-        cli()
-            .args(["--db", db.to_str().unwrap(), "migrate"])
-            .output()
-            .unwrap()
-    };
-    assert!(migrate().status.success());
+    assert!(migrate(&db).status.success());
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
@@ -180,7 +181,7 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
         )
         .unwrap();
     }
-    let out = migrate();
+    let out = migrate(&db);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "applied: 0");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -192,6 +193,104 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
         )
         .unwrap();
     assert_eq!(fork, 1);
+}
+
+/// Sol's DP3-04b r2 schedules, run through the binary. A backup whose fork
+/// history refinery cannot read is refused (exit 3) without touching the live
+/// file, even with `--no-auto-backup`.
+#[test]
+fn restore_of_a_malformed_fork_history_leaves_the_live_file() {
+    use platform_wallet_storage::sqlite::migrations::FORK_HISTORY_TABLE;
+    let tmp = common::secure_tempdir().unwrap();
+    let live = tmp.path().join("live.db");
+    let bad = tmp.path().join("bad-backup.db");
+    let db_arg = live.to_str().unwrap();
+    assert!(cli()
+        .args(["--db", db_arg, "migrate"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    std::fs::copy(&live, &bad).unwrap();
+    rusqlite::Connection::open(&bad)
+        .unwrap()
+        .execute(
+            &format!("UPDATE {FORK_HISTORY_TABLE} SET checksum = 'not_a_u64' WHERE version = 1"),
+            [],
+        )
+        .unwrap();
+    let before = std::fs::read(&live).unwrap();
+    let restore = cli()
+        .args([
+            "--db",
+            db_arg,
+            "restore",
+            "--from",
+            bad.to_str().unwrap(),
+            "--yes",
+            "--no-auto-backup",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(restore.status.code(), Some(3), "{restore:?}");
+    assert_eq!(std::fs::read(&live).unwrap(), before);
+    let migrate = cli().args(["--db", db_arg, "migrate"]).output().unwrap();
+    assert!(migrate.status.success(), "{migrate:?}");
+}
+
+/// A file whose two histories both record fork migration 1, the fork's row
+/// under another name, is refused (exit 1; the open's history check stops it
+/// before the reconcile, which refuses it too) and keeps the old upstream row.
+#[test]
+fn migrate_refuses_a_conflicting_fork_row_unchanged() {
+    use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
+    let tmp = common::secure_tempdir().unwrap();
+    let db = tmp.path().join("duplicate.db");
+    assert!(migrate(&db).status.success());
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            &format!("UPDATE {FORK_HISTORY_TABLE} SET name = 'wrong_name' WHERE version = 1"),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
+             VALUES (19, 'dashpay_external_rotation', '2026-10-01T00:00:00Z', ?1)",
+            [OLD_FORK_V019_CHECKSUM.to_string()],
+        )
+        .unwrap();
+    }
+    let out = migrate(&db);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("schema history is malformed"), "{stderr}");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let old_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM refinery_schema_history WHERE version = 19",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_rows, 1);
+}
+
+/// A fork table replaced under its name with an unusable shape is refused.
+#[test]
+fn migrate_refuses_a_reshaped_fork_table() {
+    let tmp = common::secure_tempdir().unwrap();
+    let db = tmp.path().join("shape.db");
+    assert!(migrate(&db).status.success());
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE core_address_pool_retired;
+             CREATE TABLE core_address_pool_retired (wallet_id BLOB);",
+        )
+        .unwrap();
+    let out = migrate(&db);
+    assert!(!out.status.success(), "{out:?}");
 }
 
 /// restore without --yes refuses (exit 2).

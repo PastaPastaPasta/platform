@@ -39,14 +39,40 @@ pub const OLD_FORK_V019_CHECKSUM: u64 = 15375114024144232753;
 
 const OLD_FORK_V019_FOREIGN: &str = "version 19 names the fork migration with an unknown checksum";
 
-/// What each fork migration leaves, checked after every migration run: an
-/// upstream migration that rebuilds or alters a table could drop a fork
-/// column while the fork history still says it is applied. `(fork version,
-/// table, column)`; no column means the table itself.
-const FORK_SCHEMA: &[(i32, &str, Option<&str>)] = &[
-    (1, "core_address_pool_retired", None),
-    (1, "contacts", Some("external_account_reference")),
+/// What each fork migration leaves, checked after every migration run and
+/// before a file is opened or restored: an upstream migration that rebuilds
+/// or alters a table could drop or reshape a fork object while the fork
+/// history still says it is applied. The version is the last fork migration
+/// that shapes the object; the object must match what the embedded
+/// migrations build ([`fork_schema_mismatch`]). Open and restore compare a
+/// file before its pending migrations run to that fully migrated reference:
+/// equivalent while no upstream migration touches a fork object, and when
+/// one does, the BL-193 reconcile of that pin bump must bring the file to
+/// the reference first.
+const FORK_SCHEMA: &[(i32, ForkObject)] = &[
+    (1, ForkObject::Table("core_address_pool_retired")),
+    (
+        1,
+        ForkObject::Column("contacts", "external_account_reference"),
+    ),
 ];
+
+/// A schema object a fork migration creates.
+enum ForkObject {
+    /// A table the fork owns, with its indexes and constraints.
+    Table(&'static str),
+    /// A column the fork adds to an upstream table.
+    Column(&'static str, &'static str),
+}
+
+impl std::fmt::Display for ForkObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table(table) => write!(f, "table {table}"),
+            Self::Column(table, column) => write!(f, "column {table}.{column}"),
+        }
+    }
+}
 
 /// Apply every pending migration to `conn`: upstream's, then the fork's.
 pub fn run(conn: &mut rusqlite::Connection) -> Result<refinery::Report, refinery::Error> {
@@ -54,20 +80,19 @@ pub fn run(conn: &mut rusqlite::Connection) -> Result<refinery::Report, refinery
 }
 
 /// Move a database that recorded the fork migration as upstream version 19
-/// into the fork's own history, in one transaction: the row leaves
-/// `refinery_schema_history` and fork version 1 is recorded as applied when it
-/// was. Its schema objects are already there, so nothing re-runs. Runs after
-/// the schema guards (which skip exactly this row) and before refinery, which
-/// would otherwise read version 19 as upstream's. A crash before the commit
-/// leaves the old history for the next open. One-way: a build before the fork
-/// history table cannot open the file afterwards (its V019 fails, rolled back).
-pub(crate) fn reconcile_old_fork_history(
-    conn: &mut rusqlite::Connection,
-) -> Result<(), WalletStorageError> {
-    if !has_schema_history(conn)? {
+/// into the fork's own history: the row leaves `refinery_schema_history` and
+/// fork version 1 is recorded as applied when it was. Its schema objects are
+/// already there, so nothing re-runs. Runs inside the open's migration
+/// transaction ([`run_for_open`]), after the schema guards (which skip exactly
+/// this row) and before refinery, which would otherwise read version 19 as
+/// upstream's: a refusal here or any failure later in the open leaves the
+/// file as it was. Every check comes before the first write. One-way: a build
+/// before the fork history table cannot open the file afterwards (its V019
+/// fails, rolled back).
+fn reconcile_old_fork_history(tx: &rusqlite::Connection) -> Result<(), WalletStorageError> {
+    if !has_schema_history(tx)? {
         return Ok(());
     }
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let row: Option<(String, String, String)> = tx
         .query_row(
             "SELECT name, applied_on, checksum FROM refinery_schema_history WHERE version = 19",
@@ -87,30 +112,33 @@ pub(crate) fn reconcile_old_fork_history(
         });
     }
     let v1 = fork_migration(1);
-    // Mirrors refinery's own history DDL.
-    tx.execute_batch(&format!(
-        "CREATE TABLE IF NOT EXISTS {FORK_HISTORY_TABLE}(
-             version int4 PRIMARY KEY,
-             name VARCHAR(255),
-             applied_on VARCHAR(255),
-             checksum VARCHAR(255));"
-    ))?;
-    let recorded: Option<String> = tx
-        .query_row(
-            &format!("SELECT checksum FROM {FORK_HISTORY_TABLE} WHERE version = ?1"),
+    let recorded: Option<(String, String)> = if has_table(tx, FORK_HISTORY_TABLE)? {
+        tx.query_row(
+            &format!("SELECT name, checksum FROM {FORK_HISTORY_TABLE} WHERE version = ?1"),
             [v1.version()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?;
+        .optional()?
+    } else {
+        None
+    };
     match recorded {
         // Both histories record it (a hand-merged file): keep the fork's row.
-        Some(recorded) if recorded == v1.checksum().to_string() => {}
+        Some((name, checksum)) if name == v1.name() && checksum == v1.checksum().to_string() => {}
         Some(_) => {
             return Err(WalletStorageError::SchemaHistoryMalformed {
-                reason: "fork version 1 is recorded with an unknown checksum",
+                reason: "fork version 1 is recorded as another migration",
             });
         }
         None => {
+            // Mirrors refinery's own history DDL.
+            tx.execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS {FORK_HISTORY_TABLE}(
+                     version int4 PRIMARY KEY,
+                     name VARCHAR(255),
+                     applied_on VARCHAR(255),
+                     checksum VARCHAR(255));"
+            ))?;
             tx.execute(
                 &format!(
                     "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum)
@@ -126,7 +154,6 @@ pub(crate) fn reconcile_old_fork_history(
         }
     }
     tx.execute("DELETE FROM refinery_schema_history WHERE version = 19", [])?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -144,16 +171,31 @@ fn fork_migration(version: i32) -> refinery::Migration {
 /// runner (if any) runs after upstream's in the same transaction, against
 /// [`FORK_HISTORY_TABLE`]: an open applies both or neither. With the fork
 /// runner, the run fails, rolled back, when an applied fork migration's
-/// schema is gone ([`FORK_SCHEMA`]): an upstream migration took it, and the
-/// pin bump that brought it needs a reconcile (BL-193).
+/// schema is gone or reshaped ([`FORK_SCHEMA`]): an upstream migration took
+/// it, and the pin bump that brought it needs a reconcile (BL-193).
 fn run_with_runners(
     conn: &mut rusqlite::Connection,
     runner: refinery::Runner,
     fork: Option<refinery::Runner>,
 ) -> Result<refinery::Report, refinery::Error> {
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .migration_err("begin wallet schema migration", None)?;
+    migrate(begin_migration(conn)?, runner, fork, true)
+}
+
+fn begin_migration(
+    conn: &mut rusqlite::Connection,
+) -> Result<rusqlite::Transaction<'_>, refinery::Error> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .migration_err("begin wallet schema migration", None)
+}
+
+/// Run `runner` and then `fork` in `tx` and commit. `check_fork_schema` is
+/// off only for the reference database [`fork_schema_mismatch`] compares to.
+fn migrate(
+    tx: rusqlite::Transaction<'_>,
+    runner: refinery::Runner,
+    fork: Option<refinery::Runner>,
+    check_fork_schema: bool,
+) -> Result<refinery::Report, refinery::Error> {
     let embedded = migrations::runner();
     let hook_sql = |version| {
         embedded
@@ -179,11 +221,13 @@ fn run_with_runners(
         let mut all = report.applied_migrations().clone();
         all.extend(applied.applied_migrations().iter().cloned());
         report = refinery::Report::new(all);
-        if let Some(missing) = missing_fork_schema(&driver.tx)
-            .migration_err("check the fork migrations' schema", None)?
-        {
-            return Err(std::io::Error::other(missing))
-                .migration_err("an upstream migration removed fork schema", None);
+        if check_fork_schema {
+            if let Some(mismatch) = fork_schema_mismatch(&driver.tx)
+                .migration_err("check the fork migrations' schema", None)?
+            {
+                return Err(std::io::Error::other(mismatch))
+                    .migration_err("an upstream migration changed fork schema", None);
+            }
         }
     }
     driver
@@ -257,11 +301,21 @@ impl refinery_core::traits::sync::Migrate for MigrationTransaction<'_> {}
 /// Apply migrations on behalf of [`crate::sqlite::persister::SqlitePersister::open`].
 ///
 /// A typed-error chokepoint: a single entry point for any future
-/// migration that needs to re-classify a refinery error.
+/// migration that needs to re-classify a refinery error. The old fork
+/// history is reconciled in the same transaction
+/// ([`reconcile_old_fork_history`]), so a refused open commits nothing.
 pub(crate) fn run_for_open(
     conn: &mut rusqlite::Connection,
 ) -> Result<refinery::Report, WalletStorageError> {
-    run(conn).map_err(WalletStorageError::Migration)
+    let tx = begin_migration(conn).map_err(WalletStorageError::Migration)?;
+    reconcile_old_fork_history(&tx)?;
+    migrate(
+        tx,
+        migrations::runner(),
+        Some(fork::migrations::runner()),
+        true,
+    )
+    .map_err(WalletStorageError::Migration)
 }
 
 /// Return a fresh atomic migration runner seeded with the embedded list.
@@ -350,43 +404,95 @@ pub(crate) fn db_has_objects(conn: &rusqlite::Connection) -> Result<bool, Wallet
 }
 
 /// The first [`FORK_SCHEMA`] object an applied fork migration should have
-/// left and `conn` lacks, named `table` or `table.column`.
-fn missing_fork_schema(conn: &rusqlite::Connection) -> Result<Option<String>, rusqlite::Error> {
-    let applied: i64 = conn.query_row(
-        &format!("SELECT COALESCE(MAX(version), 0) FROM {FORK_HISTORY_TABLE}"),
-        [],
-        |row| row.get(0),
-    )?;
-    for &(version, table, column) in FORK_SCHEMA {
-        if i64::from(version) > applied {
+/// left and `conn` lacks or holds in another shape than the embedded
+/// migrations build, described for the error.
+fn fork_schema_mismatch(conn: &rusqlite::Connection) -> Result<Option<String>, WalletStorageError> {
+    let applied = applied_fork_version(conn)?;
+    for ((version, object), expected) in FORK_SCHEMA.iter().zip(reference_fork_schema()) {
+        if i64::from(*version) > applied {
             continue;
         }
-        let present = match column {
-            None => conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |_| Ok(()),
-                )
-                .optional()?,
-            Some(column) => conn
-                .query_row(
-                    "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
-                    [table, column],
-                    |_| Ok(()),
-                )
-                .optional()?,
-        };
-        if present.is_none() {
-            return Ok(Some(match column {
-                None => format!("fork version {version} table {table} is missing"),
-                Some(column) => {
-                    format!("fork version {version} column {table}.{column} is missing")
-                }
-            }));
+        let found = fork_object_shape(conn, object)?;
+        if found != *expected {
+            let what = if found.is_empty() {
+                "is missing"
+            } else {
+                "has another shape"
+            };
+            return Ok(Some(format!("fork version {version} {object} {what}")));
         }
     }
     Ok(None)
+}
+
+/// The highest fork migration `conn` records: in [`FORK_HISTORY_TABLE`], or
+/// as the old fork row (fork version 1) not yet reconciled; 0 for none.
+fn applied_fork_version(conn: &rusqlite::Connection) -> Result<i64, WalletStorageError> {
+    let recorded: i64 = if has_table(conn, FORK_HISTORY_TABLE)? {
+        conn.query_row(
+            &format!("SELECT COALESCE(MAX(version), 0) FROM {FORK_HISTORY_TABLE}"),
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    let old_row = has_schema_history(conn)?
+        && conn
+            .query_row(
+                "SELECT 1 FROM refinery_schema_history
+                 WHERE version = 19 AND name = ?1 AND checksum = ?2",
+                rusqlite::params![OLD_FORK_V019_NAME, OLD_FORK_V019_CHECKSUM.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+    Ok(recorded.max(i64::from(old_row)))
+}
+
+/// Each [`FORK_SCHEMA`] object's shape in a database the embedded migrations
+/// built from empty, made once per process.
+fn reference_fork_schema() -> &'static [Vec<String>] {
+    static REFERENCE: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
+    REFERENCE.get_or_init(|| {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open an in-memory database");
+        let fork = Some(fork::migrations::runner());
+        let tx = begin_migration(&mut conn).expect("begin the reference migration");
+        migrate(tx, migrations::runner(), fork, false)
+            .expect("the embedded migrations apply to an empty database");
+        (FORK_SCHEMA.iter())
+            .map(|(_, object)| fork_object_shape(&conn, object).expect("read the reference schema"))
+            .collect()
+    })
+}
+
+/// What [`fork_schema_mismatch`] compares; empty when the object is absent.
+/// For a fork table, the statements that created it and its indexes and
+/// triggers: its columns, types, defaults, checks, key and foreign key. For a
+/// column added to an upstream table, its declared type, nullability, default
+/// and key position (an upstream rebuild of that table may write its
+/// statement differently).
+fn fork_object_shape(
+    conn: &rusqlite::Connection,
+    object: &ForkObject,
+) -> Result<Vec<String>, rusqlite::Error> {
+    match object {
+        ForkObject::Table(table) => conn
+            .prepare(
+                "SELECT type || ' ' || name || ': ' || sql FROM sqlite_master
+                 WHERE tbl_name = ?1 AND sql IS NOT NULL ORDER BY type, name",
+            )?
+            .query_map([table], |row| row.get(0))?
+            .collect(),
+        ForkObject::Column(table, column) => conn
+            .prepare(
+                "SELECT type || ' notnull=' || \"notnull\" || ' default=' ||
+                        COALESCE(dflt_value, 'NULL') || ' pk=' || pk
+                 FROM pragma_table_info(?1) WHERE name = ?2",
+            )?
+            .query_map([table, column], |row| row.get(0))?
+            .collect(),
+    }
 }
 
 /// Refuse to operate on a DB whose schema histories are newer than this
@@ -431,20 +537,28 @@ fn assert_upstream_schema_version_supported(
             reason: OLD_FORK_V019_FOREIGN,
         });
     }
-    let found: Option<i64> = conn.query_row(
-        "SELECT MAX(version) FROM refinery_schema_history
-         WHERE NOT (version = 19 AND name = ?1 AND checksum = ?2)",
-        rusqlite::params![OLD_FORK_V019_NAME, checksum],
-        |row| row.get(0),
-    )?;
     let max_supported = max_supported_version();
-    match found {
+    match applied_upstream_version(conn)? {
         Some(found) if found > max_supported => Err(WalletStorageError::SchemaVersionUnsupported {
             found,
             max_supported,
         }),
         _ => Ok(()),
     }
+}
+
+/// The highest upstream migration `conn` records, not counting the old fork
+/// row ([`reconcile_old_fork_history`]); `None` when it records none.
+/// `refinery_schema_history` must exist.
+pub(crate) fn applied_upstream_version(
+    conn: &rusqlite::Connection,
+) -> Result<Option<i64>, WalletStorageError> {
+    Ok(conn.query_row(
+        "SELECT MAX(version) FROM refinery_schema_history
+         WHERE NOT (version = 19 AND name = ?1 AND checksum = ?2)",
+        rusqlite::params![OLD_FORK_V019_NAME, OLD_FORK_V019_CHECKSUM.to_string()],
+        |row| row.get(0),
+    )?)
 }
 
 /// The upstream guard for the fork's history: refuse a database whose
@@ -534,13 +648,23 @@ fn refinery_timestamp_is_valid(value: &str) -> bool {
 /// refinery, which parses `applied_on` (RFC3339) and `checksum` (`u64`)
 /// with `unwrap()` — a malformed value would abort the process. Surfaces
 /// a typed [`WalletStorageError::SchemaHistoryMalformed`] instead.
-/// Quietly succeeds when the table is absent.
+/// Quietly succeeds when the table is absent. Then the same for the fork's
+/// history and schema ([`assert_fork_history_well_formed`]): open and restore
+/// refuse, typed, a malformed or foreign fork history and a missing or
+/// reshaped fork schema, which the open's migration run would refuse.
 pub(crate) fn assert_schema_history_well_formed(
     conn: &rusqlite::Connection,
 ) -> Result<(), WalletStorageError> {
     if !has_schema_history(conn)? {
         return Ok(());
     }
+    assert_upstream_history_well_formed(conn)?;
+    assert_fork_history_well_formed(conn)
+}
+
+fn assert_upstream_history_well_formed(
+    conn: &rusqlite::Connection,
+) -> Result<(), WalletStorageError> {
     let mut stmt = conn.prepare("SELECT applied_on, checksum FROM refinery_schema_history")?;
     let rows = stmt.query_map([], |row| {
         let applied_on: String = row.get(0)?;
@@ -567,6 +691,67 @@ pub(crate) fn assert_schema_history_well_formed(
             return Err(WalletStorageError::SchemaHistoryMalformed {
                 reason: "checksum is not a valid u64",
             });
+        }
+    }
+    Ok(())
+}
+
+/// [`FORK_HISTORY_TABLE`], when present, must be what refinery reads and
+/// accepts: refinery's four columns (exactly, stricter than refinery); on
+/// every row an integer version naming an embedded fork migration, with that
+/// migration's name and checksum and a valid `applied_on`. A row above
+/// [`max_fork_version`] is refused here too; callers run
+/// [`assert_schema_version_supported`] first for its typed error. Then, with
+/// or without the table, the schema the applied fork migrations left
+/// ([`fork_schema_mismatch`]), the old fork row counting as fork version 1.
+fn assert_fork_history_well_formed(conn: &rusqlite::Connection) -> Result<(), WalletStorageError> {
+    if has_table(conn, FORK_HISTORY_TABLE)? {
+        assert_fork_history_rows_well_formed(conn)?;
+    }
+    if fork_schema_mismatch(conn)?.is_some() {
+        return Err(WalletStorageError::SchemaHistoryMalformed {
+            reason: "an applied fork migration's schema is missing or has another shape",
+        });
+    }
+    Ok(())
+}
+
+fn assert_fork_history_rows_well_formed(
+    conn: &rusqlite::Connection,
+) -> Result<(), WalletStorageError> {
+    let malformed = |reason| Err(WalletStorageError::SchemaHistoryMalformed { reason });
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
+        .query_map([FORK_HISTORY_TABLE], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if columns != ["version", "name", "applied_on", "checksum"] {
+        return malformed("the fork history does not have refinery's columns");
+    }
+    let embedded = fork::migrations::runner();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT version, name, applied_on, checksum FROM {FORK_HISTORY_TABLE}"
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let (Ok(version), Ok(name), Ok(applied_on), Ok(checksum)) = (
+            row.get_ref(0)?.as_i64(),
+            row.get_ref(1)?.as_str(),
+            row.get_ref(2)?.as_str(),
+            row.get_ref(3)?.as_str(),
+        ) else {
+            return malformed("a fork history value has the wrong type");
+        };
+        if !refinery_timestamp_is_valid(applied_on) {
+            return malformed("a fork history applied_on is not a valid RFC3339 timestamp");
+        }
+        let Ok(checksum) = checksum.parse::<u64>() else {
+            return malformed("a fork history checksum is not a valid u64");
+        };
+        let matches = (embedded.get_migrations().iter()).any(|m| {
+            i64::from(m.version()) == version && m.name() == name && m.checksum() == checksum
+        });
+        if !matches {
+            return malformed("the fork history records a migration this build does not embed");
         }
     }
     Ok(())
@@ -860,6 +1045,14 @@ mod tests {
         applied_on
     }
 
+    /// The reconcile on its own, committed: what an open does before its
+    /// migration runners, in the same transaction.
+    fn reconcile(conn: &mut Connection) -> Result<(), WalletStorageError> {
+        let tx = conn.transaction()?;
+        reconcile_old_fork_history(&tx)?;
+        Ok(tx.commit()?)
+    }
+
     fn embedded_upstream() -> Vec<i64> {
         (1..=max_supported_version()).collect()
     }
@@ -908,7 +1101,7 @@ mod tests {
         assert_schema_version_supported(&conn).unwrap();
         assert_fork_schema_version_supported(&conn).unwrap();
 
-        reconcile_old_fork_history(&mut conn).unwrap();
+        reconcile(&mut conn).unwrap();
         assert_eq!(upstream_versions(&conn), embedded_upstream());
         let fork = fork_history(&conn);
         assert_eq!(fork.len(), 1);
@@ -916,7 +1109,7 @@ mod tests {
         assert_eq!(fork[0].2, applied_on, "applied when it was");
         assert_eq!(fork[0].3, fork_migration(1).checksum().to_string());
         assert!(has_fork_schema(&conn));
-        reconcile_old_fork_history(&mut conn).unwrap();
+        reconcile(&mut conn).unwrap();
         assert_eq!(
             fork_history(&conn),
             fork,
@@ -1024,7 +1217,7 @@ mod tests {
         as_old_fork_build_left_it(&conn, &other);
         let before = upstream_history(&conn);
         assert!(matches!(
-            reconcile_old_fork_history(&mut conn),
+            reconcile(&mut conn),
             Err(WalletStorageError::SchemaHistoryMalformed { .. })
         ));
         assert_eq!(upstream_history(&conn), before);
@@ -1051,7 +1244,7 @@ mod tests {
             [OLD_FORK_V019_CHECKSUM.to_string()],
         )
         .unwrap();
-        reconcile_old_fork_history(&mut conn).unwrap();
+        reconcile(&mut conn).unwrap();
         assert_eq!(upstream_versions(&conn), embedded_upstream());
         assert_eq!(fork_history(&conn), fork);
 
@@ -1067,7 +1260,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            reconcile_old_fork_history(&mut conn),
+            reconcile(&mut conn),
             Err(WalletStorageError::SchemaHistoryMalformed { .. })
         ));
         assert!(upstream_versions(&conn).contains(&19));
@@ -1086,11 +1279,11 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'crash'); END;",
         )
         .unwrap();
-        assert!(reconcile_old_fork_history(&mut conn).is_err());
+        assert!(reconcile(&mut conn).is_err());
         assert!(upstream_versions(&conn).contains(&19));
         assert!(!table_exists(&conn, FORK_HISTORY_TABLE));
         conn.execute_batch("DROP TRIGGER boom").unwrap();
-        reconcile_old_fork_history(&mut conn).unwrap();
+        reconcile(&mut conn).unwrap();
         assert_eq!(fork_history(&conn).len(), 1);
 
         // Upstream at V018 without fork V1, and an object in fork V1's way.
@@ -1130,27 +1323,157 @@ mod tests {
         assert_eq!(fork_history(&conn).len(), 1);
     }
 
-    /// Test 10: an upstream migration that drops or rebuilds away a fork
-    /// migration's schema, while the fork history still records it, fails
-    /// the run, rolled back, rather than leaving a file the fork code cannot
-    /// use. The same BL-193 rule applies.
+    /// SQL that removes or reshapes a fork migration's schema, with what the
+    /// error says.
+    const FORK_SCHEMA_CHANGES: &[(&str, &str)] = &[
+        (
+            "ALTER TABLE contacts DROP COLUMN external_account_reference;",
+            "is missing",
+        ),
+        ("DROP TABLE core_address_pool_retired;", "is missing"),
+        (
+            "DROP TABLE core_address_pool_retired;
+             CREATE TABLE core_address_pool_retired (wallet_id BLOB);",
+            "has another shape",
+        ),
+        (
+            "DROP INDEX idx_core_address_pool_retired_script;",
+            "has another shape",
+        ),
+        (
+            "ALTER TABLE contacts DROP COLUMN external_account_reference;
+             ALTER TABLE contacts ADD COLUMN external_account_reference TEXT;",
+            "has another shape",
+        ),
+    ];
+
+    /// Test 10: an upstream migration that drops, or rebuilds into another
+    /// shape, a fork migration's schema while the fork history still records
+    /// it, fails the run, rolled back, rather than leaving a file the fork
+    /// code cannot use. The same BL-193 rule applies.
     #[test]
     fn an_upstream_migration_removing_fork_schema_fails_loudly() {
-        for sql in [
-            "ALTER TABLE contacts DROP COLUMN external_account_reference;",
-            "DROP TABLE core_address_pool_retired;",
-        ] {
+        for (sql, what) in FORK_SCHEMA_CHANGES {
             let mut conn = Connection::open_in_memory().unwrap();
             run(&mut conn).unwrap();
             let err = MigrationRunner::with_upstream(&[("V019__rebuild", sql)])
                 .run(&mut conn)
                 .unwrap_err();
             assert!(
-                format!("{err:?}").contains("is missing"),
+                format!("{err:?}").contains(what),
                 "{sql}: a clear error: {err:?}"
             );
             assert_eq!(upstream_versions(&conn), embedded_upstream(), "{sql}");
-            assert!(has_fork_schema(&conn), "{sql}");
+            assert_eq!(fork_schema_mismatch(&conn).unwrap(), None, "{sql}");
         }
+    }
+
+    /// The same change made by hand to a file is refused by the open's run
+    /// and, before it, by the history check open and restore make.
+    #[test]
+    fn a_file_with_fork_schema_changed_is_refused() {
+        for (sql, what) in FORK_SCHEMA_CHANGES {
+            let mut conn = Connection::open_in_memory().unwrap();
+            run(&mut conn).unwrap();
+            conn.execute_batch(sql).unwrap();
+            assert!(matches!(
+                assert_schema_history_well_formed(&conn),
+                Err(WalletStorageError::SchemaHistoryMalformed { .. })
+            ));
+            let err = run_for_open(&mut conn).unwrap_err();
+            assert!(format!("{err:?}").contains(what), "{sql}: {err:?}");
+        }
+    }
+
+    /// A file an old fork build left (no fork history table yet) is checked
+    /// as fork version 1 too: with fork V1's column gone it is refused before
+    /// the open, as the open's run would refuse it after the reconcile.
+    #[test]
+    fn an_old_fork_file_with_fork_schema_changed_is_refused() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        as_old_fork_build_left_it(&conn, &OLD_FORK_V019_CHECKSUM.to_string());
+        assert_schema_history_well_formed(&conn).unwrap();
+        conn.execute_batch("ALTER TABLE contacts DROP COLUMN external_account_reference")
+            .unwrap();
+        assert!(matches!(
+            assert_schema_history_well_formed(&conn),
+            Err(WalletStorageError::SchemaHistoryMalformed { .. })
+        ));
+        assert!(run_for_open(&mut conn).is_err());
+        assert!(upstream_versions(&conn).contains(&19));
+    }
+
+    /// The reference the shape check compares to is what a migrated file
+    /// holds: the fork table with its key and index, and the added column.
+    #[test]
+    fn the_fork_schema_reference_is_a_migrated_file() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        let shape = reference_fork_schema();
+        assert_eq!(fork_schema_mismatch(&conn).unwrap(), None);
+        let table = shape[0].join("\n");
+        assert!(table.contains("account_xpub BLOB NOT NULL"), "{table}");
+        assert!(table.contains("index idx_core_address_pool_retired_script"));
+        assert_eq!(shape[1], ["INTEGER notnull=0 default=NULL pk=0"]);
+    }
+
+    /// The fork history is checked as refinery would read it: a row it cannot
+    /// parse, a migration it would call divergent or missing, or a history
+    /// table without its columns is refused, typed, before the run.
+    #[test]
+    fn a_malformed_fork_history_is_refused() {
+        for sql in [
+            "UPDATE dw_fork_schema_history SET checksum = 'not_a_u64'",
+            "UPDATE dw_fork_schema_history SET checksum = '1'",
+            "UPDATE dw_fork_schema_history SET checksum = NULL",
+            "UPDATE dw_fork_schema_history SET applied_on = 'yesterday'",
+            "UPDATE dw_fork_schema_history SET name = 'wrong_name'",
+            "UPDATE dw_fork_schema_history SET version = 'one'",
+            "UPDATE dw_fork_schema_history SET version = 0",
+            "DROP TABLE dw_fork_schema_history;
+             CREATE TABLE dw_fork_schema_history (version int4 PRIMARY KEY, name VARCHAR(255));",
+        ] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            run(&mut conn).unwrap();
+            assert_schema_history_well_formed(&conn).unwrap();
+            conn.execute_batch(sql).unwrap();
+            assert!(
+                matches!(
+                    assert_schema_history_well_formed(&conn),
+                    Err(WalletStorageError::SchemaHistoryMalformed { .. })
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Both histories record fork migration 1 but the fork's row names
+    /// another migration: the reconcile refuses before any write, and the
+    /// open that runs it commits nothing.
+    #[test]
+    fn a_fork_v1_row_under_another_name_is_refused_before_any_write() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run(&mut conn).unwrap();
+        conn.execute(
+            &format!("UPDATE {FORK_HISTORY_TABLE} SET name = 'wrong_name' WHERE version = 1"),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
+             VALUES (19, 'dashpay_external_rotation', '2026-10-01T00:00:00Z', ?1)",
+            [OLD_FORK_V019_CHECKSUM.to_string()],
+        )
+        .unwrap();
+        let upstream = upstream_history(&conn);
+        let fork = fork_history(&conn);
+        assert!(matches!(
+            reconcile(&mut conn),
+            Err(WalletStorageError::SchemaHistoryMalformed { .. })
+        ));
+        assert!(run_for_open(&mut conn).is_err());
+        assert_eq!(upstream_history(&conn), upstream);
+        assert_eq!(fork_history(&conn), fork);
     }
 }

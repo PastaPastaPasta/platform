@@ -269,6 +269,11 @@ impl SqlitePersister {
     /// - [`WalletStorageError::SchemaVersionUnsupported`] — the DB
     ///   carries a `refinery_schema_history` row beyond what this
     ///   binary can apply. Symmetric with `restore_from`'s gate.
+    /// - [`WalletStorageError::ForkSchemaVersionUnsupported`] — the same
+    ///   for the fork's `dw_fork_schema_history`.
+    /// - [`WalletStorageError::SchemaHistoryMalformed`] — a schema history
+    ///   refinery could not read or would refuse, or an applied fork
+    ///   migration's schema missing or reshaped.
     /// - [`WalletStorageError::IntegrityCheckFailed`] —
     ///   `PRAGMA integrity_check` on the pre-existing DB returned a
     ///   non-`ok` report. Raised BEFORE migrations alter the file so
@@ -364,7 +369,6 @@ impl SqlitePersister {
             crate::sqlite::migrations::assert_schema_version_supported(&conn)?;
             crate::sqlite::conn::assert_wallet_application_id_or_legacy(&conn)?;
             crate::sqlite::migrations::assert_schema_history_well_formed(&conn)?;
-            crate::sqlite::migrations::reconcile_old_fork_history(&mut conn)?;
         } else if crate::sqlite::migrations::db_has_objects(&conn)? {
             // A pre-existing file with schema objects but NO refinery history is
             // a foreign (non-wallet) SQLite DB. Migrating it in place would graft
@@ -2372,15 +2376,9 @@ fn count_pending(
 }
 
 fn current_schema_version(conn: &Connection) -> Result<Option<i32>, WalletStorageError> {
-    let row = conn
-        .query_row(
-            "SELECT MAX(version) FROM refinery_schema_history",
-            [],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(row.map(|v| v as i32))
+    // An old fork build's row is fork version 1, not upstream's.
+    let version = crate::sqlite::migrations::applied_upstream_version(conn)?;
+    Ok(version.map(|v| v as i32))
 }
 
 #[cfg(test)]

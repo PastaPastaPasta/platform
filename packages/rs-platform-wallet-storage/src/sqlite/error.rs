@@ -465,8 +465,10 @@ pub enum WalletStorageError {
     /// `refinery_schema_history` carries a malformed row (non-RFC3339
     /// `applied_on` or non-numeric `checksum`). Probed BEFORE refinery
     /// runs so a foreign or corrupted-but-integrity-valid input returns
-    /// a typed error instead of refinery panicking on the parse.
-    #[error("refinery_schema_history is malformed: {reason}")]
+    /// a typed error instead of refinery panicking on the parse. Also a
+    /// malformed or foreign `dw_fork_schema_history`, or an applied fork
+    /// migration's schema missing or reshaped (`reason` says which).
+    #[error("schema history is malformed: {reason}")]
     SchemaHistoryMalformed { reason: &'static str },
 
     /// A restore source / opened DB carries a `refinery_schema_history`
