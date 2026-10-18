@@ -12,6 +12,21 @@ fn cli() -> Command {
     Command::cargo_bin("platform-wallet-storage").expect("bin built")
 }
 
+fn restore_without_backup(db: &std::path::Path, from: &std::path::Path) -> std::process::Output {
+    cli()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "restore",
+            "--from",
+            from.to_str().unwrap(),
+            "--yes",
+            "--no-auto-backup",
+        ])
+        .output()
+        .unwrap()
+}
+
 fn migrate(db: &std::path::Path) -> std::process::Output {
     cli()
         .args(["--db", db.to_str().unwrap(), "migrate"])
@@ -204,13 +219,7 @@ fn restore_of_a_malformed_fork_history_leaves_the_live_file() {
     let tmp = common::secure_tempdir().unwrap();
     let live = tmp.path().join("live.db");
     let bad = tmp.path().join("bad-backup.db");
-    let db_arg = live.to_str().unwrap();
-    assert!(cli()
-        .args(["--db", db_arg, "migrate"])
-        .output()
-        .unwrap()
-        .status
-        .success());
+    assert!(migrate(&live).status.success());
     std::fs::copy(&live, &bad).unwrap();
     rusqlite::Connection::open(&bad)
         .unwrap()
@@ -220,22 +229,50 @@ fn restore_of_a_malformed_fork_history_leaves_the_live_file() {
         )
         .unwrap();
     let before = std::fs::read(&live).unwrap();
-    let restore = cli()
-        .args([
-            "--db",
-            db_arg,
-            "restore",
-            "--from",
-            bad.to_str().unwrap(),
-            "--yes",
-            "--no-auto-backup",
-        ])
-        .output()
-        .unwrap();
+    let restore = restore_without_backup(&live, &bad);
     assert_eq!(restore.status.code(), Some(3), "{restore:?}");
     assert_eq!(std::fs::read(&live).unwrap(), before);
-    let migrate = cli().args(["--db", db_arg, "migrate"]).output().unwrap();
-    assert!(migrate.status.success(), "{migrate:?}");
+    let reopened = migrate(&live);
+    assert!(reopened.status.success(), "{reopened:?}");
+}
+
+/// Sol's DP3-04b r3 schedules: a backup whose history passes the restore's
+/// checks but that the open refuses (fork V1's row gone while its schema
+/// stays; upstream V1 recorded with another checksum) is refused (exit 3)
+/// because a copy of it must open first. The live file stays byte for byte
+/// and still opens.
+#[test]
+fn restore_refuses_a_backup_the_open_would_refuse() {
+    use platform_wallet_storage::sqlite::migrations::FORK_HISTORY_TABLE;
+    for sql in [
+        format!("DELETE FROM {FORK_HISTORY_TABLE} WHERE version = 1"),
+        "UPDATE refinery_schema_history SET checksum = '0' WHERE version = 1".to_string(),
+    ] {
+        let tmp = common::secure_tempdir().unwrap();
+        let live = tmp.path().join("live.db");
+        let backup = tmp.path().join("backup.db");
+        assert!(migrate(&live).status.success());
+        std::fs::copy(&live, &backup).unwrap();
+        rusqlite::Connection::open(&backup)
+            .unwrap()
+            .execute_batch(&sql)
+            .unwrap();
+        let before = std::fs::read(&live).unwrap();
+        let restore = restore_without_backup(&live, &backup);
+        assert_eq!(restore.status.code(), Some(3), "{sql}: {restore:?}");
+        assert_eq!(std::fs::read(&live).unwrap(), before, "{sql}");
+        let reopened = migrate(&live);
+        assert!(reopened.status.success(), "{sql}: {reopened:?}");
+        // Nothing of the restore's own stays (the read-only source
+        // connection may leave the WAL source's own sidecars).
+        let mut files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("backup.db-"))
+            .collect();
+        files.sort();
+        assert_eq!(files, ["backup.db", "live.db"], "{sql}");
+    }
 }
 
 /// A file whose two histories both record fork migration 1, the fork's row

@@ -330,9 +330,10 @@ respectively on stderr; `-q` suppresses non-error output.
 Exit codes: `0` success, `1` runtime error, `2` usage error, `3` validation
 failure (e.g. corrupt backup source).
 
-**Restore exclusion.** `restore` opens a short-lived writer connection on
-the destination DB in exclusive locking mode and holds a `BEGIN EXCLUSIVE`
-transaction through validation and staging. This interlocks with every other
+**Restore exclusion.** Once the source is staged and proven (below),
+`restore` opens a short-lived writer connection on the destination DB in
+exclusive locking mode and holds a `BEGIN EXCLUSIVE` transaction up to the
+rename. This interlocks with every other
 SQLite peer — sibling `SqlitePersister` handles, bare `rusqlite::Connection`
 instances, the CLI — so concurrent reads and writes back off via SQLite's
 `busy_timeout` instead of racing the staged work. If a peer holds the
@@ -340,6 +341,14 @@ destination busy for longer than the timeout, `restore` returns
 `WalletStorageError::RestoreDestinationLocked`. The lock conn is released
 BEFORE the rename so SQLite's file handle on the old inode goes away before
 the new DB takes its place.
+
+**Restore acceptance.** `restore` stages the source with SQLite's online
+backup (a WAL source's committed frames included) and replaces the destination
+only after a disposable copy of the staged bytes opens through
+`SqlitePersister::open`, every pending migration included. A source that fails
+there is a validation failure (exit `3`), and the destination is untouched.
+The proof needs up to three times the database's size free beside the
+destination while it runs.
 
 Restore validation establishes structure, not provenance: a valid backup is
 trusted as much as the live database. Protect backup directories from

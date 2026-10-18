@@ -305,7 +305,7 @@ impl SqlitePersister {
         })
     }
 
-    fn open_inner(config: SqlitePersisterConfig) -> Result<Self, WalletStorageError> {
+    pub(crate) fn open_inner(config: SqlitePersisterConfig) -> Result<Self, WalletStorageError> {
         validate_config(&config)?;
         let parent = config
             .path
@@ -540,8 +540,11 @@ impl SqlitePersister {
     /// # Source trust
     ///
     /// Restore verifies SQLite integrity, wallet application identity, and
-    /// schema compatibility, but not backup provenance — and not content
-    /// invariants: a source holding two identities in one wallet's derivation
+    /// schema compatibility, and that a copy of the staged source opens
+    /// (every pending migration included) before it replaces anything. The
+    /// source is staged with SQLite's online backup, so a WAL source's
+    /// committed frames come with it. It does not verify backup provenance
+    /// or content invariants: a source holding two identities in one wallet's derivation
     /// slot is restored as-is and surfaces as a failed `load()` afterwards,
     /// because `store`'s write-path check never sees these bytes. Restore
     /// trusts a valid source file as much as the live database; protect the

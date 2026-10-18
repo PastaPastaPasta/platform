@@ -327,7 +327,12 @@ fn run_restore(
             | WalletStorageError::SchemaVersionUnsupported { .. }
             | WalletStorageError::ForkSchemaVersionUnsupported { .. }
             | WalletStorageError::SchemaHistoryMalformed { .. }
-            | WalletStorageError::SourceOpenFailed { .. }),
+            | WalletStorageError::SourceOpenFailed { .. }
+            // Restore runs no migration on the destination: this is a copy
+            // of the source that would not open. Its refinery error may also
+            // wrap an environment failure on the copy (a full disk); the
+            // message says which.
+            | WalletStorageError::Migration(_)),
         ) => Err(CliError::validation(chain_message(&err))),
         Err(WalletStorageError::AutoBackupDisabled { .. }) => Err(CliError::runtime(
             "auto-backup directory not configured; pass --no-auto-backup to proceed",

@@ -223,10 +223,13 @@ pub(crate) fn run_to(src: &Connection, dest: &Path) -> Result<(), WalletStorageE
 ///
 /// # Atomicity
 ///
-/// Validation runs against the source and again against the STAGED bytes,
-/// under SQLite `locking_mode=EXCLUSIVE` plus `BEGIN EXCLUSIVE` on
-/// `dest_db_path`, blocking every other SQLite peer (which advisory flock
-/// could not). The
+/// The source is staged with SQLite's online backup (its committed state,
+/// `-wal` frames included). Validation runs against the source and again
+/// against the STAGED bytes, and a copy of the staged bytes must open through
+/// the real open path (migrations included) before anything is replaced.
+/// The destination is then held under SQLite `locking_mode=EXCLUSIVE` plus
+/// `BEGIN EXCLUSIVE` up to the rename, blocking every other SQLite peer
+/// (which advisory flock could not). The
 /// store-generation token is rotated INTO the staged temp before the swap,
 /// so the single commit point brings in the restored bytes and the fresh
 /// token together — a peer never observes restored content carrying the
@@ -279,7 +282,8 @@ pub(crate) fn restore_from(
     // 1. Cheap early-out: sniff integrity + schema-history + version +
     //    wallet-identity against the source so an incompatible input fails
     //    before we stream the whole file. The authoritative, TOCTOU-safe
-    //    gate re-runs on the STAGED bytes (step 4).
+    //    gates re-run on the STAGED bytes (step 3) and open a copy of them
+    //    (step 5). The connection stays open: staging reads through it.
     let src = crate::sqlite::conn::open_conn(src_backup, crate::sqlite::conn::Access::ReadOnly)
         .map_err(map_source_open_err)?;
     run_integrity_check(&src, |report| WalletStorageError::IntegrityCheckFailed {
@@ -291,16 +295,87 @@ pub(crate) fn restore_from(
     crate::sqlite::migrations::assert_schema_version_supported(&src)?;
     crate::sqlite::conn::assert_wallet_application_id_or_legacy(&src)?;
     crate::sqlite::migrations::assert_schema_history_well_formed(&src)?;
-    drop(src);
 
-    // 2. SQLite-native exclusion: exclusive locking mode makes readers back
-    //    off even when the destination uses WAL, where BEGIN EXCLUSIVE alone
-    //    excludes writers but normally permits readers. For a missing
-    //    destination, create an owner-only placeholder first so a peer cannot
-    //    create and write the path during staging. A failure before lock
-    //    release removes a placeholder created by this call while exclusion
-    //    is still held. The short-lived connection is dropped before
-    //    `persist` (see lock-release trade-off).
+    // 2. Stage the source into a NamedTempFile in the destination's parent
+    //    dir (unguessable name, no symlink-plant TOCTOU) with SQLite's online
+    //    backup from the validated source connection, all pages in one step:
+    //    one read transaction, so a consistent snapshot of the source's
+    //    committed state, `-wal` frames included, that a busy writer cannot
+    //    restart. A raw copy of the main file would drop the frames a WAL
+    //    source has not checkpointed. The staged file leaves WAL mode, so its
+    //    bytes are the whole database and the rename (step 9) carries no
+    //    `-wal` frames. Steps 2–5 touch only the source and the staged temp,
+    //    so they run before the destination is locked (step 6), and the
+    //    source is closed first: restoring a file over itself takes its
+    //    lock like any other.
+    let tmp = tempfile::NamedTempFile::new_in(parent)?;
+    {
+        let mut staged =
+            crate::sqlite::conn::open_conn(tmp.path(), crate::sqlite::conn::Access::ReadWrite)?;
+        // rusqlite refuses SQLite's -1 (all pages); i32::MAX pages is one step.
+        Backup::new(&src, &mut staged)?.run_to_completion(i32::MAX, Duration::ZERO, None)?;
+        let mode: String = staged.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(WalletStorageError::JournalModeNotApplied {
+                requested: "delete",
+                actual: mode,
+            });
+        }
+    }
+    drop(src);
+    tmp.as_file().sync_all()?;
+
+    // 3. Re-validate the STAGED bytes: bound to the staged bytes (not the
+    //    source handle), so a swap during the restore window can't slip a
+    //    forward-version or foreign DB through.
+    {
+        let staged =
+            crate::sqlite::conn::open_conn(tmp.path(), crate::sqlite::conn::Access::ReadOnly)
+                .map_err(map_source_open_err)?;
+        run_integrity_check(&staged, |report| WalletStorageError::IntegrityCheckFailed {
+            report,
+        })?;
+        if !crate::sqlite::migrations::has_schema_history(&staged)? {
+            return Err(WalletStorageError::SchemaHistoryMissing);
+        }
+        crate::sqlite::migrations::assert_schema_version_supported(&staged)?;
+        crate::sqlite::conn::assert_wallet_application_id_or_legacy(&staged)?;
+        crate::sqlite::migrations::assert_schema_history_well_formed(&staged)?;
+    }
+
+    // 4. Regenerate the store-generation token INTO the staged temp, before
+    //    the atomic rename, so the single commit point (step 9) swaps in the
+    //    restored bytes and the rotated token together — there is no window
+    //    where restored content is observable with the source's stale token.
+    //    The staged DB is in DELETE journaling (step 2), so the UPDATE lands
+    //    in the main file; the reopened destination is forced back to its
+    //    configured journal mode on its next open. A pre-V009 backup has no
+    //    generation table; `regenerate_generation` is a no-op there and the
+    //    token is (re)seeded on its later migration to V009.
+    {
+        let conn =
+            crate::sqlite::conn::open_conn(tmp.path(), crate::sqlite::conn::Access::ReadWrite)?;
+        crate::sqlite::schema::versions::regenerate_generation(&conn)?;
+        drop(conn);
+        // Durably flush the regenerated token before the rename commits it.
+        tmp.as_file().sync_all()?;
+    }
+
+    // 5. Restore accepts what open accepts (DEC-258): open a disposable copy
+    //    of the exact bytes the rename will commit through the real open
+    //    path, which runs every pending upstream and fork migration, the old
+    //    fork row's reconcile and the fork schema check. The checks above
+    //    refuse the common cases early; this is the gate.
+    prove_opens(tmp.path(), parent)?;
+
+    // 6. Lock the destination. SQLite-native exclusion: exclusive locking
+    //    mode makes readers back off even when the destination uses WAL,
+    //    where BEGIN EXCLUSIVE alone excludes writers but normally permits
+    //    readers. For a missing destination, create an owner-only placeholder
+    //    first so a peer cannot create and write the path before the rename.
+    //    A failure before lock release removes a placeholder created by this
+    //    call while exclusion is still held. The short-lived connection is
+    //    dropped before `persist` (see lock-release trade-off).
     let mut dest_lock_conn: Option<rusqlite::Connection>;
     let mut created_destination = None;
     if !dest_db_path.exists() {
@@ -346,55 +421,7 @@ pub(crate) fn restore_from(
         guard.arm();
     }
 
-    // 3. Stage the source into a NamedTempFile in the destination's parent
-    //    dir (unguessable name, no symlink-plant TOCTOU).
-    let parent = dest_db_path.parent().unwrap_or(Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    let mut src_file = std::fs::File::open(src_backup)?;
-    std::io::copy(&mut src_file, tmp.as_file_mut())?;
-    tmp.as_file().sync_all()?;
-
-    // 4. Re-validate the STAGED bytes before persisting: a torn
-    //    `io::copy` that escaped `sync_all` would otherwise persist a
-    //    corrupt DB, and the recheck failing just drops the temp. Bound to
-    //    the staged bytes (not the source handle) so a swap during the
-    //    restore window can't slip a forward-version or foreign DB through.
-    {
-        let staged =
-            crate::sqlite::conn::open_conn(tmp.path(), crate::sqlite::conn::Access::ReadOnly)
-                .map_err(map_source_open_err)?;
-        run_integrity_check(&staged, |report| WalletStorageError::IntegrityCheckFailed {
-            report,
-        })?;
-        if !crate::sqlite::migrations::has_schema_history(&staged)? {
-            return Err(WalletStorageError::SchemaHistoryMissing);
-        }
-        crate::sqlite::migrations::assert_schema_version_supported(&staged)?;
-        crate::sqlite::conn::assert_wallet_application_id_or_legacy(&staged)?;
-        crate::sqlite::migrations::assert_schema_history_well_formed(&staged)?;
-    }
-
-    // 5. Regenerate the store-generation token INTO the staged temp, before
-    //    the atomic rename, so the single commit point (step 8) swaps in the
-    //    restored bytes and the rotated token together — there is no window
-    //    where restored content is observable with the source's stale token.
-    //    The staged DB is switched to DELETE journaling first so the UPDATE
-    //    lands in the main file with no `-wal` frames stranded outside the
-    //    rename; the reopened destination is forced back to its configured
-    //    journal mode on its next open. A pre-V009 backup has no generation
-    //    table; `regenerate_generation` is a no-op there and the token is
-    //    (re)seeded on its later migration to V009.
-    {
-        let conn =
-            crate::sqlite::conn::open_conn(tmp.path(), crate::sqlite::conn::Access::ReadWrite)?;
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
-        crate::sqlite::schema::versions::regenerate_generation(&conn)?;
-        drop(conn);
-        // Durably flush the regenerated token before the rename commits it.
-        tmp.as_file().sync_all()?;
-    }
-
-    // 6. chmod 0o600 on the temp BEFORE persist so the destination
+    // 7. chmod 0o600 on the temp BEFORE persist so the destination
     //    inherits owner-only mode via the rename (post-persist chmod could
     //    fail with the new DB already live).
     #[cfg(unix)]
@@ -404,7 +431,7 @@ pub(crate) fn restore_from(
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
 
-    // 7. Release the EXCLUSIVE lock before the rename/unlinks: on Windows /
+    // 8. Release the EXCLUSIVE lock before the rename/unlinks: on Windows /
     //    some FUSE mounts `remove_file` on a still-open file returns
     //    `PermissionDenied`, and the rename window wants a clean close (see
     //    lock-release trade-off above). Stop failure cleanup from removing a
@@ -418,20 +445,20 @@ pub(crate) fn restore_from(
         drop(conn);
     }
 
-    // 8. Persist the staged DB atomically over the destination. The atomic
+    // 9. Persist the staged DB atomically over the destination. The atomic
     //    rename is the single commit point: it swaps in both the restored
     //    bytes and the rotated generation token together. If it fails (disk
     //    full, EXDEV, perms) the live DB and its WAL/SHM siblings are left
     //    untouched, so a failed restore can never strand the old DB without
-    //    its WAL-committed state. Sibling cleanup (step 9) runs only once the
+    //    its WAL-committed state. Sibling cleanup (step 10) runs only once the
     //    swap has succeeded.
     tmp.persist(dest_db_path)
         .map_err(|e| WalletStorageError::Io(e.error))?;
 
-    // 9. Clear the now-stale WAL/SHM siblings AFTER the swap so a leftover
+    // 10. Clear the now-stale WAL/SHM siblings AFTER the swap so a leftover
     //    `-wal` can't shadow the restored DB on the next open. Sibling paths
     //    use `OsString::push` so non-UTF-8 bytes round-trip; `NotFound` is a
-    //    silent no-op. The lock conn was dropped in step 7 for cross-platform
+    //    silent no-op. The lock conn was dropped in step 8 for cross-platform
     //    unlink semantics.
     //    INTENTIONAL(wal-shm-cleanup-race): this unlink shares the
     //    lock-release-before-rename trade-off documented on this function. A
@@ -452,11 +479,34 @@ pub(crate) fn restore_from(
         }
     }
 
-    // 10. Make the rename + unlink dentry updates durable.
+    // 11. Make the rename + unlink dentry updates durable.
     fsync_parent_dir(dest_db_path)?;
 
-    // 11. Re-tighten perms (idempotent; SQLite may re-materialise -wal/-shm).
+    // 12. Re-tighten perms (idempotent; SQLite may re-materialise -wal/-shm).
     apply_secure_permissions(dest_db_path)?;
+    Ok(())
+}
+
+/// Open a copy of the staged database at `staged` through the open path of
+/// [`crate::SqlitePersister::open`], in an owner-only temporary directory
+/// under `parent` that is removed afterwards, and return its refusal. The
+/// copy's pre-migration backup goes into the same directory, so a restore
+/// briefly needs up to three times the database's size free in `parent`.
+fn prove_opens(staged: &Path, parent: &Path) -> Result<(), WalletStorageError> {
+    let dir = tempfile::Builder::new()
+        .prefix(".restore-proof-")
+        .tempdir_in(parent)?;
+    let copy = dir.path().join("wallet.db");
+    std::fs::copy(staged, &copy)?;
+    let mut config = crate::SqlitePersisterConfig::new(&copy)
+        .with_auto_backup_dir(Some(dir.path().join("backups")));
+    // The journal mode changes nothing the open accepts, and DELETE works on
+    // every filesystem and leaves no sidecars.
+    config.journal_mode = crate::sqlite::config::JournalMode::Delete;
+    // Not `open`, which logs its refusals as errors: here a refusal is the
+    // restore's answer, returned to its caller.
+    crate::SqlitePersister::open_inner(config)?;
+    dir.close()?;
     Ok(())
 }
 

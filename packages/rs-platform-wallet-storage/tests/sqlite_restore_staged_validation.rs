@@ -11,12 +11,12 @@ mod common;
 
 use std::fs;
 
-use common::{ensure_wallet_meta, fresh_persister, wid};
+use common::{ensure_wallet_meta, fresh_persister, ro_conn, wid};
 use platform_wallet::changeset::{
     CoreChangeSet, PlatformWalletChangeSet, PlatformWalletPersistence,
 };
 use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
-use platform_wallet_storage::{SqlitePersister, WalletStorageError};
+use platform_wallet_storage::{SqlitePersister, SqlitePersisterConfig, WalletStorageError};
 
 fn seed_one_row(persister: &SqlitePersister, w: &[u8; 32]) {
     ensure_wallet_meta(persister, w);
@@ -148,6 +148,116 @@ fn malformed_fork_history_rejected_healthy_destination_unchanged() {
         SqlitePersister::open(platform_wallet_storage::SqlitePersisterConfig::new(&dest))
             .expect("the destination still opens");
     }
+}
+
+/// A live WAL source whose committed state is still in its `-wal` (not
+/// checkpointed into the main file) restores with that state: staging reads
+/// it through SQLite, not as a copy of the main file.
+#[test]
+fn a_wal_sources_uncheckpointed_commits_are_restored() {
+    let w = wid(0xF5);
+    let birth_height = |path: &std::path::Path| -> Option<i64> {
+        ro_conn(path)
+            .query_row(
+                "SELECT birth_height FROM wallets WHERE wallet_id = ?1",
+                [w.as_slice()],
+                |r| r.get(0),
+            )
+            .ok()
+    };
+    let (source, tmp, source_path) = fresh_persister();
+    seed_one_row(&source, &w);
+    drop(source);
+    let (dest, _dest_tmp, dest_path) = fresh_persister();
+    seed_one_row(&dest, &w);
+    drop(dest);
+    rusqlite::Connection::open(&dest_path)
+        .unwrap()
+        .execute("UPDATE wallets SET birth_height = 222", [])
+        .unwrap();
+
+    // A writer that keeps its commit in the WAL while the restore runs.
+    let writer = rusqlite::Connection::open(&source_path).unwrap();
+    let mode: String = writer
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .unwrap();
+    writer
+        .execute("UPDATE wallets SET birth_height = 111", [])
+        .unwrap();
+    let main_file_only = tmp.path().join("main-file-only.db");
+    fs::copy(&source_path, &main_file_only).unwrap();
+    assert_ne!(
+        birth_height(&main_file_only),
+        Some(111),
+        "the commit is only in the WAL"
+    );
+
+    SqlitePersister::restore_from_skip_backup(&dest_path, &source_path).unwrap();
+    drop(writer);
+    assert_eq!(birth_height(&dest_path), Some(111));
+    assert_no_restore_leftovers(dest_path.parent().unwrap());
+    SqlitePersister::open(SqlitePersisterConfig::new(&dest_path)).expect("the restored file opens");
+}
+
+/// Neither the staged temp, its sidecars nor the proof's copy stay behind.
+fn assert_no_restore_leftovers(dir: &std::path::Path) {
+    let leftovers: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".restore-proof-") || name.starts_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// Restore accepts what open accepts (DEC-258): a backup whose history
+/// passes the restore's checks but whose migrations the open refuses (fork
+/// V1's row gone while its schema stays; upstream V1 recorded with another
+/// checksum) is refused with the open's own error, and a healthy destination
+/// stays byte for byte and still opens.
+#[test]
+fn a_backup_the_open_would_refuse_is_refused() {
+    for sql in [
+        format!("DELETE FROM {FORK_HISTORY_TABLE} WHERE version = 1"),
+        "UPDATE refinery_schema_history SET checksum = '0' WHERE version = 1".to_string(),
+    ] {
+        let (persister, tmp, dest) = fresh_persister();
+        seed_one_row(&persister, &wid(0xF6));
+        let backup_path = persister.backup_to(tmp.path()).unwrap();
+        drop(persister);
+        rusqlite::Connection::open(&backup_path)
+            .unwrap()
+            .execute_batch(&sql)
+            .unwrap();
+
+        let before = fs::read(&dest).unwrap();
+        let err = SqlitePersister::restore_from_skip_backup(&dest, &backup_path);
+        assert!(
+            matches!(err, Err(WalletStorageError::Migration(_))),
+            "{sql}: {err:?}"
+        );
+        assert_eq!(fs::read(&dest).unwrap(), before, "{sql}");
+        assert_no_restore_leftovers(tmp.path());
+        SqlitePersister::open(SqlitePersisterConfig::new(&dest)).expect("the destination opens");
+    }
+}
+
+/// A WAL database restored over itself: the source is closed before the
+/// destination's lock, so the restore takes it rather than waiting on its
+/// own read.
+#[test]
+fn a_database_restores_over_itself() {
+    let (persister, _tmp, path) = fresh_persister();
+    seed_one_row(&persister, &wid(0xF7));
+    drop(persister);
+    SqlitePersister::restore_from_skip_backup(&path, &path).unwrap();
+    let rows: i64 = ro_conn(&path)
+        .query_row("SELECT COUNT(*) FROM wallets", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
 }
 
 /// A source lacking `refinery_schema_history` but otherwise

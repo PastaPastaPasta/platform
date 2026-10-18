@@ -892,6 +892,14 @@ upstream migration removed or reshaped it. When upstream adopts a fork
 migration's schema, the pin bump that takes it adds a reconcile from the fork
 version to upstream's.
 
+Restore stages the source with SQLite's online backup and replaces the
+destination only once a copy of the staged bytes opens through the real open
+path, every pending upstream and fork migration included (DEC-258), so it
+accepts the bytes the open accepts. The proof opens with the default
+configuration; a caller whose open has no auto-backup directory still needs one
+for an older backup's pending migrations. The checks below refuse the common
+cases early.
+
 Open and restore (on the source and on the staged copy) refuse, with
 `SchemaHistoryMalformed`, a malformed or foreign fork history and a missing or
 reshaped fork schema: columns other than refinery's four (stricter than
