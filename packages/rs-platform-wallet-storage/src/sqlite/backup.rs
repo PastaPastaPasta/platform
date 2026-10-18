@@ -172,6 +172,17 @@ pub(crate) fn sanitize_db_stem(db_path: &Path) -> String {
 pub(crate) fn run_to(src: &Connection, dest: &Path) -> Result<(), WalletStorageError> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
+            // Owner-only from creation, whatever the umask: `mode` applies to
+            // every directory `recursive` creates.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+            }
+            #[cfg(not(unix))]
             std::fs::create_dir_all(parent)?;
         }
     }
@@ -307,7 +318,7 @@ pub(crate) fn restore_from(
     //    `-wal` frames. Steps 2–5 touch only the source and the staged temp,
     //    so they run before the destination is locked (step 6), and the
     //    source is closed first: restoring a file over itself takes its
-    //    lock like any other.
+    //    lock like any other. tempfile creates the file 0o600.
     let tmp = tempfile::NamedTempFile::new_in(parent)?;
     {
         let mut staged =
@@ -487,16 +498,38 @@ pub(crate) fn restore_from(
     Ok(())
 }
 
+/// Test-only rendezvous fired with the proof's directory while the copy in it
+/// is open, so a test can inspect the directory at that point.
+#[cfg(any(test, feature = "__test-helpers"))]
+pub type ProofSeam = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+#[cfg(any(test, feature = "__test-helpers"))]
+static PROOF_SEAM: std::sync::Mutex<Option<ProofSeam>> = std::sync::Mutex::new(None);
+
+/// Install (or with `None`, remove) the process-wide rendezvous that every
+/// restore fires while its proof is open. Every restore in the process fires
+/// it, so install it only from a test binary that runs one test.
+#[cfg(any(test, feature = "__test-helpers"))]
+pub fn set_restore_proof_seam(seam: Option<ProofSeam>) {
+    *PROOF_SEAM.lock().unwrap_or_else(|e| e.into_inner()) = seam;
+}
+
 /// Open a copy of the staged database at `staged` through the open path of
 /// [`crate::SqlitePersister::open`], in an owner-only temporary directory
 /// under `parent` that is removed afterwards, and return its refusal. The
 /// copy's pre-migration backup goes into the same directory, so a restore
 /// briefly needs up to three times the database's size free in `parent`.
 fn prove_opens(staged: &Path, parent: &Path) -> Result<(), WalletStorageError> {
-    let dir = tempfile::Builder::new()
-        .prefix(".restore-proof-")
-        .tempdir_in(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".restore-proof-");
+    // Owner-only from creation; tempfile's default is 0o777 less the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder.tempdir_in(parent)?;
     let copy = dir.path().join("wallet.db");
+    // Takes the staged file's 0o600.
     std::fs::copy(staged, &copy)?;
     let mut config = crate::SqlitePersisterConfig::new(&copy)
         .with_auto_backup_dir(Some(dir.path().join("backups")));
@@ -505,7 +538,16 @@ fn prove_opens(staged: &Path, parent: &Path) -> Result<(), WalletStorageError> {
     config.journal_mode = crate::sqlite::config::JournalMode::Delete;
     // Not `open`, which logs its refusals as errors: here a refusal is the
     // restore's answer, returned to its caller.
-    crate::SqlitePersister::open_inner(config)?;
+    let proof = crate::SqlitePersister::open_inner(config)?;
+    #[cfg(any(test, feature = "__test-helpers"))]
+    {
+        // Cloned out first: the seam runs without the lock held.
+        let seam = PROOF_SEAM.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(seam) = seam {
+            seam(dir.path());
+        }
+    }
+    drop(proof);
     dir.close()?;
     Ok(())
 }
