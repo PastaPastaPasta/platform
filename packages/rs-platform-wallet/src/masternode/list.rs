@@ -16,7 +16,9 @@
 use std::net::{IpAddr, SocketAddr};
 
 use dashcore::sml::masternode_list::MasternodeList;
-use dashcore::sml::masternode_list_entry::{EntryMasternodeType, MasternodeListEntry};
+use dashcore::sml::masternode_list_entry::{
+    EntryMasternodeType, MasternodeListEntry, MasternodeNetInfo,
+};
 
 /// What the deterministic masternode list knows about one masternode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,16 @@ pub struct MasternodeListSummary {
     /// Snapshots persisted before this field existed default to `false`;
     /// that guard reads only live list summaries.
     pub has_extended_net_info: bool,
+    /// Every network-info entry the list holds, as dashcore decodes it: a
+    /// legacy entry's one address, or a v3 entry's whole `ExtNetInfo` —
+    /// every purpose (Core P2P, Platform P2P, Platform HTTPS) and every
+    /// entry, Tor / I2P / CJDNS / domain ones included, in wire order.
+    /// Core holds each entry as a unique property of the list
+    /// (`bad-protx-dup-netinfo-entry`), so a host checking a new
+    /// registration against the list needs all of them, not only
+    /// `service_address`. `None` only on snapshots persisted by
+    /// [`super::tracked`], which doesn't store it.
+    pub net_info: Option<MasternodeNetInfo>,
 }
 
 impl MasternodeListSummary {
@@ -85,10 +97,8 @@ impl MasternodeListSummary {
             platform_node_id,
             is_valid: entry.is_valid,
             is_evonode,
-            has_extended_net_info: matches!(
-                entry.service_address,
-                dashcore::sml::masternode_list_entry::MasternodeNetInfo::Extended(_)
-            ),
+            has_extended_net_info: matches!(entry.service_address, MasternodeNetInfo::Extended(_)),
+            net_info: Some(entry.service_address.clone()),
         }
     }
 
@@ -158,19 +168,17 @@ pub fn find_in_summaries<'a>(
 pub(crate) mod test_support {
     //! Synthetic list summaries for locator tests. Kept `pub(crate)` so the
     //! locator tests build lists the same way.
-    use super::MasternodeListSummary;
+    use super::{MasternodeListSummary, MasternodeNetInfo};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
     /// A regular masternode at `10.0.0.<seed>:9999` whose proTxHash,
     /// operator key and voting key id are all derived from `seed` so every
     /// entry is distinct and recognizable.
     pub(crate) fn masternode(seed: u8) -> MasternodeListSummary {
+        let service = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, seed), 9999));
         MasternodeListSummary {
             pro_tx_hash: [seed; 32],
-            service_address: Some(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(10, 0, 0, seed),
-                9999,
-            ))),
+            service_address: Some(service),
             platform_http_port: None,
             operator_public_key: [seed; 48],
             voting_key_id: [seed; 20],
@@ -178,6 +186,7 @@ pub(crate) mod test_support {
             is_valid: true,
             is_evonode: false,
             has_extended_net_info: false,
+            net_info: Some(MasternodeNetInfo::Legacy(service)),
         }
     }
 
@@ -203,7 +212,9 @@ mod tests {
     use super::*;
     use dashcore::bls_sig_utils::BLSPublicKey;
     use dashcore::hashes::Hash;
-    use dashcore::sml::masternode_list_entry::MasternodeNetInfo;
+    use dashcore::sml::masternode_list_entry::net_info::{
+        Bip155Network, ExtNetInfo, NetInfoEntry, NetInfoPurpose,
+    };
     use dashcore::{BlockHash, PlatformNodeId, ProTxHash, PubkeyHash};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -250,9 +261,67 @@ mod tests {
         assert_eq!(s.platform_node_id, Some([3u8; 20]));
         assert!(!s.is_valid, "PoSe-banned entry stays invalid");
         assert!(s.is_evonode);
+        assert!(!s.has_extended_net_info);
+        assert_eq!(
+            s.net_info,
+            Some(MasternodeNetInfo::Legacy("1.2.3.4:19999".parse().unwrap()))
+        );
         let mut display = [7u8; 32];
         display.reverse();
         assert_eq!(s.pro_tx_hash_display(), display);
+    }
+
+    /// A v3 entry keeps every entry of every purpose, in wire order, while
+    /// `service_address` stays the first IP Core P2P entry.
+    #[test]
+    fn summary_carries_every_net_info_entry() {
+        let service = |network, addr: &[u8], port| NetInfoEntry::Service {
+            network,
+            addr: addr.to_vec(),
+            port,
+        };
+        let net_info = ExtNetInfo {
+            version: 1,
+            purposes: vec![
+                (
+                    NetInfoPurpose::CoreP2P,
+                    vec![
+                        service(Bip155Network::TorV3, &[0x11; 32], 9999),
+                        service(Bip155Network::Ipv4, &[1, 2, 3, 4], 9999),
+                        service(Bip155Network::Ipv4, &[5, 6, 7, 8], 9999),
+                    ],
+                ),
+                (
+                    NetInfoPurpose::PlatformP2P,
+                    vec![service(Bip155Network::Ipv4, &[1, 2, 3, 4], 26656)],
+                ),
+                (
+                    NetInfoPurpose::PlatformHttps,
+                    vec![NetInfoEntry::Domain {
+                        host: "evo.example.org".into(),
+                        port: 443,
+                    }],
+                ),
+            ],
+        };
+        let pro_tx = ProTxHash::from_byte_array([8u8; 32]);
+        let entry = MasternodeListEntry {
+            version: 3,
+            pro_reg_tx_hash: pro_tx,
+            confirmed_hash: None,
+            service_address: MasternodeNetInfo::Extended(net_info.clone()),
+            operator_public_key: BLSPublicKey::from([9u8; 48]),
+            key_id_voting: PubkeyHash::from_byte_array([5u8; 20]),
+            is_valid: true,
+            mn_type: EntryMasternodeType::HighPerformance {
+                platform_http_port: 443,
+                platform_node_id: PlatformNodeId::from_byte_array([3u8; 20]),
+            },
+        };
+        let s = MasternodeListSummary::from_entry(&entry);
+        assert!(s.has_extended_net_info);
+        assert_eq!(s.service_address, Some("1.2.3.4:9999".parse().unwrap()));
+        assert_eq!(s.net_info, Some(MasternodeNetInfo::Extended(net_info)));
     }
 
     #[test]

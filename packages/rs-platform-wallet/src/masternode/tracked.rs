@@ -332,6 +332,8 @@ fn list_from_json(value: &Value) -> Option<MasternodeListSummary> {
         // Absent on snapshots persisted before the field existed; the
         // next refresh rewrites it from the live entry.
         has_extended_net_info: value["hasExtendedNetInfo"].as_bool().unwrap_or(false),
+        // Not persisted: only live list summaries carry the entries.
+        net_info: None,
     })
 }
 
@@ -1124,7 +1126,11 @@ mod tests {
 
     fn snapshot_full() -> TrackedMasternodeSnapshot {
         TrackedMasternodeSnapshot {
-            list: Some(evonode(7)),
+            // As persisted: the net-info entries aren't stored.
+            list: Some(MasternodeListSummary {
+                net_info: None,
+                ..evonode(7)
+            }),
             ever_listed: true,
             registration: Some(RegistrationDetails {
                 height: 1000,
@@ -1154,7 +1160,10 @@ mod tests {
             TrackedMasternodeSnapshot::default(),
             snapshot_full(),
             TrackedMasternodeSnapshot {
-                list: Some(masternode(3)),
+                list: Some(MasternodeListSummary {
+                    net_info: None,
+                    ..masternode(3)
+                }),
                 ever_listed: true,
                 ..Default::default()
             },
@@ -1162,6 +1171,26 @@ mod tests {
             let encoded = snapshot_to_json(&snapshot);
             assert_eq!(snapshot_from_json(&encoded), snapshot, "{encoded}");
         }
+    }
+
+    /// The list's net-info entries aren't persisted: a live summary reads
+    /// back with every other field and `net_info: None`.
+    #[test]
+    fn snapshot_json_drops_the_net_info_entries() {
+        let live = masternode(3);
+        assert!(live.net_info.is_some());
+        let snapshot = TrackedMasternodeSnapshot {
+            list: Some(live.clone()),
+            ..Default::default()
+        };
+        let read = snapshot_from_json(&snapshot_to_json(&snapshot));
+        assert_eq!(
+            read.list,
+            Some(MasternodeListSummary {
+                net_info: None,
+                ..live
+            })
+        );
     }
 
     #[test]
