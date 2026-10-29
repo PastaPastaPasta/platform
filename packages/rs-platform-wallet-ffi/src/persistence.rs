@@ -9398,8 +9398,9 @@ mod tests {
             version: 1,
             mn_type: None,
             pro_tx_hash: dashcore::Txid::from_byte_array([7u8; 32]),
-            ip_address: 42,
-            port: 19999,
+            service_address: dashcore::sml::masternode_list_entry::MasternodeNetInfo::Legacy(
+                std::net::SocketAddr::from(([0, 0, 0, 42], 19999)),
+            ),
             script_payout: ScriptBuf::new(),
             inputs_hash: [3u8; 32].into(),
             platform_node_id: None,
