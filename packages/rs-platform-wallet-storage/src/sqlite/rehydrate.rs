@@ -194,9 +194,10 @@ pub(crate) fn restore_provider_platform_node_pool(
 /// - `core`: the persisted core-state changeset to apply.
 /// - `utxo_accounts`: per-outpoint owning-account side channel from
 ///   [`load_state`](crate::sqlite::schema::core_state::load_state) — the
-///   `CoreChangeSet` cannot carry it. It no longer routes UTXOs (their
-///   owner is found by derivation, below); an entry naming an account this
-///   wallet's funds accounts lack is still reported as store drift.
+///   `CoreChangeSet` cannot carry it. A UTXO goes to the account that
+///   derives its address (below); the entry only pre-derives a deep address
+///   in its account and places a UTXO no account reaches. One naming an
+///   account this wallet's funds accounts lack is reported as store drift.
 /// - `used_pool_addresses`: addresses the persisted pool snapshot marked
 ///   used, each mapped to its owning account (`None` when the script matched
 ///   no pool row). One with an owner among this wallet's funds accounts is
@@ -436,6 +437,36 @@ pub fn apply_persisted_core_state(
             wallet_id,
             ctx,
         )?;
+        // The horizon walk past the generated window still covers a coin there
+        // that no used address of its pool anchors. Coins are placed once every
+        // walk is done, so one a walk's refill reaches goes to the account that
+        // derives it.
+        {
+            let mut funding = wallet_info.accounts.all_funding_accounts_mut();
+            let mut walk_from: Vec<Vec<key_wallet::Address>> = vec![Vec::new(); funding.len()];
+            for utxo in &unmatched {
+                let target = fallback_account(&account_keys, utxo_accounts.get(&utxo.outpoint));
+                walk_from[target].push(utxo.address.clone());
+            }
+            for (i, addrs) in walk_from.iter().enumerate() {
+                if !addrs.is_empty() {
+                    extend_pools_for_restored_addresses(
+                        funding[i], manifest, addrs, wallet_id, ctx,
+                    )?;
+                }
+            }
+        }
+        let unmatched = if unmatched.is_empty() || !gap_refills_bounded(wallet_info) {
+            unmatched
+        } else {
+            match wallet_info.restore_utxos(&wallet, unmatched.iter().cloned()) {
+                Ok(rest) => rest,
+                Err(source) => {
+                    restore_failed(ctx, wallet_id, source)?;
+                    unmatched
+                }
+            }
+        };
         if !unmatched.is_empty() {
             tracing::warn!(
                 wallet_id = %hex::encode(wallet_id),
@@ -445,26 +476,21 @@ pub fn apply_persisted_core_state(
                  were placed by their stored owner, or in the first funds account"
             );
         }
+        let placed: Vec<key_wallet::Address> =
+            unmatched.iter().map(|u| u.address.clone()).collect();
         let mut funding = wallet_info.accounts.all_funding_accounts_mut();
-        let mut fallback_addrs: Vec<Vec<key_wallet::Address>> = vec![Vec::new(); funding.len()];
         for utxo in unmatched {
             let target = fallback_account(&account_keys, utxo_accounts.get(&utxo.outpoint));
-            fallback_addrs[target].push(utxo.address.clone());
             funding[target].utxos.insert(utxo.outpoint, utxo);
         }
-        // The horizon walk past the generated window still covers a coin there
-        // that no used address of its pool anchors.
-        for (i, addrs) in fallback_addrs.iter().enumerate() {
-            if !addrs.is_empty() {
-                extend_pools_for_restored_addresses(funding[i], manifest, addrs, wallet_id, ctx)?;
-            }
-        }
+        drop(funding);
+        let accounts = &wallet_info.accounts;
         let unresolved = unattributed_used
             .iter()
-            .filter(|address| !fallback_addrs.iter().flatten().any(|a| a == *address))
+            .filter(|address| !placed.contains(address))
             .filter(|address| {
-                !funding
-                    .iter()
+                !(accounts.all_funding_accounts().into_iter())
+                    .chain(accounts.dashpay_external_accounts.values())
                     .any(|a| a.managed_account_type().contains_address(address))
             })
             .count();
@@ -528,11 +554,12 @@ fn owner_label(owner: &OwningAccount) -> String {
 /// addresses longer than one gap window still leads to the coins past it.
 /// Terminates: each round marks at least one more address of a finite set.
 ///
-/// Every gap refill is bounded first, as [`extend_pools_for_restored_addresses`]
-/// bounds its own. A pool past those bounds was already reported there, so it
-/// only stops the restore, returning every UTXO unmatched; so does a
-/// derivation error, which is reported at
-/// [`LoadSite::RehydrationMaintainGapLimit`].
+/// Every refill of the marking rounds is bounded first, as
+/// [`extend_pools_for_restored_addresses`] bounds its own. A pool past those
+/// bounds was already reported there, so it only stops the restore, returning
+/// every UTXO unmatched; so does a derivation error, which is reported at
+/// [`LoadSite::RehydrationMaintainGapLimit`]. The final placement grows each
+/// pool at most one gap past each stored coin's address.
 fn restore_owned_utxos(
     wallet_info: &mut ManagedWalletInfo,
     wallet: &Wallet,
@@ -3359,8 +3386,14 @@ mod tests {
         /// The CoinJoin external address at `index`, derived on a copy of
         /// the account's pool.
         fn coinjoin_address(wallet: &Wallet, index: u32) -> Address {
+            external_address(wallet, &cj(), index)
+        }
+
+        /// `account`'s external address at `index`, derived on a copy of its
+        /// pool.
+        fn external_address(wallet: &Wallet, account: &AccountType, index: u32) -> Address {
             let info = ManagedWalletInfo::from_wallet(wallet, 1);
-            let pool = external_pool(&info, &cj());
+            let pool = external_pool(&info, account);
             let mut probe = AddressPool::new_without_generation(
                 pool.base_path.clone(),
                 pool.pool_type,
@@ -3368,7 +3401,7 @@ mod tests {
                 Network::Testnet,
             );
             probe
-                .generate_addresses(index + 1, &wallet.key_source_for_account(cj()), true)
+                .generate_addresses(index + 1, &wallet.key_source_for_account(*account), true)
                 .unwrap();
             probe.address_at_index(index).unwrap()
         }
@@ -3442,7 +3475,7 @@ mod tests {
         }
 
         /// A CoinJoin coin past the stored window, with no pool row, lands
-        /// in CoinJoin (dashpay/platform#5724), where its key is found.
+        /// in CoinJoin, where its key is found.
         #[test]
         fn a_coinjoin_utxo_past_its_stored_window_restores_into_coinjoin() {
             let (wallet, manifest) = fixture(21);
@@ -3557,6 +3590,34 @@ mod tests {
             );
             assert_eq!(holders(&info, &foreign.outpoint), vec![bip44()]);
             assert_eq!(holders(&info, &isolated.outpoint), vec![cj()]);
+            assert_eq!(info.balance.total(), 2 * VALUE);
+        }
+
+        /// A coin past the generated window whose stale stored owner names
+        /// another account lands in the account that derives it, next to the
+        /// coin whose address leads there.
+        #[test]
+        fn a_coin_only_another_coins_walk_reaches_restores_into_that_account() {
+            let (wallet, manifest) = fixture(27);
+            let walked = utxo(1, &external_address(&wallet, &bip44(), 30));
+            let reached = utxo(2, &external_address(&wallet, &bip44(), 45));
+            let owner_of = |account: &AccountType| {
+                let info = ManagedWalletInfo::from_wallet(&wallet, 1);
+                owning_account_of(info.accounts.funds_account(account).unwrap())
+            };
+            let side = HashMap::from([
+                (walked.outpoint, owner_of(&bip44())),
+                (reached.outpoint, owner_of(&cj())),
+            ]);
+            let info = load(
+                &wallet,
+                &manifest,
+                vec![walked.clone(), reached.clone()],
+                &side,
+                &HashMap::new(),
+            );
+            assert_eq!(holders(&info, &walked.outpoint), vec![bip44()]);
+            assert_eq!(holders(&info, &reached.outpoint), vec![bip44()]);
             assert_eq!(info.balance.total(), 2 * VALUE);
         }
 
