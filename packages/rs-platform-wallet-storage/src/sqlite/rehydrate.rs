@@ -490,7 +490,6 @@ pub fn apply_persisted_core_state(
             .filter(|address| !placed.contains(address))
             .filter(|address| {
                 !(accounts.all_funding_accounts().into_iter())
-                    .chain(accounts.dashpay_external_accounts.values())
                     .any(|a| a.managed_account_type().contains_address(address))
             })
             .count();
@@ -3593,9 +3592,10 @@ mod tests {
             assert_eq!(info.balance.total(), 2 * VALUE);
         }
 
-        /// A coin past the generated window whose stale stored owner names
-        /// another account lands in the account that derives it, next to the
-        /// coin whose address leads there.
+        /// A coin whose stale stored owner names another account lands in
+        /// the account that derives it once the horizon walk from a coin with
+        /// no stored owner (BIP44 index 30, one past the generated window)
+        /// reaches it (index 45).
         #[test]
         fn a_coin_only_another_coins_walk_reaches_restores_into_that_account() {
             let (wallet, manifest) = fixture(27);
@@ -3605,10 +3605,7 @@ mod tests {
                 let info = ManagedWalletInfo::from_wallet(&wallet, 1);
                 owning_account_of(info.accounts.funds_account(account).unwrap())
             };
-            let side = HashMap::from([
-                (walked.outpoint, owner_of(&bip44())),
-                (reached.outpoint, owner_of(&cj())),
-            ]);
+            let side = HashMap::from([(reached.outpoint, owner_of(&cj()))]);
             let info = load(
                 &wallet,
                 &manifest,
