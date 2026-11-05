@@ -429,7 +429,7 @@ pub fn apply_persisted_core_state(
             wallet_id,
             ecdsa_accounts(wallet_info.network(), wallet_id, manifest)?,
         );
-        let unmatched = restore_owned_utxos(
+        let (unmatched, restorable) = restore_owned_utxos(
             wallet_info,
             &wallet,
             &unspent,
@@ -456,7 +456,10 @@ pub fn apply_persisted_core_state(
                 }
             }
         }
-        let unmatched = if unmatched.is_empty() || !gap_refills_bounded(wallet_info) {
+        // A restore that already failed would only fail, and be reported,
+        // again.
+        let unmatched = if unmatched.is_empty() || !restorable || !gap_refills_bounded(wallet_info)
+        {
             unmatched
         } else {
             match wallet_info.restore_utxos(&wallet, unmatched.iter().cloned()) {
@@ -544,14 +547,18 @@ fn owner_label(owner: &OwningAccount) -> String {
 }
 
 /// Restore `unspent` into the funds accounts whose pools derive each address,
-/// after marking `unattributed_used` wherever the pools derive them, and
-/// return the UTXOs no account reaches.
+/// after marking `unattributed_used` wherever the pools derive them. Returns
+/// the UTXOs no account reaches, and whether `restore_utxos` may run again:
+/// false once a refill was refused or a restore failed.
 ///
 /// Used addresses extend the reach as a rescan's would: each round marks the
 /// ones the pools now hold and extends every pool to its gap limit past its
 /// highest used address, until a round marks nothing new, so a run of spent
 /// addresses longer than one gap window still leads to the coins past it.
-/// Terminates: each round marks at least one more address of a finite set.
+/// The first round looks up every address the pools hold; each later round
+/// only the ones the previous refill derived, so the rounds together look up
+/// each derived address once. Terminates: each round marks at least one more
+/// address of a finite set.
 ///
 /// Every refill of the marking rounds is bounded first, as
 /// [`extend_pools_for_restored_addresses`] bounds its own. A pool past those
@@ -566,28 +573,53 @@ fn restore_owned_utxos(
     unattributed_used: &[key_wallet::Address],
     wallet_id: [u8; 32],
     ctx: &LoadCtx,
-) -> Result<Vec<key_wallet::Utxo>, WalletStorageError> {
+) -> Result<(Vec<key_wallet::Utxo>, bool), WalletStorageError> {
     let all_unmatched = || unspent.iter().map(|u| (*u).clone()).collect();
+    let wanted: std::collections::HashSet<&key_wallet::Address> =
+        unattributed_used.iter().collect();
+    // Per funds pool, in `all_funding_accounts_mut` x `address_pools_mut`
+    // order, the highest index already looked up.
+    let mut looked_up: Vec<Option<u32>> = Vec::new();
     loop {
         let mut marked_any = false;
+        let mut slot = 0;
         for funds in wallet_info.accounts.all_funding_accounts_mut() {
-            for address in unattributed_used {
-                marked_any |= funds.managed_account_type_mut().mark_address_used(address);
+            for pool in funds.managed_account_type_mut().address_pools_mut() {
+                let from = looked_up
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .map_or(0, |seen| seen.saturating_add(1));
+                let generated = pool.highest_generated;
+                if let Some(to) = generated.filter(|to| from <= *to) {
+                    let hits: Vec<u32> = (pool.addresses.range(from..=to))
+                        .filter(|(_, info)| wanted.contains(&info.address))
+                        .map(|(index, _)| *index)
+                        .collect();
+                    for index in hits {
+                        marked_any |= pool.mark_index_used(index);
+                    }
+                }
+                match looked_up.get_mut(slot) {
+                    Some(seen) => *seen = generated,
+                    None => looked_up.push(generated),
+                }
+                slot += 1;
             }
         }
         if !gap_refills_bounded(wallet_info) {
-            return Ok(all_unmatched());
+            return Ok((all_unmatched(), false));
         }
         if let Err(source) = wallet_info.restore_utxos(wallet, std::iter::empty()) {
-            return restore_failed(ctx, wallet_id, source).map(|()| all_unmatched());
+            return restore_failed(ctx, wallet_id, source).map(|()| (all_unmatched(), false));
         }
         if !marked_any {
             break;
         }
     }
     match wallet_info.restore_utxos(wallet, unspent.iter().map(|u| (*u).clone())) {
-        Ok(unmatched) => Ok(unmatched),
-        Err(source) => restore_failed(ctx, wallet_id, source).map(|()| all_unmatched()),
+        Ok(unmatched) => Ok((unmatched, true)),
+        Err(source) => restore_failed(ctx, wallet_id, source).map(|()| (all_unmatched(), false)),
     }
 }
 
@@ -3739,6 +3771,45 @@ mod tests {
                 .await;
             info.update_balance();
             assert_eq!(holders(&info, &coin.outpoint), vec![bip44()]);
+            assert_eq!(info.balance.total(), VALUE);
+        }
+
+        /// A stored coin on an address of a DashPay contact's chain (theirs,
+        /// watched) restores into that contact's account: no funds account
+        /// holds it and the balance leaves it out.
+        #[test]
+        fn a_coin_on_a_contacts_address_stays_out_of_the_funds_accounts() {
+            let (mut wallet, _) = fixture(29);
+            let contact = AccountType::DashpayExternalAccount {
+                index: 0,
+                user_identity_id: [0xaa; 32],
+                friend_identity_id: [0xbb; 32],
+            };
+            wallet.add_account(contact, None).unwrap();
+            let manifest = manifest_for(&wallet);
+            let theirs = {
+                let info = ManagedWalletInfo::from_wallet(&wallet, 1);
+                let account = info.accounts.dashpay_external_accounts.values().next();
+                let pools = account.unwrap().managed_account_type().address_pools();
+                pools[0].address_at_index(0).unwrap()
+            };
+            let ours = external_address(&wallet, &bip44(), 0);
+            let contact_coin = utxo(1, &theirs);
+            let own_coin = utxo(2, &ours);
+            let info = load(
+                &wallet,
+                &manifest,
+                vec![contact_coin.clone(), own_coin.clone()],
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            assert!(holders(&info, &contact_coin.outpoint).is_empty());
+            assert!(info
+                .accounts
+                .dashpay_external_accounts
+                .values()
+                .any(|a| a.utxos.contains_key(&contact_coin.outpoint)));
+            assert_eq!(holders(&info, &own_coin.outpoint), vec![bip44()]);
             assert_eq!(info.balance.total(), VALUE);
         }
     }
