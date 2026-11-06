@@ -3604,6 +3604,7 @@ mod tests {
     mod restore_owned {
         use super::*;
         use dashcore::blockdata::transaction::txout::TxOut;
+        use dashcore::hashes::Hash;
         use dashcore::{BlockHash, OutPoint, Transaction, TxIn, Txid};
         use key_wallet::managed_account::address_pool::AddressPool;
         use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
