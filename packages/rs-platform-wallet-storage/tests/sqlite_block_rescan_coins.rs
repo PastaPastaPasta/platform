@@ -22,7 +22,8 @@ use platform_wallet::changeset::{
 };
 use platform_wallet::key_wallet_manager::WalletEvent;
 use platform_wallet::test_support::{
-    block_paying, external_addresses, process_block_with_rescans, wallet_manager_with_persistence,
+    block_paying, external_addresses, process_block_with_rescans, transaction_paying,
+    wallet_manager_with_persistence,
 };
 use platform_wallet::wallet::platform_wallet::{PlatformWalletInfo, WalletId};
 use platform_wallet_storage::{SqlitePersister, SqlitePersisterConfig};
@@ -162,4 +163,63 @@ async fn bip44_coins_past_the_gap_in_one_transaction_survive_a_reload() {
         standard_account_type: StandardAccountType::BIP44Account,
     })
     .await;
+}
+
+fn bip44_account_0() -> AccountType {
+    AccountType::Standard {
+        index: 0,
+        standard_account_type: StandardAccountType::BIP44Account,
+    }
+}
+
+/// One block pays two funds accounts, CoinJoin past its gap and BIP44
+/// within it. The re-scan passes re-send the BIP44 coins, and a reload puts
+/// every coin of each transaction in its own account.
+#[tokio::test]
+async fn coins_of_two_accounts_at_one_height_reload_into_their_own_accounts() {
+    const BIP44_PAID: u32 = 5;
+    let (persister, _tmp, path) = fresh_persister();
+    let persister = Arc::new(persister);
+    let wallet = Wallet::new_random(
+        key_wallet::Network::Testnet,
+        WalletAccountCreationOptions::Default,
+    )
+    .expect("wallet");
+    let coinjoin = AccountType::CoinJoin { index: 0 };
+    let count = external_gap(&wallet, coinjoin) + PAST_GAP;
+    let past_gap = transaction_paying(&external_addresses(&wallet, coinjoin, count), VALUE, 1);
+    let within_gap = transaction_paying(
+        &external_addresses(&wallet, bip44_account_0(), BIP44_PAID),
+        VALUE,
+        2,
+    );
+    let manifest_wallet = wallet.clone();
+    let (manager, wallet_id, mut queued) = wallet_manager_with_persistence(wallet);
+    register(&persister, wallet_id, &manifest_wallet);
+
+    let block = dashcore::Block::dummy(HEIGHT, vec![past_gap.clone(), within_gap.clone()]);
+    process_block_with_rescans(&manager, wallet_id, &block, HEIGHT).await;
+    persist_queued(&manager, &mut queued, &persister).await;
+    persister.flush(wallet_id).expect("flush");
+    drop(persister);
+
+    let vouts_of = |account: AccountType, txid: dashcore::Txid| -> Vec<u32> {
+        let mut vouts: Vec<u32> = reloaded_coins(&path, wallet_id, account)
+            .into_iter()
+            .filter(|o| o.txid == txid)
+            .map(|o| o.vout)
+            .collect();
+        vouts.sort_unstable();
+        vouts
+    };
+    assert_eq!(
+        vouts_of(coinjoin, past_gap.txid()),
+        (0..count).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vouts_of(bip44_account_0(), within_gap.txid()),
+        (0..BIP44_PAID).collect::<Vec<_>>()
+    );
+    assert!(vouts_of(coinjoin, within_gap.txid()).is_empty());
+    assert!(vouts_of(bip44_account_0(), past_gap.txid()).is_empty());
 }

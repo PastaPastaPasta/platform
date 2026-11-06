@@ -1240,8 +1240,8 @@ async fn build_core_changeset(
                 cs.spent_utxos.extend(derive_spent_utxos(r));
             }
             // Updated records (re-confirmation, IS-lock applied to a known
-            // mempool tx, etc.) don't usually change UTXO topology — the
-            // record's content does change though, so re-emit it.
+            // mempool tx, etc.) change the record's content, so re-emit it;
+            // the coins the block credits are read from the wallet below.
             // Matured coinbase records likewise: no UTXO topology change,
             // just a status update for the persister.
             //
@@ -1301,8 +1301,8 @@ async fn build_core_changeset(
             // context, so the event names no record at all; a mempool
             // record confirming here credits outputs its pools grew to
             // reach since. A coin spent since is no longer held, so it never
-            // comes back as unspent; re-sending a stored coin is an
-            // idempotent upsert.
+            // comes back as unspent; re-sending a coin the store holds as an
+            // unspent row is an idempotent upsert.
             let (verdicts, held) = utxo_credit_state(
                 wallet_manager,
                 wallet_id,
@@ -1718,14 +1718,18 @@ async fn utxo_credit_state(
     )
 }
 
-/// The coins the wallet's funds accounts hold confirmed at `height`.
+/// The coins the wallet's funds accounts hold confirmed at `height`, once
+/// per outpoint. The funds accounts are the ones the wallet's UTXO view
+/// walks (`ManagedAccountCollection::all_funding_accounts`), so a
+/// contact's watch-only DashPay external account never contributes.
 fn held_at_height(core_wallet: &key_wallet::wallet::ManagedWalletInfo, height: u32) -> Vec<Utxo> {
-    use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
-
+    let mut seen = HashSet::new();
     core_wallet
-        .utxos()
+        .accounts
+        .all_funding_accounts()
         .into_iter()
-        .filter(|u| u.is_confirmed && u.height == height)
+        .flat_map(|account| account.utxos.values())
+        .filter(|u| u.is_confirmed && u.height == height && seen.insert(u.outpoint))
         .cloned()
         .collect()
 }
@@ -7418,7 +7422,7 @@ mod block_rescan_credit_tests {
 
     use super::*;
     use crate::test_support::{
-        block_paying, external_addresses, process_block_with_rescans,
+        block_paying, external_addresses, process_block_with_rescans, transaction_paying,
         wallet_manager_with_persistence,
     };
     use dashcore::Transaction;
@@ -7578,5 +7582,197 @@ mod block_rescan_credit_tests {
             "the spent coin is not sent as unspent"
         );
         assert!(cs.spent_utxos.iter().any(|u| u.outpoint == spent));
+    }
+
+    /// BIP44 receive addresses the second transaction of a block pays.
+    const BIP44_PAID: u32 = 5;
+
+    /// One pass of `block`, without the re-scans its derivations ask for.
+    async fn one_pass(
+        manager: &Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+        wallet_id: WalletId,
+        block: &dashcore::Block,
+        height: u32,
+    ) {
+        use key_wallet_manager::WalletInterface;
+
+        manager
+            .write()
+            .await
+            .process_block_for_wallets(
+                block,
+                block.block_hash(),
+                height,
+                &BTreeSet::from([wallet_id]),
+            )
+            .await;
+    }
+
+    /// A transaction seen in the mempool credits the outputs its pools
+    /// reach and grows them; the block that confirms it credits the rest
+    /// on a record the wallet already holds. Every output reaches the
+    /// block's changesets as a confirmed coin.
+    #[tokio::test]
+    async fn a_mempool_transaction_confirmed_after_its_pools_grew_credits_every_coin() {
+        use key_wallet_manager::WalletInterface;
+
+        let account = coinjoin_account_0();
+        let wallet = new_wallet();
+        let gap = external_gap(&wallet, account);
+        let count = gap + PAST_GAP;
+        let addresses = external_addresses(&wallet, account, count);
+        let (manager, wallet_id, mut receiver) = wallet_manager_with_persistence(wallet);
+        let block = block_paying(&addresses, VALUE, 100);
+        let txid = block.txdata[0].txid();
+
+        manager
+            .write()
+            .await
+            .process_mempool_transaction(&block.txdata[0], None)
+            .await;
+        let seen = drain(&manager, &mut receiver).await;
+        assert_eq!(
+            credited_vouts(&seen, txid),
+            (0..gap).collect::<BTreeSet<_>>(),
+            "the mempool sighting credits the outputs the pool reached"
+        );
+
+        process_block_with_rescans(&manager, wallet_id, &block, 100).await;
+        let confirmed = drain(&manager, &mut receiver).await;
+        let confirmed_vouts: BTreeSet<u32> = confirmed
+            .new_utxos
+            .iter()
+            .filter(|u| u.outpoint.txid == txid && u.is_confirmed && u.height == 100)
+            .map(|u| u.outpoint.vout)
+            .collect();
+        assert_eq!(
+            confirmed_vouts,
+            (0..count).collect::<BTreeSet<_>>(),
+            "the block's changesets carry every coin as confirmed"
+        );
+        assert!(confirmed.utxo_credit_verdicts.is_empty());
+    }
+
+    /// One block pays two funds accounts: CoinJoin past its gap, BIP44
+    /// within it. The re-scan passes re-send the BIP44 coins held at the
+    /// same height exactly as first sent, and every coin of both reaches the
+    /// changesets.
+    #[tokio::test]
+    async fn coins_of_a_second_account_at_the_same_height_are_resent_unchanged() {
+        let wallet = new_wallet();
+        let coinjoin = coinjoin_account_0();
+        let count = external_gap(&wallet, coinjoin) + PAST_GAP;
+        let coinjoin_addresses = external_addresses(&wallet, coinjoin, count);
+        let bip44_addresses = external_addresses(&wallet, bip44_account_0(), BIP44_PAID);
+        let (manager, wallet_id, mut receiver) = wallet_manager_with_persistence(wallet);
+        let past_gap = transaction_paying(&coinjoin_addresses, VALUE, 1);
+        let within_gap = transaction_paying(&bip44_addresses, VALUE, 2);
+        let block = dashcore::Block::dummy(100, vec![past_gap.clone(), within_gap.clone()]);
+
+        let passes = process_block_with_rescans(&manager, wallet_id, &block, 100).await;
+        assert!(passes > 1, "the block is re-scanned");
+        let cs = drain(&manager, &mut receiver).await;
+
+        assert_eq!(
+            credited_vouts(&cs, past_gap.txid()),
+            (0..count).collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            credited_vouts(&cs, within_gap.txid()),
+            (0..BIP44_PAID).collect::<BTreeSet<_>>()
+        );
+        let sends: Vec<&Utxo> = cs
+            .new_utxos
+            .iter()
+            .filter(|u| u.outpoint.txid == within_gap.txid())
+            .collect();
+        assert!(
+            sends.len() > BIP44_PAID as usize,
+            "the re-scan passes re-send the coins held at the block's height"
+        );
+        let first: BTreeMap<OutPoint, &Utxo> =
+            sends.iter().rev().map(|u| (u.outpoint, *u)).collect();
+        for sent in &sends {
+            let original = first[&sent.outpoint];
+            assert_eq!(
+                (&sent.txout, sent.height, sent.is_confirmed),
+                (&original.txout, original.height, original.is_confirmed),
+                "a re-sent coin matches its first send"
+            );
+        }
+        assert!(cs.utxo_credit_verdicts.is_empty());
+    }
+
+    /// A re-scan pass of block 100 runs after block 101 spent one of its
+    /// coins, and the bridge projects each block's events as they arrive.
+    /// The pass sends the coins of block 100 the wallet still holds, never
+    /// the spent one, and no coin of another block.
+    #[tokio::test]
+    async fn a_rescan_pass_after_a_later_spend_does_not_resend_the_spent_coin() {
+        let account = coinjoin_account_0();
+        let wallet = new_wallet();
+        let gap = external_gap(&wallet, account);
+        let count = gap + PAST_GAP;
+        let addresses = external_addresses(&wallet, account, count);
+        let change = external_addresses(&wallet, bip44_account_0(), 1).remove(0);
+        let (manager, wallet_id, mut receiver) = wallet_manager_with_persistence(wallet);
+        let funding = block_paying(&addresses, VALUE, 100);
+        let funding_txid = funding.txdata[0].txid();
+        let spent = OutPoint {
+            txid: funding_txid,
+            vout: 0,
+        };
+        let spend = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![dashcore::TxIn {
+                previous_output: spent,
+                script_sig: dashcore::ScriptBuf::new(),
+                sequence: u32::MAX,
+                witness: dashcore::Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: VALUE / 2,
+                    script_pubkey: dashcore::Address::dummy(key_wallet::Network::Testnet, 7)
+                        .script_pubkey(),
+                },
+                TxOut {
+                    value: VALUE / 2 - 1_000,
+                    script_pubkey: change.script_pubkey(),
+                },
+            ],
+            special_transaction_payload: None,
+        };
+
+        one_pass(&manager, wallet_id, &funding, 100).await;
+        let first = drain(&manager, &mut receiver).await;
+        assert_eq!(
+            credited_vouts(&first, funding_txid),
+            (0..gap).collect::<BTreeSet<_>>(),
+            "the first pass credits the outputs the pool reached"
+        );
+
+        let spending = dashcore::Block::dummy(101, vec![spend]);
+        process_block_with_rescans(&manager, wallet_id, &spending, 101).await;
+        let spent_drain = drain(&manager, &mut receiver).await;
+        assert!(spent_drain.spent_utxos.iter().any(|u| u.outpoint == spent));
+
+        process_block_with_rescans(&manager, wallet_id, &funding, 100).await;
+        let rescanned = drain(&manager, &mut receiver).await;
+        let mut expected: BTreeSet<u32> = (0..count).collect();
+        expected.remove(&spent.vout);
+        assert_eq!(credited_vouts(&rescanned, funding_txid), expected);
+        assert!(
+            !rescanned.new_utxos.iter().any(|u| u.outpoint == spent),
+            "the spent coin is not re-sent as unspent"
+        );
+        assert!(
+            rescanned
+                .new_utxos
+                .iter()
+                .all(|u| u.outpoint.txid == funding_txid),
+            "a pass of block 100 sends no coin of another block"
+        );
     }
 }

@@ -222,16 +222,20 @@ pub fn external_addresses(
         .collect()
 }
 
-/// A block at `height` holding one transaction that pays `value` to each of
-/// `addresses`, spending an outpoint no wallet holds.
-pub fn block_paying(addresses: &[dashcore::Address], value: u64, height: u32) -> dashcore::Block {
-    let tx = Transaction {
+/// A transaction paying `value` to each of `addresses`, spending an
+/// outpoint no wallet holds (one per `input_vout`).
+pub fn transaction_paying(
+    addresses: &[dashcore::Address],
+    value: u64,
+    input_vout: u32,
+) -> Transaction {
+    Transaction {
         version: 2,
         lock_time: 0,
         input: vec![dashcore::TxIn {
             previous_output: dashcore::OutPoint {
                 txid: dashcore::Txid::from_byte_array([0xF0; 32]),
-                vout: height,
+                vout: input_vout,
             },
             script_sig: dashcore::ScriptBuf::new(),
             sequence: u32::MAX,
@@ -245,8 +249,13 @@ pub fn block_paying(addresses: &[dashcore::Address], value: u64, height: u32) ->
             })
             .collect(),
         special_transaction_payload: None,
-    };
-    dashcore::Block::dummy(height, vec![tx])
+    }
+}
+
+/// A block at `height` holding one transaction that pays `value` to each of
+/// `addresses`.
+pub fn block_paying(addresses: &[dashcore::Address], value: u64, height: u32) -> dashcore::Block {
+    dashcore::Block::dummy(height, vec![transaction_paying(addresses, value, height)])
 }
 
 /// Processes `block` for `wallet_id` the way dash-spv's filter sync does:
