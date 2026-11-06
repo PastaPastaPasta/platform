@@ -10,5 +10,6 @@ pub mod orchestration;
 pub(crate) mod sync;
 pub mod tracked;
 
+pub use build::AssetLockBuildAmount;
 pub use lock_notify_handler::LockNotifyHandler;
 pub use orchestration::AssetLockFunding;
