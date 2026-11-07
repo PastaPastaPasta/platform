@@ -2855,6 +2855,7 @@ mod tests {
                 (blob, blob, short, "'executed'", "NULL"),
                 (blob, blob, text, "'executed'", "NULL"),
                 (blob, blob, blob, "'maybe'", "NULL"),
+                (blob, blob, blob, "'maybe'", "'refused'"),
                 (blob, blob, blob, "'executed'", "'refused'"),
                 (blob, blob, blob, "'not_executed'", "NULL"),
                 (blob, blob, blob, "'unresolved'", "NULL"),
