@@ -174,11 +174,12 @@ pub struct PendingRedrive {
 }
 
 impl PendingRedrive {
-    /// SHA-256 of [`st_bytes`](Self::st_bytes): the same value as
-    /// `StateTransition::transaction_id()` for the transition these bytes
-    /// serialize, and the key its spend disposition is recorded under.
-    /// Computed from the bytes, so it needs no decode and also exists for a
-    /// record whose bytes no longer deserialize.
+    /// SHA-256 of [`st_bytes`](Self::st_bytes), and the key the spend's
+    /// disposition is recorded under. For bytes that are a transition's
+    /// platform serialization, as the library writes them, this equals that
+    /// transition's `StateTransition::transaction_id()`. Computed from the
+    /// bytes, so it needs no decode and also exists for a record whose bytes
+    /// no longer deserialize.
     pub fn st_hash(&self) -> [u8; 32] {
         dpp::util::hash::hash_single(&self.st_bytes)
     }
@@ -330,32 +331,54 @@ pub enum ShieldedDispositionRefusal {
         hex::encode(activity_id)
     )]
     IdentityDebit { activity_id: [u8; 32] },
-    /// A redrive for this transition or activity is still armed, so the
-    /// disposition must be written by resolving it.
+    /// [`ShieldedSpendDisposition::Executed`] was asked for while another
+    /// armed redrive also reserves one of this record's notes, so a spent
+    /// nullifier does not show which of the two executed.
+    #[error(
+        "shielded redrive for activity {} shares a reserved note with activity {}; its execution is not provable",
+        hex::encode(activity_id),
+        hex::encode(other_activity_id)
+    )]
+    ReservationShared {
+        activity_id: [u8; 32],
+        other_activity_id: [u8; 32],
+    },
+    /// A redrive for this transition or activity is still armed in the
+    /// wallet, so the disposition must be written by resolving it.
     #[error(
         "shielded redrive for activity {} is still armed; resolve it instead",
         hex::encode(activity_id)
     )]
     RedriveArmed { activity_id: [u8; 32] },
-    /// An unacknowledged disposition for `st_hash` already holds different
-    /// evidence.
+    /// An unacknowledged disposition for `st_hash` in the same wallet
+    /// already holds different evidence (another value, activity or account).
     #[error(
-        "transition {} already has disposition {existing:?} for activity {}; refusing {attempted:?} for activity {}",
+        "transition {} already has disposition {existing:?} for account {existing_account_index} activity {}; refusing {attempted:?} for account {attempted_account_index} activity {}",
         hex::encode(st_hash),
         hex::encode(existing_activity_id),
         hex::encode(attempted_activity_id)
     )]
     Conflict {
         st_hash: [u8; 32],
+        existing_account_index: u32,
         existing_activity_id: [u8; 32],
         existing: ShieldedSpendDisposition,
+        attempted_account_index: u32,
         attempted_activity_id: [u8; 32],
         attempted: ShieldedSpendDisposition,
     },
 }
 
+/// Access to the [`ShieldedDispositionRefusal`] a store error carries, so
+/// code generic over [`ShieldedStore`] can tell a refusal from a storage
+/// failure.
+pub trait AsDispositionRefusal {
+    /// The refusal this error is, if it is one.
+    fn disposition_refusal(&self) -> Option<&ShieldedDispositionRefusal>;
+}
+
 /// Decide a disposition write against the unacknowledged one already stored
-/// for the same subwallet and `st_hash`: `Ok(Some(record))` is the record to
+/// for the same wallet and `st_hash`: `Ok(Some(record))` is the record to
 /// write, `Ok(None)` is an identical no-op, and different evidence is a
 /// conflict.
 pub(super) fn disposition_to_write(
@@ -367,14 +390,18 @@ pub(super) fn disposition_to_write(
 ) -> Result<Option<ShieldedSpendDispositionRecord>, ShieldedDispositionRefusal> {
     match existing {
         Some(existing)
-            if existing.activity_id == *activity_id && existing.disposition == disposition =>
+            if existing.subwallet == id
+                && existing.activity_id == *activity_id
+                && existing.disposition == disposition =>
         {
             Ok(None)
         }
         Some(existing) => Err(ShieldedDispositionRefusal::Conflict {
             st_hash: *st_hash,
+            existing_account_index: existing.subwallet.account_index,
             existing_activity_id: existing.activity_id,
             existing: existing.disposition,
+            attempted_account_index: id.account_index,
             attempted_activity_id: *activity_id,
             attempted: disposition,
         }),
@@ -436,7 +463,7 @@ pub(super) struct MarkSpentOutcome {
 /// batch writes without interior mutability.
 pub trait ShieldedStore: Send + Sync {
     /// The error type returned by storage operations.
-    type Error: StdError + Send + Sync + 'static;
+    type Error: StdError + AsDispositionRefusal + Send + Sync + 'static;
 
     // ── Notes (per-subwallet) ──────────────────────────────────────────
 
@@ -555,12 +582,19 @@ pub trait ShieldedStore: Send + Sync {
     /// [`st_hash`](PendingRedrive::st_hash), delete the redrive record, and
     /// release its note reservations. Returns the removed record.
     ///
-    /// A reservation that another armed redrive also carries stays reserved,
-    /// and that redrive stays armed. An identical unacknowledged disposition
-    /// for the same `st_hash` is kept as is; a different one is
-    /// [`ShieldedDispositionRefusal::Conflict`]. A missing record is
-    /// [`ShieldedDispositionRefusal::RedriveNotFound`] and an identity-debit
-    /// guard is [`ShieldedDispositionRefusal::IdentityDebit`].
+    /// A reservation that another armed redrive also carries stays reserved
+    /// for that redrive, which stays armed; `Executed` is then refused with
+    /// [`ShieldedDispositionRefusal::ReservationShared`]. An identical
+    /// unacknowledged disposition for the same `st_hash` in the wallet is
+    /// kept as is; a different one is [`ShieldedDispositionRefusal::Conflict`].
+    /// A missing record is [`ShieldedDispositionRefusal::RedriveNotFound`]
+    /// and an identity-debit guard is
+    /// [`ShieldedDispositionRefusal::IdentityDebit`].
+    ///
+    /// Resolution releases reservations but never marks notes spent. After
+    /// resolving as `Executed`, mark the notes spent with
+    /// [`Self::mark_spent`] under the same store guard, so the spend is
+    /// reported as newly detected.
     ///
     /// Durable implementations commit every durable effect in one transaction
     /// before changing memory. On any error nothing changed: the record, its
@@ -575,9 +609,9 @@ pub trait ShieldedStore: Send + Sync {
     /// Record a disposition for a transition that has no armed redrive
     /// record, persisted before anything else changes. Returns `false` when an
     /// identical unacknowledged disposition already exists. Different
-    /// evidence for the same `st_hash` is
-    /// [`ShieldedDispositionRefusal::Conflict`], and a still-armed redrive
-    /// for `st_hash` or `activity_id` is
+    /// evidence for the same `st_hash` anywhere in the wallet is
+    /// [`ShieldedDispositionRefusal::Conflict`], and a redrive for `st_hash`
+    /// or `activity_id` still armed in any of the wallet's accounts is
     /// [`ShieldedDispositionRefusal::RedriveArmed`]; nothing changes in
     /// either case.
     fn record_disposition(
@@ -1045,11 +1079,14 @@ impl SubwalletState {
         self.redrives.remove(activity_id);
     }
 
-    /// The armed note-spend redrive `resolve_redrive` may act on. Identity
-    /// debits carry no input nullifiers and are refused.
-    pub(super) fn note_spend_redrive(
+    /// The armed note-spend redrive `resolve_redrive` may resolve as
+    /// `disposition`. Identity debits carry no input nullifiers and are
+    /// refused, and `Executed` is refused while another armed redrive
+    /// reserves one of the same notes.
+    pub(super) fn redrive_to_resolve(
         &self,
         activity_id: &[u8; 32],
+        disposition: ShieldedSpendDisposition,
     ) -> Result<&PendingRedrive, ShieldedDispositionRefusal> {
         let redrive =
             self.redrives
@@ -1061,6 +1098,20 @@ impl SubwalletState {
             return Err(ShieldedDispositionRefusal::IdentityDebit {
                 activity_id: *activity_id,
             });
+        }
+        if disposition == ShieldedSpendDisposition::Executed {
+            if let Some(other) = self.redrives.values().find(|other| {
+                other.activity_id != *activity_id
+                    && other
+                        .nullifiers
+                        .iter()
+                        .any(|nullifier| redrive.nullifiers.contains(nullifier))
+            }) {
+                return Err(ShieldedDispositionRefusal::ReservationShared {
+                    activity_id: *activity_id,
+                    other_activity_id: other.activity_id,
+                });
+            }
         }
         Ok(redrive)
     }
@@ -1085,19 +1136,29 @@ impl SubwalletState {
     }
 
     /// Remove the redrive keyed by `activity_id` and release each of its
-    /// reservations that no remaining armed redrive carries.
+    /// reservations that no remaining armed redrive carries. A reservation
+    /// another redrive still carries is repointed to that redrive's anchor
+    /// and activity, so the prune backstop judges it by the survivor.
     pub(super) fn remove_redrive_and_release(
         &mut self,
         activity_id: &[u8; 32],
     ) -> Option<PendingRedrive> {
         let redrive = self.redrives.remove(activity_id)?;
         for nullifier in &redrive.nullifiers {
-            if !self
+            match self
                 .redrives
                 .values()
-                .any(|other| other.nullifiers.contains(nullifier))
+                .find(|other| other.nullifiers.contains(nullifier))
             {
-                self.pending_nullifiers.remove(nullifier);
+                Some(other) => {
+                    if let Some(pending) = self.pending_nullifiers.get_mut(nullifier) {
+                        pending.anchor = Some(other.anchor);
+                        pending.activity_id = Some(other.activity_id);
+                    }
+                }
+                None => {
+                    self.pending_nullifiers.remove(nullifier);
+                }
             }
         }
         Some(redrive)
@@ -1167,9 +1228,10 @@ impl InMemoryStoreError {
             refusal: None,
         }
     }
+}
 
-    /// The disposition refusal this error carries, if it is one.
-    pub fn refusal(&self) -> Option<&ShieldedDispositionRefusal> {
+impl AsDispositionRefusal for InMemoryStoreError {
+    fn disposition_refusal(&self) -> Option<&ShieldedDispositionRefusal> {
         self.refusal.as_ref()
     }
 }
@@ -1218,6 +1280,18 @@ impl InMemoryShieldedStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+/// The unacknowledged disposition for `st_hash` in any of the wallet's
+/// accounts.
+fn wallet_disposition<'a>(
+    dispositions: &'a BTreeMap<(SubwalletId, [u8; 32]), ShieldedSpendDispositionRecord>,
+    wallet_id: WalletId,
+    st_hash: &[u8; 32],
+) -> Option<&'a ShieldedSpendDispositionRecord> {
+    dispositions
+        .values()
+        .find(|record| record.subwallet.wallet_id == wallet_id && record.st_hash == *st_hash)
 }
 
 impl ShieldedStore for InMemoryShieldedStore {
@@ -1368,10 +1442,9 @@ impl ShieldedStore for InMemoryShieldedStore {
                 .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
                     activity_id: *activity_id,
                 })?;
-        let st_hash = sw.note_spend_redrive(activity_id)?.st_hash();
-        let key = (id, st_hash);
+        let st_hash = sw.redrive_to_resolve(activity_id, disposition)?.st_hash();
         let record = disposition_to_write(
-            self.dispositions.get(&key),
+            wallet_disposition(&self.dispositions, id.wallet_id, &st_hash),
             id,
             &st_hash,
             activity_id,
@@ -1383,7 +1456,7 @@ impl ShieldedStore for InMemoryShieldedStore {
             },
         )?;
         if let Some(record) = record {
-            self.dispositions.insert(key, record);
+            self.dispositions.insert((id, st_hash), record);
         }
         Ok(redrive)
     }
@@ -1395,12 +1468,15 @@ impl ShieldedStore for InMemoryShieldedStore {
         activity_id: &[u8; 32],
         disposition: ShieldedSpendDisposition,
     ) -> Result<bool, Self::Error> {
-        if let Some(sw) = self.subwallets.get(&id) {
+        for (_, sw) in self
+            .subwallets
+            .iter()
+            .filter(|(subwallet, _)| subwallet.wallet_id == id.wallet_id)
+        {
             sw.ensure_no_armed_redrive(st_hash, activity_id)?;
         }
-        let key = (id, *st_hash);
         let Some(record) = disposition_to_write(
-            self.dispositions.get(&key),
+            wallet_disposition(&self.dispositions, id.wallet_id, st_hash),
             id,
             st_hash,
             activity_id,
@@ -1409,7 +1485,7 @@ impl ShieldedStore for InMemoryShieldedStore {
         else {
             return Ok(false);
         };
-        self.dispositions.insert(key, record);
+        self.dispositions.insert((id, *st_hash), record);
         Ok(true)
     }
 
@@ -1642,12 +1718,16 @@ pub(super) mod disposition_contract {
             .collect()
     }
 
-    fn refusal<T: fmt::Debug, E: StdError>(
+    /// The typed refusal, read through [`AsDispositionRefusal`] as generic
+    /// callers would.
+    fn refusal<T: fmt::Debug, E: StdError + AsDispositionRefusal>(
         result: Result<T, E>,
-        refusal_of: &impl Fn(&E) -> Option<ShieldedDispositionRefusal>,
     ) -> ShieldedDispositionRefusal {
         let error = result.expect_err("the store must refuse");
-        refusal_of(&error).unwrap_or_else(|| panic!("expected a typed refusal, got {error}"))
+        error
+            .disposition_refusal()
+            .cloned()
+            .unwrap_or_else(|| panic!("expected a typed refusal, got {error}"))
     }
 
     pub(crate) fn resolve_records_removes_and_releases<S: ShieldedStore>(
@@ -1685,7 +1765,6 @@ pub(super) mod disposition_contract {
 
     pub(crate) fn identical_second_write_is_noop_and_different_conflicts<S: ShieldedStore>(
         store: &mut S,
-        refusal_of: impl Fn(&S::Error) -> Option<ShieldedDispositionRefusal>,
     ) -> Vec<WalletId> {
         let id = SubwalletId::new([0xC3; 32], 0);
         let st_hash = [0x21; 32];
@@ -1704,44 +1783,67 @@ pub(super) mod disposition_contract {
             "an identical second write is a no-op"
         );
         assert_eq!(
-            refusal(
-                store.record_disposition(id, &st_hash, &activity_id, purged),
-                &refusal_of
-            ),
+            refusal(store.record_disposition(id, &st_hash, &activity_id, purged)),
             ShieldedDispositionRefusal::Conflict {
                 st_hash,
+                existing_account_index: 0,
                 existing_activity_id: activity_id,
                 existing: rejected,
+                attempted_account_index: 0,
                 attempted_activity_id: activity_id,
                 attempted: purged,
             }
         );
         assert!(matches!(
-            refusal(
-                store.record_disposition(id, &st_hash, &[0x32; 32], rejected),
-                &refusal_of
-            ),
+            refusal(store.record_disposition(id, &st_hash, &[0x32; 32], rejected)),
             ShieldedDispositionRefusal::Conflict { .. }
         ));
+        assert!(
+            matches!(
+                refusal(store.record_disposition(
+                    SubwalletId::new(id.wallet_id, 1),
+                    &st_hash,
+                    &activity_id,
+                    rejected
+                )),
+                ShieldedDispositionRefusal::Conflict {
+                    existing_account_index: 0,
+                    attempted_account_index: 1,
+                    ..
+                }
+            ),
+            "one transition has one piece of evidence across the wallet's accounts"
+        );
         assert_eq!(
             store.dispositions(id.wallet_id).unwrap(),
             before,
             "neither the no-op nor a conflict may touch the stored evidence"
         );
+        assert!(
+            store
+                .record_disposition(
+                    SubwalletId::new([0xC2; 32], 0),
+                    &st_hash,
+                    &activity_id,
+                    purged
+                )
+                .unwrap(),
+            "another wallet keeps its own evidence"
+        );
 
         // The same rule holds when the write comes from resolving a record.
         let redrive = spend(0x12, &[[0xA3; 32]]);
-        let refused = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Refused);
         assert!(store
-            .record_disposition(id, &redrive.st_hash(), &redrive.activity_id, refused)
+            .record_disposition(id, &redrive.st_hash(), &redrive.activity_id, purged)
             .unwrap());
         let before = store.dispositions(id.wallet_id).unwrap();
         arm_reserved(store, id, &redrive);
         assert!(matches!(
-            refusal(
-                store.resolve_redrive(id, &redrive.activity_id, ShieldedSpendDisposition::Executed),
-                &refusal_of
-            ),
+            refusal(store.resolve_redrive(
+                id,
+                &redrive.activity_id,
+                ShieldedSpendDisposition::Executed
+            )),
             ShieldedDispositionRefusal::Conflict { .. }
         ));
         assert_eq!(
@@ -1757,7 +1859,7 @@ pub(super) mod disposition_contract {
 
         assert_eq!(
             store
-                .resolve_redrive(id, &redrive.activity_id, refused)
+                .resolve_redrive(id, &redrive.activity_id, purged)
                 .expect("an identical resolution completes"),
             redrive
         );
@@ -1768,26 +1870,22 @@ pub(super) mod disposition_contract {
             before,
             "the existing evidence is kept unchanged"
         );
-        vec![id.wallet_id]
+        vec![id.wallet_id, [0xC2; 32]]
     }
 
     pub(crate) fn resolve_redrive_refuses_identity_debit_and_missing_activity<S: ShieldedStore>(
         store: &mut S,
-        refusal_of: impl Fn(&S::Error) -> Option<ShieldedDispositionRefusal>,
     ) -> Vec<WalletId> {
         let id = SubwalletId::new([0xC4; 32], 1);
         let identity_debit = spend(0x13, &[]);
         store.arm_redrive(id, identity_debit.clone()).unwrap();
 
         assert_eq!(
-            refusal(
-                store.resolve_redrive(
-                    id,
-                    &identity_debit.activity_id,
-                    ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Abandoned)
-                ),
-                &refusal_of
-            ),
+            refusal(store.resolve_redrive(
+                id,
+                &identity_debit.activity_id,
+                ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Abandoned)
+            )),
             ShieldedDispositionRefusal::IdentityDebit {
                 activity_id: identity_debit.activity_id
             }
@@ -1802,14 +1900,11 @@ pub(super) mod disposition_contract {
             (SubwalletId::new([0xC4; 32], 2), [0x13; 32]),
         ] {
             assert_eq!(
-                refusal(
-                    store.resolve_redrive(
-                        subwallet,
-                        &activity_id,
-                        ShieldedSpendDisposition::Executed
-                    ),
-                    &refusal_of
-                ),
+                refusal(store.resolve_redrive(
+                    subwallet,
+                    &activity_id,
+                    ShieldedSpendDisposition::Executed
+                )),
                 ShieldedDispositionRefusal::RedriveNotFound { activity_id }
             );
         }
@@ -1819,22 +1914,23 @@ pub(super) mod disposition_contract {
 
     pub(crate) fn record_disposition_refuses_while_redrive_armed<S: ShieldedStore>(
         store: &mut S,
-        refusal_of: impl Fn(&S::Error) -> Option<ShieldedDispositionRefusal>,
     ) -> Vec<WalletId> {
         let id = SubwalletId::new([0xC5; 32], 0);
         let redrive = spend(0x14, &[[0xA4; 32]]);
         arm_reserved(store, id, &redrive);
         let executed = ShieldedSpendDisposition::Executed;
 
-        for (st_hash, activity_id) in [
-            (redrive.st_hash(), [0x99; 32]),
-            ([0x98; 32], redrive.activity_id),
+        for (subwallet, st_hash, activity_id) in [
+            (id, redrive.st_hash(), [0x99; 32]),
+            (id, [0x98; 32], redrive.activity_id),
+            (
+                SubwalletId::new(id.wallet_id, 1),
+                redrive.st_hash(),
+                redrive.activity_id,
+            ),
         ] {
             assert_eq!(
-                refusal(
-                    store.record_disposition(id, &st_hash, &activity_id, executed),
-                    &refusal_of
-                ),
+                refusal(store.record_disposition(subwallet, &st_hash, &activity_id, executed)),
                 ShieldedDispositionRefusal::RedriveArmed {
                     activity_id: redrive.activity_id
                 }
@@ -1844,19 +1940,19 @@ pub(super) mod disposition_contract {
         assert_eq!(store.pending_redrives(id).unwrap(), vec![redrive.clone()]);
         assert!(unspent(store, id).is_empty());
 
-        let other_account = SubwalletId::new(id.wallet_id, 1);
+        let other_wallet = SubwalletId::new([0xCC; 32], 0);
         assert!(
             store
                 .record_disposition(
-                    other_account,
+                    other_wallet,
                     &redrive.st_hash(),
                     &redrive.activity_id,
                     executed
                 )
                 .unwrap(),
-            "the armed-record check is scoped to its own subwallet"
+            "the armed-record check is scoped to its own wallet"
         );
-        vec![id.wallet_id]
+        vec![id.wallet_id, other_wallet.wallet_id]
     }
 
     pub(crate) fn ack_removes_only_that_hash<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
@@ -1868,7 +1964,7 @@ pub(super) mod disposition_contract {
         for (id, st_hash) in [
             (a, [0x41; 32]),
             (a, [0x42; 32]),
-            (b, [0x41; 32]),
+            (b, [0x43; 32]),
             (other, [0x41; 32]),
         ] {
             assert!(store
@@ -1884,10 +1980,13 @@ pub(super) mod disposition_contract {
             .into_iter()
             .map(|record| (record.subwallet, record.st_hash))
             .collect();
-        assert_eq!(left, vec![(a, [0x42; 32]), (b, [0x41; 32])]);
+        assert_eq!(left, vec![(a, [0x42; 32]), (b, [0x43; 32])]);
         assert_eq!(store.dispositions(other.wallet_id).unwrap().len(), 1);
         assert!(!store.ack_disposition(a, &[0x41; 32]).unwrap());
-        assert!(!store.ack_disposition(a, &[0x43; 32]).unwrap());
+        assert!(
+            !store.ack_disposition(a, &[0x43; 32]).unwrap(),
+            "an ack names its account; another account's evidence stays"
+        );
         assert_eq!(store.dispositions(wallet_id).unwrap().len(), 2);
         vec![wallet_id, other.wallet_id]
     }
@@ -1943,23 +2042,61 @@ pub(super) mod disposition_contract {
         let id = SubwalletId::new([0xCA; 32], 0);
         let shared = [0xB1; 32];
         let first = spend(0x18, &[shared, [0xB2; 32]]);
-        let second = spend(0x19, &[shared, [0xB3; 32]]);
+        let second = PendingRedrive {
+            anchor: [0x5B; 32],
+            ..spend(0x19, &[shared, [0xB3; 32]])
+        };
         arm_reserved(store, id, &first);
         arm_reserved(store, id, &second);
 
+        assert_eq!(
+            refusal(store.resolve_redrive(
+                id,
+                &first.activity_id,
+                ShieldedSpendDisposition::Executed
+            )),
+            ShieldedDispositionRefusal::ReservationShared {
+                activity_id: first.activity_id,
+                other_activity_id: second.activity_id,
+            },
+            "a spent shared nullifier cannot show which record executed"
+        );
+        assert_eq!(store.pending_redrives(id).unwrap().len(), 2);
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+
+        // The shared reservation was last attached to `second`; resolving it
+        // must hand the reservation back to `first`, not leave it on `second`.
         store
             .resolve_redrive(
                 id,
-                &first.activity_id,
+                &second.activity_id,
                 ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Pruned),
             )
             .unwrap();
 
-        assert_eq!(store.pending_redrives(id).unwrap(), vec![second]);
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![first.clone()]);
         assert_eq!(
             unspent(store, id),
-            BTreeSet::from([[0xB2; 32]]),
+            BTreeSet::from([[0xB3; 32]]),
             "a note another armed record carries stays reserved"
+        );
+        let mut stale = store.stale_pending_spends(id).unwrap();
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                (shared, first.anchor, Some(first.activity_id)),
+                ([0xB2; 32], first.anchor, Some(first.activity_id)),
+            ],
+            "the kept reservation now describes the surviving record"
+        );
+
+        store
+            .resolve_redrive(id, &first.activity_id, ShieldedSpendDisposition::Executed)
+            .expect("with no other record on its notes, Executed is allowed");
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([shared, [0xB2; 32], [0xB3; 32]])
         );
         vec![id.wallet_id]
     }
@@ -2649,10 +2786,6 @@ mod tests {
         }
     }
 
-    fn in_memory_refusal(error: &InMemoryStoreError) -> Option<ShieldedDispositionRefusal> {
-        error.refusal().cloned()
-    }
-
     #[test]
     fn in_memory_resolve_records_removes_and_releases() {
         disposition_contract::resolve_records_removes_and_releases(
@@ -2664,7 +2797,6 @@ mod tests {
     fn in_memory_identical_second_write_is_noop_and_different_conflicts() {
         disposition_contract::identical_second_write_is_noop_and_different_conflicts(
             &mut InMemoryShieldedStore::new(),
-            in_memory_refusal,
         );
     }
 
@@ -2672,7 +2804,6 @@ mod tests {
     fn in_memory_resolve_redrive_refuses_identity_debit_and_missing_activity() {
         disposition_contract::resolve_redrive_refuses_identity_debit_and_missing_activity(
             &mut InMemoryShieldedStore::new(),
-            in_memory_refusal,
         );
     }
 
@@ -2680,7 +2811,6 @@ mod tests {
     fn in_memory_record_disposition_refuses_while_redrive_armed() {
         disposition_contract::record_disposition_refuses_while_redrive_armed(
             &mut InMemoryShieldedStore::new(),
-            in_memory_refusal,
         );
     }
 
