@@ -65,17 +65,20 @@ grovedb-storage = { git = "https://github.com/dashpay/grovedb", rev = "9791d2772
 grovedb-version = { git = "https://github.com/dashpay/grovedb", rev = "9791d277207998b7789c85b0745e99d37040a12e" }
 grovedb-epoch-based-storage-flags = { git = "https://github.com/dashpay/grovedb", rev = "9791d277207998b7789c85b0745e99d37040a12e" }
 grovedb-commitment-tree = { git = "https://github.com/dashpay/grovedb", rev = "9791d277207998b7789c85b0745e99d37040a12e" }
-# rust-dashcore: PastaPastaPasta/rust-dashcore dw/0.1.x-confirm-credits-rescan-outputs = dashpay
-# 626c91d1 + #1112, #1105 and #1295 (ManagedWalletInfo::restore_utxos) and #1326 (credit outputs a
-# re-scan newly matches), cherry-picked. Back to a dashpay/rust-dashcore revision at the next re-pin.
-dashcore = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-dash-network-seeds = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-dash-spv = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-key-wallet = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-key-wallet-ffi = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-key-wallet-manager = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-dash-network = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
-dashcore-rpc = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "846ffe54fe4d0bf1b4e6d4683a7a57989860a1df" }
+# rust-dashcore: PastaPastaPasta/rust-dashcore dw/0.1.x-row57-rescan-credits-swept@7b7126b418
+# = dw/0.1.x-confirm-credits-rescan-outputs@846ffe54 (dashpay 626c91d1 + #1112, #1105 and
+# #1295, ManagedWalletInfo::restore_utxos, + #1326, crediting outputs a re-scan newly matches,
+# cherry-picked) merged with dw/0.2-swept-winner-block-hash@9359687d93
+# (+ `TransactionsSwept::winner_block`, the winner's block hash with its height); both on
+# dw/restore-utxos-626c91d1@55663e4352. Back to a dashpay/rust-dashcore revision at the next re-pin.
+dashcore = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+dash-network-seeds = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+dash-spv = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+key-wallet = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+key-wallet-ffi = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+key-wallet-manager = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+dash-network = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
+dashcore-rpc = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "7b7126b418c646963eab49d64cf964f11d50d54d" }
 tokio-metrics = "0.5"
 
 # Size-tuned profile for the iOS `rs-unified-sdk-ffi` staticlib, which
