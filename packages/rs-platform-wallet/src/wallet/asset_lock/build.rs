@@ -987,46 +987,60 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         // have been swept and re-owned) and no transaction reaches the wire.
         // The funding key index consumed by the build is the same residue any
         // discarded build leaves and is reclaimed by the gap-limit scan.
-        if let AssetLockBuildAmount::DrainAll {
-            minimum_lock_duffs: Some(minimum),
-        } = amount
-        {
-            if locked_amount_duffs < minimum {
-                drop(build_persist_guard);
-                // Nothing reached the broadcaster, so the fence has no
-                // transaction to protect: release it alongside the reservation
-                // — but AFTER the cleanup, never before it. The cleanup awaits
-                // the manager read lock, and an input that is unfenced while
-                // still reserved-or-reusable is exactly the window the
-                // contact-send path closes. This site's release is
-                // owner-guarded by `reservation_token`, so a newer build's
-                // reservation cannot be clobbered here even so; the ordering is
-                // uniform across every settle-with-cleanup site rather than
-                // resting on that one argument.
-                //
-                // The RELEASED verdict is recorded before the cleanup's first
-                // await, so cancellation inside it still settles the fence as
-                // released on drop: the abort is established and nothing was
-                // sent, so a pending-spend settle there would fence inputs no
-                // observed spend could ever clear — same shape as the
-                // contact-send rejection arm.
-                let mut in_broadcast_pin = in_broadcast_pin;
-                in_broadcast_pin.settle_released_on_drop();
-                crate::wallet::reservations::release_reservation_after_rejected_broadcast(
-                    &self.wallet_manager,
-                    &self.wallet_id,
-                    &funding_accounts,
-                    &tx,
-                    reservation_token,
-                )
-                .await;
-                in_broadcast_pin.settle_released();
-                return Err(PlatformWalletError::AssetLockTransaction(format!(
-                    "drained asset lock of {locked_amount_duffs} duffs is below the required \
-                     minimum of {minimum} duffs (the balance cannot clear the shield pool fee); \
-                     nothing was broadcast"
-                )));
-            }
+        //
+        // The same verdict covers the asset-lock input cap: Dash Core relays
+        // at most `max_asset_lock_transaction_inputs` (100) inputs and drops a
+        // larger lock silently (`assetlocktx-too-many-inputs`), and Platform
+        // consensus validates the same versioned bound — tighter than the
+        // standard-transaction limit key-wallet's builder applies. Any amount
+        // can cross it: a drain pools every eligible input, and a fixed amount
+        // held only in many small coins selects as many. An oversized lock is
+        // abandoned here rather than stranded on the wire; the caller can
+        // consolidate the coins and build again.
+        let abandon =
+            super::input_cap_violation(&tx, 0, self.sdk.version()).or_else(|| match amount {
+                AssetLockBuildAmount::DrainAll {
+                    minimum_lock_duffs: Some(minimum),
+                } if locked_amount_duffs < minimum => {
+                    Some(PlatformWalletError::AssetLockTransaction(format!(
+                        "drained asset lock of {locked_amount_duffs} duffs is below the \
+                         required minimum of {minimum} duffs (the balance cannot clear the \
+                         shield pool fee); nothing was broadcast"
+                    )))
+                }
+                _ => None,
+            });
+        if let Some(error) = abandon {
+            drop(build_persist_guard);
+            // Nothing reached the broadcaster, so the fence has no
+            // transaction to protect: release it alongside the reservation
+            // — but AFTER the cleanup, never before it. The cleanup awaits
+            // the manager read lock, and an input that is unfenced while
+            // still reserved-or-reusable is exactly the window the
+            // contact-send path closes. This site's release is
+            // owner-guarded by `reservation_token`, so a newer build's
+            // reservation cannot be clobbered here even so; the ordering is
+            // uniform across every settle-with-cleanup site rather than
+            // resting on that one argument.
+            //
+            // The RELEASED verdict is recorded before the cleanup's first
+            // await, so cancellation inside it still settles the fence as
+            // released on drop: the abort is established and nothing was
+            // sent, so a pending-spend settle there would fence inputs no
+            // observed spend could ever clear — same shape as the
+            // contact-send rejection arm.
+            let mut in_broadcast_pin = in_broadcast_pin;
+            in_broadcast_pin.settle_released_on_drop();
+            crate::wallet::reservations::release_reservation_after_rejected_broadcast(
+                &self.wallet_manager,
+                &self.wallet_id,
+                &funding_accounts,
+                &tx,
+                reservation_token,
+            )
+            .await;
+            in_broadcast_pin.settle_released();
+            return Err(error);
         }
 
         // Persist the funding account's address pool now that the build marked
@@ -3681,5 +3695,147 @@ mod tests {
             !info.tracked_asset_locks.contains_key(&out_point),
             "and the row itself is gone, not just reported as removed"
         );
+    }
+
+    // -- Asset-lock input cap -----------------------------------------------
+
+    /// A wallet of `coins` coins of 10 000 duffs each, under an asset-lock
+    /// manager whose broadcaster counts and accepts every transaction.
+    async fn small_coin_asset_lock_manager(
+        coins: usize,
+    ) -> (
+        Arc<AssetLockManager<CountingOkBroadcaster>>,
+        WalletSigner,
+        Arc<CapturingPersistence>,
+    ) {
+        let (wallet_manager, wallet_id, _, signer) =
+            crate::test_support::funded_wallet_manager_with_outputs(
+                StandardAccountType::BIP44Account,
+                &vec![10_000; coins],
+            )
+            .await;
+        let (manager, persistence) = asset_lock_manager_over(
+            wallet_manager,
+            wallet_id,
+            Arc::new(CountingOkBroadcaster::default()),
+        );
+        (manager, signer, persistence)
+    }
+
+    /// Builds and broadcasts an identity-registration lock of exactly
+    /// `amount_duffs`, funded from the default asset-lock sources.
+    async fn broadcast_exact_registration_lock(
+        manager: &AssetLockManager<CountingOkBroadcaster>,
+        signer: &WalletSigner,
+        amount_duffs: u64,
+    ) -> Result<(key_wallet::bip32::DerivationPath, OutPoint), PlatformWalletError> {
+        manager
+            .broadcast_funded_asset_lock(
+                amount_duffs,
+                0,
+                AssetLockFundingType::IdentityRegistration,
+                0,
+                signer,
+            )
+            .await
+    }
+
+    /// Whether any changeset the build queued carries an asset-lock row.
+    fn stored_any_asset_lock_row(persistence: &CapturingPersistence) -> bool {
+        persistence
+            .stored
+            .lock()
+            .expect("capturing persistence mutex")
+            .iter()
+            .filter_map(|cs| cs.asset_locks.as_ref())
+            .any(|al| !al.asset_locks.is_empty())
+    }
+
+    /// A fixed amount held only in small coins selects more inputs than an
+    /// asset lock may carry: the lock is refused before it is tracked or
+    /// broadcast, and its inputs stay spendable.
+    #[tokio::test]
+    async fn should_refuse_an_exact_lock_over_100_inputs() {
+        // 100 coins of 10 000 duffs cover 1 000 000 only before the fee.
+        let (manager, signer, persistence) = small_coin_asset_lock_manager(120).await;
+
+        let result = broadcast_exact_registration_lock(&manager, &signer, 1_000_000).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(PlatformWalletError::AssetLockTooManyInputs { count, max: 100 }) if count > 100
+            ),
+            "{result:?}"
+        );
+        assert_eq!(manager.broadcaster.calls(), 0);
+        assert!(manager.list_tracked_locks().await.is_empty());
+        assert!(!stored_any_asset_lock_row(&persistence));
+        // The refused build released its reservation and its fence: a lock
+        // that fits funds from the same coins.
+        let retry = broadcast_exact_registration_lock(&manager, &signer, 500_000).await;
+        assert!(retry.is_ok(), "{retry:?}");
+        assert_eq!(manager.broadcaster.calls(), 1);
+    }
+
+    /// A fixed amount that needs every one of 100 coins is exactly at the cap,
+    /// so it is built and broadcast.
+    #[tokio::test]
+    async fn should_broadcast_an_exact_lock_of_exactly_100_inputs() {
+        // 99 coins hold 990 000 duffs, short of 980 000 plus a 100-input fee.
+        let (manager, signer, _) = small_coin_asset_lock_manager(100).await;
+
+        let result = broadcast_exact_registration_lock(&manager, &signer, 980_000).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(manager.broadcaster.calls(), 1);
+        let locks = manager.list_tracked_locks().await;
+        assert_eq!(locks[0].transaction.input.len(), 100);
+    }
+
+    /// A whole-balance drain pools every eligible coin, so 101 coins draw the
+    /// refusal before anything is tracked or sent, and 100 coins still drain.
+    #[tokio::test]
+    async fn should_refuse_a_drain_all_lock_over_100_inputs() {
+        for count in [101, 100] {
+            let (manager, signer, persistence) = small_coin_asset_lock_manager(count).await;
+            let result = manager
+                .broadcast_funded_asset_lock_with_funding(
+                    super::AssetLockBuildAmount::DrainAll {
+                        minimum_lock_duffs: Some(1),
+                    },
+                    &crate::ASSET_LOCK_FUNDING_SOURCES,
+                    0,
+                    AssetLockFundingType::IdentityRegistration,
+                    0,
+                    &signer,
+                )
+                .await;
+            if count == 101 {
+                assert!(
+                    matches!(
+                        result,
+                        Err(PlatformWalletError::AssetLockTooManyInputs {
+                            count: 101,
+                            max: 100
+                        })
+                    ),
+                    "{result:?}"
+                );
+                assert_eq!(manager.broadcaster.calls(), 0);
+                assert!(manager.list_tracked_locks().await.is_empty());
+                assert!(!stored_any_asset_lock_row(&persistence));
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(manager.broadcaster.calls(), 1);
+                assert_eq!(
+                    manager.list_tracked_locks().await[0]
+                        .transaction
+                        .input
+                        .len(),
+                    100
+                );
+            }
+        }
     }
 }
