@@ -4,6 +4,7 @@
 //! addresses, and the unified `create_funded_asset_lock_proof` entry point.
 
 use crate::broadcaster::TransactionBroadcaster;
+use std::sync::Arc;
 use std::time::Duration;
 
 use dashcore::Address as DashAddress;
@@ -24,6 +25,7 @@ use key_wallet::wallet::Wallet;
 
 use crate::changeset::{AccountRegistrationEntry, PlatformWalletChangeSet};
 use crate::error::PlatformWalletError;
+use crate::wallet::core::{InBroadcastPin, WalletGeneration};
 use crate::wallet::platform_wallet::PlatformWalletInfo;
 use crate::ASSET_LOCK_FUNDING_SOURCES;
 
@@ -211,7 +213,7 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             DerivationPath,
             Option<key_wallet::ReservationToken>,
             Vec<AccountType>,
-            crate::wallet::core::InBroadcastPin,
+            InBroadcastPin,
         ),
         PlatformWalletError,
     > {
@@ -880,6 +882,15 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
     /// address pool, track the lifecycle row, and broadcast. Returns as soon as
     /// the broadcaster accepts the transaction, with the row at `Broadcast` or
     /// a later status installed by a concurrent resume, BEFORE any proof wait.
+    /// If the wallet left after the broadcast through a removal that bypasses
+    /// its lifecycle gate, it still returns the sent lock's outpoint, with no
+    /// row left to advance.
+    ///
+    /// A wallet removed or re-created between the build's last signature and
+    /// its tracking write draws [`PlatformWalletError::WalletRemovedBeforeSend`]
+    /// and nothing is tracked or broadcast. After signing, the call enters the
+    /// wallet generation's lifecycle gate and holds it through tracking, the
+    /// broadcast and the status advance, so a teardown waits for it to return.
     /// This lets a caller durably record its own bookkeeping for the funded lock
     /// (e.g. the inviter-side invitation row) between the broadcast and the
     /// potentially long proof wait in
@@ -1043,6 +1054,57 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             return Err(error);
         }
 
+        // LIFECYCLE GATE. The build's manager guard ended when the fenced build
+        // returned, so from here on the wallet can be removed — or removed and
+        // re-created under the same id as a new generation — while this call
+        // holds a signed lock. Enter the gate of the generation the build ran
+        // on, then re-check under it that the wallet still is that generation.
+        // Teardown (`remove_wallet_with_teardown`) takes the gate's exclusive
+        // side before it touches the manager, so once the re-check holds it
+        // stays true through the tracking write, the broadcast and the status
+        // advance below, and a removal waits for this call to return: the gate
+        // is held to the end of the call.
+        //
+        // Taken after the signature, never around it: an open signing prompt
+        // must not stall teardown. Lock order: `build_persist_guard` (held
+        // here), then the gate, then the manager lock. Teardown never takes
+        // `build_persist_serial`, and nothing holding the gate or the manager
+        // lock waits for it, so entering the gate under it cannot deadlock.
+        let Some(build_generation) = self
+            .current_generation()
+            .await
+            .filter(|generation| in_broadcast_pin.is_on(generation))
+        else {
+            drop(build_persist_guard);
+            return Err(self
+                .abandon_build_of_a_left_wallet(
+                    in_broadcast_pin,
+                    &funding_accounts,
+                    &tx,
+                    reservation_token,
+                )
+                .await);
+        };
+        #[cfg(test)]
+        self.lifecycle_gate_arrivals
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _lifecycle = build_generation.payment_guard().await;
+        if !self
+            .current_generation()
+            .await
+            .is_some_and(|generation| in_broadcast_pin.is_on(&generation))
+        {
+            drop(build_persist_guard);
+            return Err(self
+                .abandon_build_of_a_left_wallet(
+                    in_broadcast_pin,
+                    &funding_accounts,
+                    &tx,
+                    reservation_token,
+                )
+                .await);
+        }
+
         // Persist the funding account's address pool now that the build marked
         // its index used. These asset-lock accounts fund OP_RETURN-payload
         // credit outputs that never appear as on-chain UTXOs, so SPV can never
@@ -1109,18 +1171,35 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
 
         // 2. Track as Built and queue the changeset onto the persister
         //    so a crash after broadcast leaves a row we can recover from.
-        let cs_built = self
-            .track_asset_lock(TrackedAssetLock {
-                out_point,
-                transaction: tx.clone(),
-                account_index: source_index,
-                funding_type,
-                identity_index,
-                amount: locked_amount_duffs,
-                status: AssetLockStatus::Built,
-                proof: None,
-            })
-            .await;
+        //    Bound to the build's generation: the gate excludes teardown, but
+        //    not a removal that bypasses it — the load rollback, or a host
+        //    writing through the public inner `WalletManager`. A lock its
+        //    wallet does not track is never broadcast.
+        let Some(cs_built) = self
+            .track_asset_lock_in(
+                TrackedAssetLock {
+                    out_point,
+                    transaction: tx.clone(),
+                    account_index: source_index,
+                    funding_type,
+                    identity_index,
+                    amount: locked_amount_duffs,
+                    status: AssetLockStatus::Built,
+                    proof: None,
+                },
+                &build_generation,
+            )
+            .await
+        else {
+            return Err(self
+                .abandon_build_of_a_left_wallet(
+                    in_broadcast_pin,
+                    &funding_accounts,
+                    &tx,
+                    reservation_token,
+                )
+                .await);
+        };
         self.queue_asset_lock_changeset(cs_built);
 
         tracing::debug!(
@@ -1257,19 +1336,92 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         // 4. Transition to Broadcast only if no concurrent flow advanced the
         //    row while this call awaited the network. Replacing a finalized
         //    status here would retain its proof under the weaker status.
-        if let Some(cs_broadcast) = self
+        //
+        //    The gate is still held, so teardown cannot remove the wallet
+        //    before this advance. A removal that bypasses the gate can, and
+        //    then there is no row to advance. The lock went out all the same,
+        //    so that is reported as the send it was, never as an error a
+        //    caller could read as "not sent": the row went with the wallet,
+        //    and the caller's next step on this lock meets the absence itself.
+        match self
             .advance_asset_lock_status_if(
                 &out_point,
                 |current| *current == AssetLockStatus::Built,
                 AssetLockStatus::Broadcast,
                 None,
             )
-            .await?
+            .await
         {
-            self.queue_asset_lock_changeset(cs_broadcast);
+            Ok(Some(cs_broadcast)) => self.queue_asset_lock_changeset(cs_broadcast),
+            Ok(None) => {}
+            Err(error)
+                if !self
+                    .current_generation()
+                    .await
+                    .is_some_and(|generation| Arc::ptr_eq(&generation, &build_generation)) =>
+            {
+                tracing::warn!(
+                    %txid,
+                    %error,
+                    "asset lock was broadcast, but its wallet left before the row could \
+                     advance to Broadcast; reporting the send"
+                );
+            }
+            Err(error) => return Err(error),
         }
 
         Ok((path, out_point))
+    }
+
+    /// The wallet generation registered under this manager's wallet id now,
+    /// if any.
+    async fn current_generation(&self) -> Option<Arc<WalletGeneration>> {
+        let wm = self.wallet_manager.read().await;
+        wm.get_wallet_info(&self.wallet_id)
+            .map(|info| Arc::clone(&info.generation))
+    }
+
+    /// Abandon a signed build that was neither tracked nor broadcast because
+    /// its wallet left the generation it was built on.
+    ///
+    /// The same sequence as every pre-broadcast abandon: the released verdict
+    /// is recorded on the pin first, the reservation cleanup runs under the
+    /// raised fence, and the fence comes down last. Nothing reached the
+    /// broadcaster, and the fence map outlives generations, so a pin left
+    /// standing would keep these inputs from a re-created generation for the
+    /// life of the process.
+    ///
+    /// Only the owner-guarded release runs. The id may now name a different
+    /// generation, and the build's token, unique within the process, frees
+    /// only what this build reserved: nothing, on a generation that never held
+    /// its reservation. A build without a token reserved nothing, and the
+    /// unconditional release would free another generation's reservations of
+    /// the same inputs, so nothing is released for it.
+    async fn abandon_build_of_a_left_wallet(
+        &self,
+        mut in_broadcast_pin: InBroadcastPin,
+        funding_accounts: &[AccountType],
+        tx: &Transaction,
+        reservation_token: Option<key_wallet::ReservationToken>,
+    ) -> PlatformWalletError {
+        in_broadcast_pin.settle_released_on_drop();
+        if reservation_token.is_some() {
+            crate::wallet::reservations::release_reservation_after_rejected_broadcast(
+                &self.wallet_manager,
+                &self.wallet_id,
+                funding_accounts,
+                tx,
+                reservation_token,
+            )
+            .await;
+        }
+        in_broadcast_pin.settle_released();
+        tracing::info!(
+            wallet_id = %hex::encode(self.wallet_id),
+            "asset lock build abandoned before tracking: its wallet was removed or \
+             re-created after signing; nothing was broadcast"
+        );
+        PlatformWalletError::WalletRemovedBeforeSend(hex::encode(self.wallet_id))
     }
 
     /// Proof half of [`Self::create_funded_asset_lock_proof`] — steps 5–6:
@@ -1399,10 +1551,13 @@ mod tests {
     };
     use crate::wallet::asset_lock::manager::AssetLockManager;
     use crate::wallet::asset_lock::tracked::AssetLockStatus;
+    use crate::wallet::core::generation::InBroadcastProbe;
+    use crate::wallet::core::{InBroadcastFences, WalletGeneration};
     use crate::wallet::persister::WalletPersister;
     use crate::wallet::platform_wallet::PlatformWalletInfo;
     use crate::wallet::platform_wallet::WalletId;
     use crate::{AssetLockFundingType, PlatformWalletError};
+    use key_wallet::wallet::managed_wallet_info::ManagedWalletInfo;
 
     /// The zero-spendable-candidate selection error must surface the SAME
     /// typed shortfall as a partial shortfall (not the generic string form),
@@ -3837,5 +3992,593 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Wallet lifecycle between signing and broadcast ----------------------
+
+    /// Parks after each signature, while the build still holds the manager
+    /// write guard: `parked` fires once a signature exists, and the signer
+    /// returns only after `resume`.
+    struct PausedSigner {
+        inner: WalletSigner,
+        parked: Notify,
+        resume: Notify,
+    }
+
+    impl PausedSigner {
+        fn new(inner: WalletSigner) -> Self {
+            Self {
+                inner,
+                parked: Notify::new(),
+                resume: Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl key_wallet::signer::Signer for PausedSigner {
+        type Error = String;
+
+        fn supported_methods(&self) -> &[key_wallet::signer::SignerMethod] {
+            self.inner.supported_methods()
+        }
+
+        async fn sign_ecdsa(
+            &self,
+            path: &key_wallet::DerivationPath,
+            sighash: [u8; 32],
+        ) -> Result<
+            (
+                dashcore::secp256k1::ecdsa::Signature,
+                dashcore::secp256k1::PublicKey,
+            ),
+            String,
+        > {
+            let signature = self.inner.sign_ecdsa(path, sighash).await?;
+            self.parked.notify_one();
+            self.resume.notified().await;
+            Ok(signature)
+        }
+
+        async fn public_key(
+            &self,
+            path: &key_wallet::DerivationPath,
+        ) -> Result<dashcore::secp256k1::PublicKey, String> {
+            self.inner.public_key(path).await
+        }
+    }
+
+    #[async_trait]
+    impl key_wallet::signer::ExtendedPubKeySigner for PausedSigner {
+        async fn extended_public_key(
+            &self,
+            path: &key_wallet::DerivationPath,
+        ) -> Result<key_wallet::bip32::ExtendedPubKey, String> {
+            self.inner.extended_public_key(path).await
+        }
+    }
+
+    /// Re-homes the fixture wallet onto a generation over a fence map the
+    /// caller can hand to a later generation, as the manager's per-wallet map
+    /// is handed to a re-created one.
+    async fn rehome_onto_shared_fences(
+        wallet_manager: &Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+        wallet_id: WalletId,
+    ) -> (Arc<WalletGeneration>, Arc<InBroadcastFences>) {
+        let fences = Arc::new(InBroadcastFences::default());
+        let generation = Arc::new(WalletGeneration::with_fences(Arc::clone(&fences)));
+        wallet_manager
+            .write()
+            .await
+            .get_wallet_info_mut(&wallet_id)
+            .expect("wallet present")
+            .generation = Arc::clone(&generation);
+        (generation, fences)
+    }
+
+    /// The wallet and its core state as they are now: what re-creating the
+    /// wallet from the same seed restores. Cloning the core state shares its
+    /// accounts' reservation sets, as re-registering the removed state itself
+    /// would, so a build on the re-created generation also shows that the
+    /// abandoned build released its own reservation.
+    async fn snapshot_for_recreation(
+        wallet_manager: &Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+        wallet_id: WalletId,
+    ) -> (key_wallet::Wallet, ManagedWalletInfo) {
+        let wm = wallet_manager.read().await;
+        let (wallet, info) = wm.get_wallet_and_info(&wallet_id).expect("wallet present");
+        (wallet.clone(), info.core_wallet.clone())
+    }
+
+    /// Removes the wallet from the inner manager and registers it again under
+    /// the same id as a NEW generation over `fences`.
+    fn recreate_under_the_same_id(
+        wm: &mut WalletManager<PlatformWalletInfo>,
+        wallet_id: WalletId,
+        (wallet, core_wallet): (key_wallet::Wallet, ManagedWalletInfo),
+        fences: Arc<InBroadcastFences>,
+    ) -> Arc<WalletGeneration> {
+        wm.remove_wallet(&wallet_id).expect("wallet present");
+        let generation = Arc::new(WalletGeneration::with_fences(fences));
+        let info = PlatformWalletInfo {
+            observed_input_conflicts: Default::default(),
+            core_wallet,
+            generation: Arc::clone(&generation),
+            identity_manager: crate::wallet::identity::IdentityManager::new(),
+            tracked_asset_locks: std::collections::BTreeMap::new(),
+            dpns_name_states: std::collections::BTreeMap::new(),
+        };
+        let id = wm
+            .insert_wallet(wallet, info)
+            .expect("the freed id registers");
+        assert_eq!(id, wallet_id);
+        generation
+    }
+
+    async fn broadcast_registration_lock<S: key_wallet::signer::ExtendedPubKeySigner, B>(
+        manager: &AssetLockManager<B>,
+        signer: &S,
+    ) -> Result<(key_wallet::DerivationPath, OutPoint), PlatformWalletError>
+    where
+        B: TransactionBroadcaster,
+    {
+        manager
+            .broadcast_funded_asset_lock(
+                1_000_000,
+                0,
+                AssetLockFundingType::IdentityRegistration,
+                0,
+                signer,
+            )
+            .await
+    }
+
+    /// Yields until a build of `manager` has passed its liveness check and is
+    /// entering the lifecycle gate. Bounded by a poll count, not a clock: a
+    /// build that never takes the gate fails here instead of hanging.
+    async fn wait_for_lifecycle_gate_arrival(manager: &AssetLockManager<CountingOkBroadcaster>) {
+        for _ in 0..10_000 {
+            if manager
+                .lifecycle_gate_arrivals
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "the build never reached the lifecycle gate; broadcasts so far: {}",
+            manager.broadcaster.calls()
+        );
+    }
+
+    async fn tracked_rows(
+        wallet_manager: &Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+        wallet_id: WalletId,
+    ) -> usize {
+        wallet_manager
+            .read()
+            .await
+            .get_wallet_info(&wallet_id)
+            .map_or(0, |info| info.tracked_asset_locks.len())
+    }
+
+    /// A teardown that completes between the build's last signature and its
+    /// tracking write leaves a signed lock whose wallet is gone. It is
+    /// refused as `WalletRemovedBeforeSend`: nothing is broadcast or
+    /// persisted, and the fence on its input comes down.
+    #[tokio::test]
+    async fn removal_between_last_signature_and_tracking_sends_nothing() {
+        let (wallet_manager, wallet_id, generation, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let funded = the_only_funded_outpoint(&wallet_manager, wallet_id).await;
+        let (manager, persistence) = asset_lock_manager_over(
+            Arc::clone(&wallet_manager),
+            wallet_id,
+            Arc::new(CountingOkBroadcaster::default()),
+        );
+        let signer = PausedSigner::new(signer);
+
+        let build = broadcast_registration_lock(&manager, &signer);
+        let remove = async {
+            signer.parked.notified().await;
+            // Teardown's own order: the generation's gate, then the manager.
+            // The gate is free while the build signs.
+            let teardown = generation.teardown_guard().await;
+            signer.resume.notify_one();
+            // The build finishes signing, still sees its wallet, and waits at
+            // the gate this teardown holds.
+            wait_for_lifecycle_gate_arrival(&manager).await;
+            wallet_manager
+                .write()
+                .await
+                .remove_wallet(&wallet_id)
+                .expect("wallet present");
+            drop(teardown);
+        };
+        let (result, ()) = tokio::join!(build, remove);
+
+        assert!(
+            matches!(result, Err(PlatformWalletError::WalletRemovedBeforeSend(_))),
+            "{result:?}"
+        );
+        assert_eq!(manager.broadcaster.calls(), 0, "nothing reaches the wire");
+        assert!(!stored_any_asset_lock_row(&persistence));
+        assert_eq!(
+            generation.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Free,
+            "the abandoned build's fence comes down"
+        );
+    }
+
+    /// A same-id re-creation between the build's last signature and its
+    /// tracking write: the old generation's lock is refused before anything
+    /// is written, nothing lands on the new generation, and the new
+    /// generation's next build selects the same input at once.
+    #[tokio::test]
+    async fn same_id_recreation_between_signature_and_tracking_sends_nothing() {
+        let (wallet_manager, wallet_id, _, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let (first, fences) = rehome_onto_shared_fences(&wallet_manager, wallet_id).await;
+        let funded = the_only_funded_outpoint(&wallet_manager, wallet_id).await;
+        let restored = snapshot_for_recreation(&wallet_manager, wallet_id).await;
+        let (manager, persistence) = asset_lock_manager_over(
+            Arc::clone(&wallet_manager),
+            wallet_id,
+            Arc::new(CountingOkBroadcaster::default()),
+        );
+        let signer = PausedSigner::new(signer);
+
+        let build = broadcast_registration_lock(&manager, &signer);
+        let recreate = async {
+            signer.parked.notified().await;
+            let teardown = first.teardown_guard().await;
+            signer.resume.notify_one();
+            // The build sees its own generation, then waits at its gate.
+            wait_for_lifecycle_gate_arrival(&manager).await;
+            let second = recreate_under_the_same_id(
+                &mut *wallet_manager.write().await,
+                wallet_id,
+                restored,
+                fences,
+            );
+            drop(teardown);
+            second
+        };
+        let (result, second) = tokio::join!(build, recreate);
+
+        assert!(
+            matches!(result, Err(PlatformWalletError::WalletRemovedBeforeSend(_))),
+            "{result:?}"
+        );
+        assert_eq!(manager.broadcaster.calls(), 0, "nothing reaches the wire");
+        assert!(
+            persistence
+                .stored
+                .lock()
+                .expect("capturing persistence mutex")
+                .is_empty(),
+            "the refused build writes nothing, not even the funding pools of the \
+             generation that replaced it"
+        );
+        assert_eq!(tracked_rows(&wallet_manager, wallet_id).await, 0);
+        assert_eq!(
+            second.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Free,
+            "no fence of the old build is left on the new generation"
+        );
+
+        let rebuild = broadcast_registration_lock(&manager, &signer.inner).await;
+        assert!(rebuild.is_ok(), "{rebuild:?}");
+        assert_eq!(manager.broadcaster.calls(), 1);
+        assert_eq!(tracked_rows(&wallet_manager, wallet_id).await, 1);
+    }
+
+    /// Records, from inside `broadcast`, whether a teardown of `generation`
+    /// could enter its gate, then parks until `release`.
+    struct TeardownProbeBroadcaster {
+        generation: Arc<WalletGeneration>,
+        teardown_blocked: Mutex<Option<bool>>,
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl TransactionBroadcaster for TeardownProbeBroadcaster {
+        async fn broadcast(&self, transaction: &Transaction) -> Result<Txid, BroadcastError> {
+            let blocked = tokio::time::timeout(Duration::ZERO, self.generation.teardown_guard())
+                .await
+                .is_err();
+            *self.teardown_blocked.lock().expect("probe mutex") = Some(blocked);
+            self.entered.wait().await;
+            self.release.wait().await;
+            Ok(transaction.txid())
+        }
+    }
+
+    /// A teardown that starts while the lock is mid-broadcast waits for the
+    /// build to return, so the row reaches `Broadcast` before the wallet goes.
+    #[tokio::test]
+    async fn build_holds_lifecycle_gate_through_broadcast() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (wallet_manager, wallet_id, generation, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let broadcaster = Arc::new(TeardownProbeBroadcaster {
+            generation: Arc::clone(&generation),
+            teardown_blocked: Mutex::new(None),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (manager, persistence) = asset_lock_manager_over(
+            Arc::clone(&wallet_manager),
+            wallet_id,
+            Arc::clone(&broadcaster),
+        );
+        let build_returned = Arc::new(AtomicBool::new(false));
+
+        let build = async {
+            let result = broadcast_registration_lock(&manager, &signer).await;
+            build_returned.store(true, Ordering::SeqCst);
+            result
+        };
+        let teardown = async {
+            entered.wait().await;
+            let remover = tokio::spawn({
+                let wallet_manager = Arc::clone(&wallet_manager);
+                let generation = Arc::clone(&generation);
+                let build_returned = Arc::clone(&build_returned);
+                async move {
+                    let _teardown = generation.teardown_guard().await;
+                    let after_build = build_returned.load(Ordering::SeqCst);
+                    let removed = wallet_manager.write().await.remove_wallet(&wallet_id);
+                    (after_build, removed.is_ok())
+                }
+            });
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !remover.is_finished(),
+                "teardown must wait for the in-flight broadcast"
+            );
+            release.wait().await;
+            remover.await.expect("remover task")
+        };
+        let (result, (after_build, removed)) = tokio::join!(build, teardown);
+
+        let (_, out_point) = result.expect("the lock is sent");
+        assert_eq!(
+            *broadcaster.teardown_blocked.lock().expect("probe mutex"),
+            Some(true),
+            "inside the broadcast, the generation's teardown cannot enter its gate"
+        );
+        assert!(
+            after_build,
+            "teardown entered its gate only after the build returned"
+        );
+        assert!(removed);
+        let reached_broadcast = persistence
+            .stored
+            .lock()
+            .expect("capturing persistence mutex")
+            .iter()
+            .filter_map(|cs| cs.asset_locks.as_ref())
+            .filter_map(|al| al.asset_locks.get(&out_point))
+            .any(|entry| entry.status == AssetLockStatus::Broadcast);
+        assert!(reached_broadcast, "the row advanced before the wallet left");
+    }
+
+    /// Removes the wallet through the inner manager from inside `broadcast`,
+    /// bypassing the lifecycle gate as the load rollback does, then accepts.
+    struct RemovingBroadcaster {
+        wallet_manager: Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+        wallet_id: WalletId,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TransactionBroadcaster for RemovingBroadcaster {
+        async fn broadcast(&self, transaction: &Transaction) -> Result<Txid, BroadcastError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.wallet_manager
+                .write()
+                .await
+                .remove_wallet(&self.wallet_id)
+                .expect("wallet present");
+            Ok(transaction.txid())
+        }
+    }
+
+    /// A lock that went out stays a sent lock when its wallet leaves before
+    /// the status advance: the build reports the send, never
+    /// `WalletNotFound`, and the `Built` row it queued before the broadcast
+    /// is what a reload resumes.
+    #[tokio::test]
+    async fn post_broadcast_removal_keeps_the_sent_status() {
+        let (wallet_manager, wallet_id, _, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let broadcaster = Arc::new(RemovingBroadcaster {
+            wallet_manager: Arc::clone(&wallet_manager),
+            wallet_id,
+            calls: Default::default(),
+        });
+        let (manager, persistence) = asset_lock_manager_over(
+            Arc::clone(&wallet_manager),
+            wallet_id,
+            Arc::clone(&broadcaster),
+        );
+
+        let result = broadcast_registration_lock(&manager, &signer).await;
+
+        let (_, out_point) = result.expect("a sent lock is reported as sent");
+        assert_eq!(
+            broadcaster.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let queued_built = persistence
+            .stored
+            .lock()
+            .expect("capturing persistence mutex")
+            .iter()
+            .filter_map(|cs| cs.asset_locks.as_ref())
+            .filter_map(|al| al.asset_locks.get(&out_point))
+            .any(|entry| entry.status == AssetLockStatus::Built);
+        assert!(queued_built);
+    }
+
+    /// Runs `hook` once, inside the first store that carries funding-pool
+    /// snapshots: the build's pool persist, after its lifecycle gate and
+    /// before its tracking write. The build holds no manager guard there.
+    struct PoolStoreHookPersistence {
+        inner: CapturingPersistence,
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl PlatformWalletPersistence for PoolStoreHookPersistence {
+        fn store(
+            &self,
+            wallet_id: WalletId,
+            changeset: PlatformWalletChangeSet,
+        ) -> Result<(), PersistenceError> {
+            if !changeset.account_address_pools.is_empty() {
+                let hook = self.hook.lock().expect("hook mutex").take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            self.inner.store(wallet_id, changeset)
+        }
+
+        fn flush(&self, wallet_id: WalletId) -> Result<(), PersistenceError> {
+            self.inner.flush(wallet_id)
+        }
+
+        fn load(&self) -> Result<ClientStartState, PersistenceError> {
+            self.inner.load()
+        }
+    }
+
+    fn asset_lock_manager_with_pool_store_hook(
+        wallet_manager: Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+        wallet_id: WalletId,
+        hook: Box<dyn FnOnce() + Send>,
+    ) -> (
+        Arc<AssetLockManager<CountingOkBroadcaster>>,
+        Arc<PoolStoreHookPersistence>,
+    ) {
+        let persistence = Arc::new(PoolStoreHookPersistence {
+            inner: CapturingPersistence::default(),
+            hook: Mutex::new(Some(hook)),
+        });
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let manager = Arc::new(AssetLockManager::new(
+            sdk,
+            wallet_manager,
+            wallet_id,
+            Arc::new(Notify::new()),
+            Arc::new(CountingOkBroadcaster::default()),
+            WalletPersister::new(
+                wallet_id,
+                Arc::clone(&persistence) as Arc<dyn PlatformWalletPersistence>,
+            ),
+        ));
+        (manager, persistence)
+    }
+
+    /// A removal that bypasses the lifecycle gate — the load rollback, or a
+    /// host writing through the inner `WalletManager` — after the gate's
+    /// check: the generation-bound tracking write finds no wallet, and the
+    /// lock is refused before its broadcast.
+    #[tokio::test]
+    async fn inner_manager_removal_before_tracking_sends_nothing() {
+        let (wallet_manager, wallet_id, generation, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let funded = the_only_funded_outpoint(&wallet_manager, wallet_id).await;
+        let hook = {
+            let wallet_manager = Arc::clone(&wallet_manager);
+            Box::new(move || {
+                wallet_manager
+                    .try_write()
+                    .expect("the pool snapshot released the manager lock")
+                    .remove_wallet(&wallet_id)
+                    .expect("wallet present");
+            })
+        };
+        let (manager, persistence) =
+            asset_lock_manager_with_pool_store_hook(Arc::clone(&wallet_manager), wallet_id, hook);
+
+        let result = broadcast_registration_lock(&manager, &signer).await;
+
+        assert!(
+            matches!(result, Err(PlatformWalletError::WalletRemovedBeforeSend(_))),
+            "{result:?}"
+        );
+        assert_eq!(manager.broadcaster.calls(), 0, "nothing reaches the wire");
+        assert!(!stored_any_asset_lock_row(&persistence.inner));
+        assert_eq!(
+            generation.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Free
+        );
+    }
+
+    /// As above, with the wallet re-created under the same id: only the
+    /// generation-bound tracking write tells the new generation from the
+    /// build's, so the row never lands on it and nothing is sent.
+    #[tokio::test]
+    async fn inner_manager_recreation_before_tracking_sends_nothing() {
+        let (wallet_manager, wallet_id, _, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let (_first, fences) = rehome_onto_shared_fences(&wallet_manager, wallet_id).await;
+        let funded = the_only_funded_outpoint(&wallet_manager, wallet_id).await;
+        let restored = snapshot_for_recreation(&wallet_manager, wallet_id).await;
+        let second = Arc::new(Mutex::new(None));
+        let hook = {
+            let wallet_manager = Arc::clone(&wallet_manager);
+            let second = Arc::clone(&second);
+            Box::new(move || {
+                let generation = recreate_under_the_same_id(
+                    &mut wallet_manager
+                        .try_write()
+                        .expect("the pool snapshot released the manager lock"),
+                    wallet_id,
+                    restored,
+                    fences,
+                );
+                *second.lock().expect("generation slot") = Some(generation);
+            })
+        };
+        let (manager, persistence) =
+            asset_lock_manager_with_pool_store_hook(Arc::clone(&wallet_manager), wallet_id, hook);
+
+        let result = broadcast_registration_lock(&manager, &signer).await;
+
+        assert!(
+            matches!(result, Err(PlatformWalletError::WalletRemovedBeforeSend(_))),
+            "{result:?}"
+        );
+        assert_eq!(manager.broadcaster.calls(), 0, "nothing reaches the wire");
+        assert!(!stored_any_asset_lock_row(&persistence.inner));
+        assert_eq!(
+            tracked_rows(&wallet_manager, wallet_id).await,
+            0,
+            "the old build's row never lands on the new generation"
+        );
+        let second = second
+            .lock()
+            .expect("generation slot")
+            .clone()
+            .expect("the hook ran");
+        assert_eq!(
+            second.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Free
+        );
+
+        let rebuild = broadcast_registration_lock(&manager, &signer).await;
+        assert!(rebuild.is_ok(), "{rebuild:?}");
+        assert_eq!(manager.broadcaster.calls(), 1);
     }
 }

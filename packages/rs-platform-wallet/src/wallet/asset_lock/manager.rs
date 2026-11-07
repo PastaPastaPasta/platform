@@ -74,6 +74,12 @@ pub struct AssetLockManager<B: TransactionBroadcaster + ?Sized> {
     /// span. Deliberately NOT held across the broadcast/proof-wait — only the
     /// snapshot ordering needs serialization.
     ///
+    /// Lock order: this mutex, then the build's wallet-generation lifecycle
+    /// gate (`WalletGeneration::payment_guard`), then `wallet_manager`. The
+    /// build enters the gate while it still holds this mutex; nothing that
+    /// holds the gate or the manager lock ever waits for this mutex, and
+    /// teardown, which takes the gate's exclusive side, never takes it.
+    ///
     /// Shared (`Arc`) so a [`shared_handle`](Self::shared_handle) sees the
     /// same gate.
     pub(super) build_persist_serial: Arc<tokio::sync::Mutex<()>>,
@@ -145,6 +151,12 @@ pub struct AssetLockManager<B: TransactionBroadcaster + ?Sized> {
     /// yet have collected its pool snapshot.
     #[cfg(test)]
     pub(super) build_serial_gate: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only count of builds that passed the liveness check before the
+    /// wallet-generation lifecycle gate and are about to enter it. Lets the
+    /// removal tests synchronize on "the build is at the gate" instead of
+    /// assuming a scheduling order.
+    #[cfg(test)]
+    pub(super) lifecycle_gate_arrivals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
@@ -170,6 +182,8 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             mined_height_locator: Arc::new(NoMinedHeightLocator),
             #[cfg(test)]
             build_serial_gate: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            lifecycle_gate_arrivals: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -205,6 +219,8 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             mined_height_locator: Arc::clone(&self.mined_height_locator),
             #[cfg(test)]
             build_serial_gate: Arc::clone(&self.build_serial_gate),
+            #[cfg(test)]
+            lifecycle_gate_arrivals: Arc::clone(&self.lifecycle_gate_arrivals),
         }
     }
 
