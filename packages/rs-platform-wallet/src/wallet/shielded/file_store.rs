@@ -89,7 +89,7 @@ impl From<FileShieldedStoreError> for PlatformWalletError {
                 reason,
             },
             FileShieldedStoreError::Disposition(refusal) => {
-                Self::ShieldedStoreError(refusal.to_string())
+                Self::ShieldedDispositionRefused(refusal)
             }
         }
     }
@@ -2578,6 +2578,27 @@ mod tests {
             contract_survives_reopen("disposition_unattributable", |store| {
                 disposition_contract::shared_note_resolves_unattributable(store)
             });
+        }
+
+        #[test]
+        fn disposition_refusals_stay_typed_in_platform_wallet_error() {
+            for refusal in [
+                ShieldedDispositionRefusal::RedriveNotFound {
+                    activity_id: [0x71; 32],
+                },
+                ShieldedDispositionRefusal::Unreadable {
+                    subwallet: SubwalletId::new([0x72; 32], 4),
+                    st_hash: [0x73; 32],
+                    detail: "unknown".to_owned(),
+                },
+            ] {
+                let error: PlatformWalletError =
+                    FileShieldedStoreError::Disposition(refusal.clone()).into();
+                assert!(
+                    matches!(&error, PlatformWalletError::ShieldedDispositionRefused(typed) if *typed == refusal),
+                    "{error:?}"
+                );
+            }
         }
 
         /// The typed refusal for an unreadable stored disposition, naming its key.

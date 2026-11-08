@@ -973,6 +973,15 @@ pub enum PlatformWalletError {
     #[error("Shielded store error: {0}")]
     ShieldedStoreError(String),
 
+    /// The shielded store refused a spend-disposition write, redrive
+    /// resolution or read, and changed nothing. The refusal stays typed so a
+    /// caller can match it, for example to acknowledge an
+    /// [`Unreadable`](crate::wallet::shielded::ShieldedDispositionRefusal::Unreadable)
+    /// row by its key.
+    #[cfg(feature = "shielded")]
+    #[error("Shielded spend disposition refused: {0}")]
+    ShieldedDispositionRefused(crate::wallet::shielded::ShieldedDispositionRefusal),
+
     #[error("Shielded Merkle witness unavailable: {0}")]
     ShieldedMerkleWitnessUnavailable(String),
 
