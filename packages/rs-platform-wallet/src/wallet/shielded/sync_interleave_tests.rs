@@ -769,6 +769,56 @@ async fn a_clear_before_the_pass_guard_leaves_the_store_reset() {
     remove_store_files(&path);
 }
 
+/// A pass that lists the wallets while a Clear waits for another pass's store
+/// guard: it lists them only after the Clear, so neither pass leaves a
+/// watermark or a commitment in the reset store.
+#[tokio::test]
+async fn a_pass_listing_during_a_clear_writes_nothing_into_the_reset_store() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+
+    let key = pass_pause::key(coordinator.store());
+    let in_guard = pass_pause::arm_at(key, Point::AfterWatermarkRead);
+    let first = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&in_guard).await;
+    let clear = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.clear().await }
+    });
+    // Let the Clear start and wait for the first pass's store guard.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let listed = pass_pause::arm_at(key, Point::AfterListSnapshot);
+    let second = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    // A pass that lists during the Clear stops here; one that waits for it
+    // does not get here before the Clear ends.
+    let _ = tokio::time::timeout(Duration::from_secs(2), listed.reached.acquire()).await;
+    listed.resume.add_permits(1);
+    in_guard.resume.add_permits(1);
+    first.await.unwrap();
+    clear.await.unwrap().unwrap();
+    second.await.unwrap();
+
+    let store = coordinator.store().read().await;
+    assert_eq!(
+        store.last_synced_note_index(id).unwrap(),
+        0,
+        "no pass leaves a watermark in the reset store"
+    );
+    assert_eq!(store.tree_size().unwrap(), 0, "the tree stays reset");
+    drop(store);
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
 /// A wallet removed and added again from an older host snapshot keeps its
 /// inputs held until its first pass: before it, neither the executed input
 /// nor the never-executed one is selectable or counted, even beside a
