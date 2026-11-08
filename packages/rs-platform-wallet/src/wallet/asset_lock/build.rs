@@ -4081,6 +4081,11 @@ mod tests {
                 assert_eq!(manager.broadcaster.calls(), 0);
                 assert!(manager.list_tracked_locks().await.is_empty());
                 assert!(!stored_any_asset_lock_row(&persistence));
+                // The refused drain released its reservation and its fence:
+                // a lock that fits funds from the same coins at once.
+                let retry = broadcast_exact_registration_lock(&manager, &signer, 500_000).await;
+                assert!(retry.is_ok(), "{retry:?}");
+                assert_eq!(manager.broadcaster.calls(), 1);
             } else {
                 assert!(result.is_ok(), "{result:?}");
                 assert_eq!(manager.broadcaster.calls(), 1);
