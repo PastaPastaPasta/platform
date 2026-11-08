@@ -267,6 +267,10 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
             // so a concurrent loader can't slip between them (TOCTOU).
             {
                 let mut wm = self.wallet_manager.write().await;
+                // A failed load's rollback can still be waiting on lifecycle
+                // gates for this id (as long as a broadcast in flight). A load
+                // that skips it here may return `Ok`, and that rollback then
+                // removes the wallet until the next load.
                 if wm.get_wallet(&wallet_id).is_some() {
                     continue 'load;
                 }
@@ -502,9 +506,13 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
     /// Only the gate is shared with that method; none of its registry teardown
     /// runs here. The rollback waits for a payment operation already inside the
     /// gate to return, and one that enters after it finds its wallet gone. The
-    /// gates are taken one after another, before the manager lock and with no
-    /// other lock held. Nothing in this crate holds two generations' gates at
-    /// once, so the order between them cannot deadlock. A wallet that never
+    /// gates are taken one after another, before the manager lock, and each is
+    /// kept while the next is awaited, so the rollback holds earlier
+    /// generations' gates while it waits for a later one. That cannot deadlock:
+    /// every other user of a gate takes one wallet generation's gate and
+    /// nothing else while it waits, so no waiter holds a gate this rollback
+    /// still needs, and nothing waits on one it holds while holding another. A
+    /// wallet that never
     /// reached `self.wallets` has no handle anyone could operate on, and is
     /// removed from the inner manager without a gate.
     ///

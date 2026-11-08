@@ -6222,8 +6222,8 @@ mod tests {
             }
         }
 
-        /// A row over the cap: 100 coins of 10 000 duffs cover 1 000 000
-        /// only before the fee, so the lock takes more than 100 inputs.
+        /// A row over the cap: covering 1 000 000 plus the fee from 120 coins
+        /// of 10 000 duffs takes more than 100 of them.
         async fn oversized(status: AssetLockStatus) -> Self {
             let row = Self::tracked(120, 1_000_000, status).await;
             assert!(

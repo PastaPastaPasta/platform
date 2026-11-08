@@ -4012,7 +4012,8 @@ mod tests {
     /// broadcast, and its inputs stay spendable.
     #[tokio::test]
     async fn should_refuse_an_exact_lock_over_100_inputs() {
-        // 100 coins of 10 000 duffs cover 1 000 000 only before the fee.
+        // Covering 1 000 000 plus the fee from 120 coins of 10 000 duffs takes
+        // more than 100 of them.
         let (manager, signer, persistence) = small_coin_asset_lock_manager(120).await;
 
         let result = broadcast_exact_registration_lock(&manager, &signer, 1_000_000).await;
