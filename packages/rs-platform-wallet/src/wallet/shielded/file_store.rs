@@ -287,6 +287,16 @@ impl FileBackedShieldedStore {
             .map_err(|e| {
                 FileShieldedStoreError::Storage(format!("create spend dispositions table: {e}"))
             })?;
+        // One transition has one piece of evidence across a wallet's accounts.
+        pending_conn
+            .execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS shielded_spend_dispositions_by_transition \
+                 ON shielded_spend_dispositions (wallet_id, st_hash)",
+                [],
+            )
+            .map_err(|e| {
+                FileShieldedStoreError::Storage(format!("create spend dispositions index: {e}"))
+            })?;
         let mut store = Self {
             tree: Mutex::new(tree),
             path,
@@ -648,8 +658,9 @@ impl FileBackedShieldedStore {
 
     /// Read the unacknowledged disposition for `st_hash` in any of the
     /// wallet's accounts. A stored value this build cannot decode, or a second
-    /// account holding evidence for the same transition, is an error, so it
-    /// is never compared against or overwritten.
+    /// account holding evidence for the same transition (which the schema's
+    /// unique index rules out), is an error, so it is never compared against
+    /// or overwritten.
     fn read_disposition(
         conn: &rusqlite::Connection,
         wallet_id: WalletId,
@@ -689,18 +700,48 @@ impl FileBackedShieldedStore {
     /// `wallet_id, account_index, st_hash, activity_id, disposition, reason, at,
     /// nullifiers`.
     /// The outer result is SQLite's; the inner one fails closed on any value
-    /// this build does not recognise.
+    /// this build does not recognise, as the typed
+    /// [`ShieldedDispositionRefusal::Unreadable`] naming the row's key so it
+    /// can be acknowledged, or as `RecoveryCorrupted` when the key itself
+    /// cannot be read.
     fn decode_disposition_row(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<Result<ShieldedSpendDispositionRecord, FileShieldedStoreError>> {
         let stored_account = row.get::<_, u32>(1).ok();
-        let stored_st_hash = row
-            .get::<_, Vec<u8>>(2)
-            .map(hex::encode)
-            .unwrap_or_else(|_| "unreadable".to_owned());
-        let corrupted = |reason: String| FileShieldedStoreError::RecoveryCorrupted {
-            account_index: stored_account,
-            reason: format!("spend disposition for transition {stored_st_hash}: {reason}"),
+        let stored_wallet = row
+            .get::<_, Vec<u8>>(0)
+            .ok()
+            .and_then(|wallet_id| <[u8; 32]>::try_from(wallet_id.as_slice()).ok());
+        let stored_st_hash = row.get::<_, Vec<u8>>(2).ok();
+        let stored_key = match (
+            stored_wallet,
+            stored_account,
+            stored_st_hash
+                .as_deref()
+                .and_then(|st_hash| <[u8; 32]>::try_from(st_hash).ok()),
+        ) {
+            (Some(wallet_id), Some(account_index), Some(st_hash)) => {
+                Some((SubwalletId::new(wallet_id, account_index), st_hash))
+            }
+            _ => None,
+        };
+        let corrupted = |detail: String| match stored_key {
+            Some((subwallet, st_hash)) => {
+                FileShieldedStoreError::Disposition(ShieldedDispositionRefusal::Unreadable {
+                    subwallet,
+                    st_hash,
+                    detail,
+                })
+            }
+            None => FileShieldedStoreError::RecoveryCorrupted {
+                account_index: stored_account,
+                reason: format!(
+                    "spend disposition for transition {}: {detail}",
+                    stored_st_hash
+                        .as_deref()
+                        .map_or_else(|| "unreadable".to_owned(), hex::encode)
+                ),
+            },
         };
         let raw: rusqlite::Result<_> = (|| {
             Ok((
@@ -2533,6 +2574,27 @@ mod tests {
         }
 
         #[test]
+        fn shared_note_resolves_unattributable() {
+            contract_survives_reopen("disposition_unattributable", |store| {
+                disposition_contract::shared_note_resolves_unattributable(store)
+            });
+        }
+
+        /// The typed refusal for an unreadable stored disposition, naming its key.
+        fn unreadable<T: std::fmt::Debug>(
+            result: Result<T, FileShieldedStoreError>,
+        ) -> (SubwalletId, [u8; 32]) {
+            match result {
+                Err(FileShieldedStoreError::Disposition(
+                    ShieldedDispositionRefusal::Unreadable {
+                        subwallet, st_hash, ..
+                    },
+                )) => (subwallet, st_hash),
+                other => panic!("expected an unreadable disposition, got {other:?}"),
+            }
+        }
+
+        #[test]
         fn executed_hold_reports_spends_and_lifts_on_ack() {
             contract_survives_reopen("disposition_hold_ack", |store| {
                 disposition_contract::executed_hold_reports_spends_and_lifts_on_ack(store)
@@ -2678,10 +2740,11 @@ mod tests {
                     .unwrap();
             }
             let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-            assert!(store.dispositions(id.wallet_id).is_err());
+            let (subwallet, st_hash) = unreadable(store.dispositions(id.wallet_id));
+            assert_eq!((subwallet, st_hash), (id, redrive.st_hash()));
             restore_snapshot(&mut store, id, &[input]);
             assert!(unspent(&store, id).is_empty());
-            assert!(store.ack_disposition(id, &redrive.st_hash()).unwrap());
+            assert!(store.ack_disposition(subwallet, &st_hash).unwrap());
             assert_eq!(unspent(&store, id), BTreeSet::from([input]));
             assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
             drop(store);
@@ -2701,6 +2764,7 @@ mod tests {
                 NotExecuted(NotExecutedReason::Pruned),
                 Unresolved(UnresolvedReason::DeserializeDropped),
                 Unresolved(UnresolvedReason::Purged),
+                Unresolved(UnresolvedReason::Unattributable),
             ];
             let written = {
                 let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
@@ -2732,7 +2796,7 @@ mod tests {
             {
                 let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen 2");
                 assert_eq!(store.dispositions(id.wallet_id).unwrap(), written[1..]);
-                for tag in 2..=7u8 {
+                for tag in 2..=8u8 {
                     assert!(store.ack_disposition(id, &[tag; 32]).unwrap());
                 }
             }
@@ -2965,33 +3029,27 @@ mod tests {
                     ],
                 )
                 .unwrap();
-            let corrupted = |result: Result<_, FileShieldedStoreError>| {
-                matches!(
-                    result,
-                    Err(FileShieldedStoreError::RecoveryCorrupted {
-                        account_index: Some(3),
-                        ..
-                    })
-                )
-            };
+            let key = (id, redrive.st_hash());
 
-            assert!(corrupted(store.dispositions(id.wallet_id).map(|_| ())));
-            assert!(corrupted(
-                store
-                    .record_disposition(
-                        id,
-                        &redrive.st_hash(),
-                        &redrive.activity_id,
-                        ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
-                    )
-                    .map(|_| ())
-            ));
+            assert_eq!(unreadable(store.dispositions(id.wallet_id)), key);
+            assert_eq!(
+                unreadable(store.record_disposition(
+                    id,
+                    &redrive.st_hash(),
+                    &redrive.activity_id,
+                    ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
+                )),
+                key
+            );
             arm_reserved(&mut store, id, &redrive);
-            assert!(corrupted(
-                store
-                    .resolve_redrive(id, &redrive.activity_id, ShieldedSpendDisposition::Executed)
-                    .map(|_| ())
-            ));
+            assert_eq!(
+                unreadable(store.resolve_redrive(
+                    id,
+                    &redrive.activity_id,
+                    ShieldedSpendDisposition::Executed
+                )),
+                key
+            );
             assert_eq!(store.pending_redrives(id).unwrap(), vec![redrive.clone()]);
             assert!(unspent(&store, id).is_empty());
             drop(store);
@@ -3009,7 +3067,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(reason, "a_later_reason", "the row is kept as written");
             }
-            assert!(store.ack_disposition(id, &redrive.st_hash()).unwrap());
+            let (subwallet, st_hash) = unreadable(store.dispositions(id.wallet_id));
+            assert!(store.ack_disposition(subwallet, &st_hash).unwrap());
             assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
             drop(store);
             remove_store_files(&path);
@@ -3028,7 +3087,7 @@ mod tests {
             let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
             {
                 let conn = store.pending_conn.lock().unwrap();
-                for account in [0, 1] {
+                let insert = |account: u32| {
                     conn.execute(
                         "INSERT INTO shielded_spend_dispositions \
                          (wallet_id, account_index, st_hash, activity_id, disposition, reason, at) \
@@ -3040,8 +3099,17 @@ mod tests {
                             redrive.activity_id.as_slice(),
                         ],
                     )
+                };
+                insert(0).unwrap();
+                assert!(
+                    insert(1).is_err(),
+                    "the schema holds one disposition per transition across a wallet's accounts"
+                );
+                // Every open creates that index; without it, two rows for one
+                // transition still fail closed.
+                conn.execute_batch("DROP INDEX shielded_spend_dispositions_by_transition;")
                     .unwrap();
-                }
+                insert(1).unwrap();
             }
             let corrupted = |result: Result<(), FileShieldedStoreError>| {
                 matches!(
@@ -3081,12 +3149,12 @@ mod tests {
 
         #[test]
         fn undecodable_stored_fields_fail_the_read() {
-            for corruption in [
-                "at = -1",
-                "account_index = -1",
-                "account_index = 4294967296",
-                "reason = 'a_later_reason'",
-                "disposition = 'unresolved', reason = 'refused'",
+            for (corruption, key_readable) in [
+                ("at = -1", true),
+                ("account_index = -1", false),
+                ("account_index = 4294967296", false),
+                ("reason = 'a_later_reason'", true),
+                ("disposition = 'unresolved', reason = 'refused'", true),
             ] {
                 let path = temp_tree_path("disposition_undecodable");
                 let id = SubwalletId::new([0xD6; 32], 0);
@@ -3108,13 +3176,21 @@ mod tests {
                     ))
                     .unwrap();
 
-                assert!(
-                    matches!(
-                        store.dispositions(id.wallet_id),
-                        Err(FileShieldedStoreError::RecoveryCorrupted { .. })
-                    ),
-                    "{corruption} must fail the read"
-                );
+                if key_readable {
+                    assert_eq!(
+                        unreadable(store.dispositions(id.wallet_id)),
+                        (id, [0x65; 32]),
+                        "{corruption} must fail the read, naming the row to acknowledge"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            store.dispositions(id.wallet_id),
+                            Err(FileShieldedStoreError::RecoveryCorrupted { .. })
+                        ),
+                        "{corruption} must fail the read"
+                    );
+                }
                 assert_eq!(
                     count(
                         &store.pending_conn.lock().unwrap(),
@@ -3165,6 +3241,7 @@ mod tests {
                 (blob, blob, blob, "'executed'", "'refused'", none),
                 (blob, blob, blob, "'not_executed'", "NULL", none),
                 (blob, blob, blob, "'unresolved'", "NULL", none),
+                (blob, "NULL", blob, "'executed'", "NULL", none),
                 (blob, blob, blob, "'executed'", "NULL", "NULL"),
                 (blob, blob, blob, "'executed'", "NULL", short),
                 (blob, blob, blob, "'executed'", "NULL", text),

@@ -238,6 +238,13 @@ pub enum UnresolvedReason {
     /// A wallet or account purge removed the record without proof of either
     /// outcome.
     Purged,
+    /// Platform reported one of the record's notes spent, or showed its
+    /// outputs, but the record did not hold that evidence alone: another
+    /// armed record reserved one of the same notes (so `Executed` is refused
+    /// with [`ShieldedDispositionRefusal::ReservationShared`]), one of its
+    /// notes was no longer reserved, or one was already marked spent (as a
+    /// restored snapshot does). The spend may belong to another transition.
+    Unattributable,
 }
 
 /// A stored disposition string that this build does not know. Decoding never
@@ -272,6 +279,7 @@ impl ShieldedSpendDisposition {
             Self::NotExecuted(NotExecutedReason::Pruned) => Some("pruned"),
             Self::Unresolved(UnresolvedReason::DeserializeDropped) => Some("deserialize_dropped"),
             Self::Unresolved(UnresolvedReason::Purged) => Some("purged"),
+            Self::Unresolved(UnresolvedReason::Unattributable) => Some("unattributable"),
         }
     }
 
@@ -295,6 +303,9 @@ impl ShieldedSpendDisposition {
                 Some(Self::Unresolved(UnresolvedReason::DeserializeDropped))
             }
             ("unresolved", Some("purged")) => Some(Self::Unresolved(UnresolvedReason::Purged)),
+            ("unresolved", Some("unattributable")) => {
+                Some(Self::Unresolved(UnresolvedReason::Unattributable))
+            }
             _ => None,
         };
         decoded.ok_or_else(|| UnknownDispositionValue {
@@ -344,7 +355,8 @@ pub enum ShieldedDispositionRefusal {
     IdentityDebit { activity_id: [u8; 32] },
     /// [`ShieldedSpendDisposition::Executed`] was asked for while another
     /// armed redrive also reserves one of this record's notes, so a spent
-    /// nullifier does not show which of the two executed.
+    /// nullifier does not show which of the two executed. Resolving it as
+    /// [`UnresolvedReason::Unattributable`] states exactly that.
     #[error(
         "shielded redrive for activity {} shares a reserved note with activity {}; its execution is not provable",
         hex::encode(activity_id),
@@ -353,6 +365,22 @@ pub enum ShieldedDispositionRefusal {
     ReservationShared {
         activity_id: [u8; 32],
         other_activity_id: [u8; 32],
+    },
+    /// A stored disposition for `st_hash` in `subwallet` cannot be read by
+    /// this build. It is kept as written and never defaulted, skipped or
+    /// overwritten; reads of its wallet's dispositions and writes for its
+    /// transition are refused until
+    /// [`ShieldedStore::ack_disposition`]`(subwallet, st_hash)` removes it.
+    /// The notes it holds stay excluded until then.
+    #[error(
+        "unreadable shielded spend disposition for account {} transition {}: {detail}",
+        subwallet.account_index,
+        hex::encode(st_hash)
+    )]
+    Unreadable {
+        subwallet: SubwalletId,
+        st_hash: [u8; 32],
+        detail: String,
     },
     /// A redrive for this transition or activity is still armed in the
     /// wallet, so the disposition must be written by resolving it.
@@ -665,7 +693,8 @@ pub trait ShieldedStore: Send + Sync {
     /// accounts, ordered by account index then `st_hash`. Purges leave
     /// dispositions in place, so this includes accounts that are no longer
     /// bound. A stored value this build cannot decode is an error, never
-    /// skipped or defaulted.
+    /// skipped or defaulted: [`ShieldedDispositionRefusal::Unreadable`] names
+    /// the row to acknowledge whenever its key can be read.
     fn dispositions(
         &self,
         wallet_id: WalletId,
@@ -2311,6 +2340,56 @@ pub(super) mod disposition_contract {
         vec![id.wallet_id]
     }
 
+    /// A record refused `Executed` because another armed record shares one
+    /// of its notes resolves honestly as `Unattributable`, which holds
+    /// nothing and leaves the shared reservation with the other record.
+    pub(crate) fn shared_note_resolves_unattributable<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xCF; 32], 0);
+        let shared = [0xB8; 32];
+        let first = spend(0x20, &[shared, [0xB9; 32]]);
+        let second = PendingRedrive {
+            anchor: [0x5C; 32],
+            ..spend(0x21, &[shared, [0xBA; 32]])
+        };
+        arm_reserved(store, id, &first);
+        arm_reserved(store, id, &second);
+        assert!(matches!(
+            refusal(store.resolve_redrive(
+                id,
+                &first.activity_id,
+                ShieldedSpendDisposition::Executed
+            )),
+            ShieldedDispositionRefusal::ReservationShared { .. }
+        ));
+
+        let unattributable = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable);
+        assert_eq!(
+            store
+                .resolve_redrive(id, &first.activity_id, unattributable)
+                .unwrap(),
+            first
+        );
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![second.clone()]);
+        assert_eq!(unspent(store, id), BTreeSet::from([[0xB9; 32]]));
+        let mut stale = store.stale_pending_spends(id).unwrap();
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                (shared, second.anchor, Some(second.activity_id)),
+                ([0xBA; 32], second.anchor, Some(second.activity_id)),
+            ]
+        );
+        let dispositions = store.dispositions(id.wallet_id).unwrap();
+        assert_eq!(dispositions.len(), 1);
+        assert_eq!(dispositions[0].st_hash, first.st_hash());
+        assert_eq!(dispositions[0].disposition, unattributable);
+        assert!(dispositions[0].held_nullifiers.is_empty());
+        vec![id.wallet_id]
+    }
+
     pub(crate) fn unresolved_roundtrips<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
         let id = SubwalletId::new([0xCB; 32], 2);
         let dropped = spend(0x1A, &[[0xB4; 32]]);
@@ -2318,11 +2397,15 @@ pub(super) mod disposition_contract {
         let deserialize_dropped =
             ShieldedSpendDisposition::Unresolved(UnresolvedReason::DeserializeDropped);
         let purged = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
+        let unattributable = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable);
         store
             .resolve_redrive(id, &dropped.activity_id, deserialize_dropped)
             .unwrap();
         assert!(store
             .record_disposition(id, &[0x1B; 32], &[0x1B; 32], purged)
+            .unwrap());
+        assert!(store
+            .record_disposition(id, &[0x1C; 32], &[0x1C; 32], unattributable)
             .unwrap());
 
         let got: Vec<_> = store
@@ -2334,6 +2417,7 @@ pub(super) mod disposition_contract {
         let mut expected = vec![
             (dropped.st_hash(), dropped.activity_id, deserialize_dropped),
             ([0x1B; 32], [0x1B; 32], purged),
+            ([0x1C; 32], [0x1C; 32], unattributable),
         ];
         expected.sort_by_key(|(st_hash, _, _)| *st_hash);
         assert_eq!(got, expected);
@@ -2978,6 +3062,11 @@ mod tests {
                 "unresolved",
                 Some("purged"),
             ),
+            (
+                Unresolved(UnresolvedReason::Unattributable),
+                "unresolved",
+                Some("unattributable"),
+            ),
         ];
         for (disposition, kind, reason) in table {
             assert_eq!(disposition.kind_str(), kind);
@@ -2991,6 +3080,7 @@ mod tests {
             ("executed", Some("refused")),
             ("not_executed", None),
             ("not_executed", Some("purged")),
+            ("not_executed", Some("unattributable")),
             ("unresolved", None),
             ("unresolved", Some("refused")),
             ("unresolved", Some("a_later_reason")),
@@ -3064,6 +3154,11 @@ mod tests {
     #[test]
     fn in_memory_ack_lifts_only_its_own_hold() {
         disposition_contract::ack_lifts_only_its_own_hold(&mut InMemoryShieldedStore::new());
+    }
+
+    #[test]
+    fn in_memory_shared_note_resolves_unattributable() {
+        disposition_contract::shared_note_resolves_unattributable(&mut InMemoryShieldedStore::new());
     }
 
     #[test]
