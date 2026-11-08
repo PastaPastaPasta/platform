@@ -77,8 +77,9 @@ pub struct AssetLockManager<B: TransactionBroadcaster + ?Sized> {
     /// Lock order: this mutex, then the build's wallet-generation lifecycle
     /// gate (`WalletGeneration::payment_guard`), then `wallet_manager`. The
     /// build enters the gate while it still holds this mutex; nothing that
-    /// holds the gate or the manager lock ever waits for this mutex, and
-    /// teardown, which takes the gate's exclusive side, never takes it.
+    /// holds the gate or the manager lock ever waits for this mutex, and the
+    /// removers that take the gate's exclusive side (teardown and a failed
+    /// load's rollback) never take it.
     ///
     /// Shared (`Arc`) so a [`shared_handle`](Self::shared_handle) sees the
     /// same gate.
