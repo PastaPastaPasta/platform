@@ -268,9 +268,10 @@ pub struct NetworkShieldedCoordinator {
     removals: WalletRemovals,
 }
 
-/// Per-wallet count of [`unregister_wallet`](NetworkShieldedCoordinator::unregister_wallet)
-/// calls, so a sync pass can skip a wallet removed after it took its
-/// subwallet list.
+/// Per-wallet count of removals, so a sync pass can skip a wallet removed
+/// after it took its subwallet list. A removal is an
+/// [`unregister_wallet`](NetworkShieldedCoordinator::unregister_wallet), or a
+/// re-bind that drops or re-keys one of the wallet's accounts.
 ///
 /// [`sync`](NetworkShieldedCoordinator::sync) lists the registered
 /// subwallets under `accounts.read` and takes the store write guard only
@@ -795,19 +796,26 @@ impl NetworkShieldedCoordinator {
             }
         }
 
-        // Persister FIRST, accounts second. `sync()` snapshots
-        // `accounts` at pass start and looks the persister up only
-        // when it queues the pass's changeset — with the reverse
-        // order a pass starting between the two inserts would see
-        // the subwallets but find no persister and silently drop
-        // the whole changeset ("no persister registered", observed
-        // on device as a scan pass whose discovered notes never
-        // reached the host). Registering the persister before the
-        // accounts makes "accounts visible ⇒ persister visible"
-        // hold at every interleaving.
-        self.persisters.write().await.insert(wallet_id, persister);
         {
             let mut accounts = self.accounts.write().await;
+            // A dropped or re-keyed account is a removal: a pass that
+            // listed the old registration must write nothing for it and
+            // hand the new persister nothing (see `WalletRemovals`).
+            // Bumped before the persister is replaced.
+            if !stale.is_empty() {
+                self.removals.record(wallet_id);
+            }
+            // Persister FIRST, accounts second, both under
+            // `accounts.write`. `sync()` snapshots `accounts` at pass
+            // start and looks the persister up only when it queues the
+            // pass's changeset — with the reverse order a pass starting
+            // between the two inserts would see the subwallets but find
+            // no persister and silently drop the whole changeset ("no
+            // persister registered", observed on device as a scan pass
+            // whose discovered notes never reached the host). This
+            // makes "accounts visible ⇒ persister visible" hold at
+            // every interleaving.
+            self.persisters.write().await.insert(wallet_id, persister);
             // Drop any prior subwallets for this wallet_id before
             // installing the new set so a re-bind with a different
             // account list doesn't leave orphan entries.

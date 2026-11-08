@@ -339,9 +339,19 @@ impl PlatformWalletPersistence for Host {
 /// Register [`WALLET`]'s account 0 with `host` as its persister, under the
 /// keys `register` uses.
 async fn register_with(coordinator: &NetworkShieldedCoordinator, host: &Arc<Host>) {
+    register_keys(coordinator, host, &[42; 64]).await;
+}
+
+/// Register [`WALLET`]'s account 0 with `host` as its persister, under the
+/// keys of `seed`.
+async fn register_keys(
+    coordinator: &NetworkShieldedCoordinator,
+    host: &Arc<Host>,
+    seed: &[u8; 64],
+) {
     let views = BTreeMap::from([(
         0,
-        OrchardKeySet::from_seed(&[42; 64], dashcore::Network::Testnet, 0)
+        OrchardKeySet::from_seed(seed, dashcore::Network::Testnet, 0)
             .expect("test viewing key")
             .viewing_keys(),
     )]);
@@ -666,6 +676,49 @@ async fn a_re_add_at_the_tip_lifts_the_holds_on_an_inline_host() {
 #[tokio::test]
 async fn a_re_add_at_the_tip_keeps_the_holds_on_a_buffering_host() {
     re_add_at_the_tip(Host::buffering()).await;
+}
+
+/// The wallet re-bound under new keys after a pass took its subwallet list
+/// but before the pass took the store guard: the pass writes nothing under
+/// the old keys, and hands the new registration's host nothing.
+#[tokio::test]
+async fn a_re_key_before_the_pass_guard_writes_nothing_for_the_old_key() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+
+    let pause = pass_pause::arm_at(
+        pass_pause::key(coordinator.store()),
+        Point::AfterListSnapshot,
+    );
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    let host = Host::inline();
+    register_keys(&coordinator, &host, &[43; 64]).await;
+    pause.resume.add_permits(1);
+    pass.await.unwrap();
+
+    assert_eq!(
+        coordinator
+            .store()
+            .read()
+            .await
+            .last_synced_note_index(id)
+            .unwrap(),
+        0,
+        "the pass writes no watermark under the old key"
+    );
+    assert!(
+        !host.took_any_for(id),
+        "the pass hands the new registration's host nothing"
+    );
+    drop(coordinator);
+    remove_store_files(&path);
 }
 
 /// A wallet removed and added again from an older host snapshot keeps its
