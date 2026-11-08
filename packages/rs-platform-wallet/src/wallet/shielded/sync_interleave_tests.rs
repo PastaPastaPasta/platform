@@ -561,6 +561,113 @@ async fn a_removal_before_the_scan_lift_keeps_the_holds() {
     remove_store_files(&path);
 }
 
+/// A wallet removed and added again under the same keys after a pass marked
+/// its holds as scanned, but before the pass hands its host the changeset:
+/// the re-added wallet's host gets nothing from that pass, and the holds the
+/// removal marked again wait for the re-added wallet's own scan.
+#[tokio::test]
+async fn a_removal_before_the_host_save_hands_the_new_host_nothing() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    re_add(
+        &coordinator,
+        &Host::inline(),
+        &snapshot_with_inputs_unspent(id),
+    )
+    .await;
+
+    let pause = pass_pause::arm_at(pass_pause::key(coordinator.store()), Point::BeforeHostSave);
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+    pause.resume.add_permits(1);
+    pass.await.unwrap();
+
+    assert!(
+        !host.took_any_for(id),
+        "the pass hands the re-added wallet's host nothing"
+    );
+    assert_inputs_held(
+        &coordinator,
+        id,
+        "the pass lifts no hold for a wallet removed since its list",
+    )
+    .await;
+    assert_holds_wait_for_a_scan(&coordinator, id).await;
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
+/// A wallet re-added from a snapshot at the tip, so its first pass finds
+/// nothing past the snapshot's watermark: the holds the removal left lift
+/// when the host commits inline, and stay when it only buffers.
+async fn re_add_at_the_tip(host: Arc<Host>) {
+    let path = tree_path();
+    let id = SubwalletId::new(WALLET, 0);
+    {
+        let live = coordinator_on(pool_sdk().await, &path);
+        register_with(&live, &Host::inline()).await;
+        live.mark_hydrated(WALLET, true).await;
+        let outcome = live.sync(true).await;
+        assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+        hold_inputs(&live, id).await;
+        live.unregister_wallet(WALLET).await;
+    }
+
+    let coordinator = coordinator_on(pool_sdk_from(SPENT_AT, CHUNK_WATERMARK).await, &path);
+    let snapshot = snapshot_at(
+        id,
+        &[
+            spent(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+        ],
+        POOL_SIZE,
+    );
+    re_add(&coordinator, &host, &snapshot).await;
+    assert_inputs_held(
+        &coordinator,
+        id,
+        "held inputs are not selectable before the pass",
+    )
+    .await;
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert!(!host.took_spent(id, SPENT_NULLIFIER));
+    if host.inline {
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+            "an inline host's pass lifts the holds"
+        );
+    } else {
+        assert_inputs_held(&coordinator, id, "a buffering host's pass lifts nothing").await;
+    }
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
+#[tokio::test]
+async fn a_re_add_at_the_tip_lifts_the_holds_on_an_inline_host() {
+    re_add_at_the_tip(Host::inline()).await;
+}
+
+#[tokio::test]
+async fn a_re_add_at_the_tip_keeps_the_holds_on_a_buffering_host() {
+    re_add_at_the_tip(Host::buffering()).await;
+}
+
 /// A wallet removed and added again from an older host snapshot keeps its
 /// inputs held until its first pass: before it, neither the executed input
 /// nor the never-executed one is selectable or counted, even beside a

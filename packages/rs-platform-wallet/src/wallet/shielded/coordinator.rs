@@ -275,22 +275,27 @@ pub struct NetworkShieldedCoordinator {
 /// [`sync`](NetworkShieldedCoordinator::sync) lists the registered
 /// subwallets under `accounts.read` and takes the store write guard only
 /// later, so a removal can complete in between. The pass records each listed
-/// wallet's count with the list and compares it under the store write guard,
-/// both in the pass and again before it lifts scanned holds after the host
-/// save. A changed count means the wallet was removed, and maybe added again
-/// under the same id, after the list was taken: the pass then saves no note,
-/// advances no watermark and lifts no hold for it. Checking that the wallet
-/// is still registered could not tell a same-id re-add from no removal.
+/// wallet's count with the list and compares it under the store write guard
+/// in the pass, under `persisters.read` when it hands the host its
+/// changeset, and under the store write guard again before it lifts scanned
+/// holds. A changed count means the wallet was removed, and maybe added
+/// again under the same id, after the list was taken: the pass then saves no
+/// note, advances no watermark, hands the host nothing and lifts no hold for
+/// it. Checking that the wallet is still registered could not tell a same-id
+/// re-add from no removal.
 ///
-/// A removal bumps the count under `accounts.write`, before its purge, so a
-/// list taken under `accounts.read` pairs with the count of that same
-/// registration. The purge needs the store write guard, so a removal that
-/// has not purged yet when the pass holds the guard waits for the pass, and
-/// one that has purged already changed the count.
+/// A removal bumps the count under `accounts.write`, before its purge and
+/// before it removes or replaces the wallet's persister, so a list taken
+/// under `accounts.read` pairs with the count of that same registration, and
+/// a persister installed after the list is only ever seen with the changed
+/// count. The purge needs the store write guard, so a removal that has not
+/// purged yet when the pass holds the guard waits for the pass, and one that
+/// has purged already changed the count.
 ///
 /// Lock order: `lifecycle` → `accounts` → `persisters` → `hydrated` →
 /// `store`. The map's std mutex comes last, taken under `accounts` (bump,
-/// list) or under `store` (compare), and is never held across an await.
+/// list) or under `persisters` or `store` (compare), and is never held
+/// across an await.
 #[derive(Default)]
 struct WalletRemovals(std::sync::Mutex<BTreeMap<WalletId, u64>>);
 
@@ -1579,6 +1584,11 @@ impl NetworkShieldedCoordinator {
                     );
                     continue;
                 };
+                // A wallet removed since the list: this may be its new
+                // registration's persister (see `WalletRemovals`).
+                if self.removals.removed_since(&removal_marks, wallet_id) {
+                    continue;
+                }
                 let full = crate::changeset::PlatformWalletChangeSet {
                     shielded: Some(cs),
                     ..Default::default()
