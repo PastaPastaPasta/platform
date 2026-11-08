@@ -260,8 +260,8 @@ impl FileBackedShieldedStore {
         // the row or blocking the open. The reason is checked only against
         // its kind, so a reason added by a later build is stored and then
         // refused by this build's decode. Only `nullifiers`, the notes an
-        // `Executed` disposition holds until it is acknowledged, is loaded at
-        // open (see `rehydrate_disposition_holds`).
+        // `executed` or `unresolved` disposition holds until it is
+        // acknowledged, is loaded at open (see `rehydrate_disposition_holds`).
         pending_conn
             .execute(
                 "CREATE TABLE IF NOT EXISTS shielded_spend_dispositions (
@@ -281,7 +281,8 @@ impl FileBackedShieldedStore {
                     at            INTEGER NOT NULL,
                     nullifiers    BLOB    NOT NULL DEFAULT x''
                         CHECK (typeof(nullifiers) = 'blob' AND length(nullifiers) % 32 = 0
-                               AND (disposition = 'executed' OR length(nullifiers) = 0)),
+                               AND (disposition IN ('executed', 'unresolved')
+                                    OR length(nullifiers) = 0)),
                     PRIMARY KEY (wallet_id, account_index, st_hash)
                 )",
                 [],
@@ -312,8 +313,8 @@ impl FileBackedShieldedStore {
         Ok(store)
     }
 
-    /// Load the notes every unacknowledged disposition holds (an `Executed`
-    /// resolution's inputs), so they are excluded from selection before
+    /// Load the notes every unacknowledged disposition holds (an `Executed` or
+    /// `Unresolved` resolution's inputs), so they are excluded from selection before
     /// anything can select. The note's spent flag lives with the host, so a
     /// crash after the resolution committed but before the host stored the
     /// spend would otherwise offer those notes again once the host restores
@@ -2597,6 +2598,13 @@ mod tests {
         }
 
         #[test]
+        fn unresolved_resolutions_hold_until_ack() {
+            contract_survives_reopen("disposition_unresolved_hold", |store| {
+                disposition_contract::unresolved_resolutions_hold_until_ack(store)
+            });
+        }
+
+        #[test]
         fn disposition_refusals_stay_typed_in_platform_wallet_error() {
             for refusal in [
                 ShieldedDispositionRefusal::RedriveNotFound {
@@ -2712,6 +2720,70 @@ mod tests {
             remove_store_files(&path);
         }
 
+        /// The crash window of an `Executed` resolution, for each `Unresolved`
+        /// value: the inputs stay out of selection after a reopen and a
+        /// restored older snapshot, no build can pull a healthy note in with
+        /// them, and the acknowledgement by the disposition's key lifts the
+        /// hold for good.
+        #[test]
+        fn unresolved_hold_survives_a_crash_until_ack() {
+            for (tag, reason) in [
+                (0x6Cu8, UnresolvedReason::DeserializeDropped),
+                (0x6D, UnresolvedReason::Purged),
+                (0x6E, UnresolvedReason::Unattributable),
+            ] {
+                let path = temp_tree_path("disposition_unresolved_crash");
+                let id = SubwalletId::new([0xDC; 32], 0);
+                let stale = [[tag.wrapping_add(0x80); 32], [tag.wrapping_add(0x90); 32]];
+                let healthy = [0xEF; 32];
+                let redrive = spend(tag, &stale);
+                {
+                    let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                    arm_reserved(&mut store, id, &redrive);
+                    store
+                        .resolve_redrive(
+                            id,
+                            &redrive.activity_id,
+                            ShieldedSpendDisposition::Unresolved(reason),
+                        )
+                        .unwrap();
+                }
+                {
+                    let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                    restore_snapshot(&mut store, id, &[stale[0], stale[1], healthy]);
+                    assert_eq!(
+                        unspent(&store, id),
+                        BTreeSet::from([healthy]),
+                        "{reason:?}: the stale inputs must not be selectable after the reopen"
+                    );
+                    assert_eq!(store.spendable_balance(id).unwrap(), 1_000, "{reason:?}");
+                    let notes = store.get_unspent_notes(id).unwrap();
+                    assert!(
+                        matches!(
+                            crate::wallet::shielded::note_selection::select_notes(&notes, 1_500, 0),
+                            Err(PlatformWalletError::ShieldedInsufficientBalance { .. })
+                        ),
+                        "{reason:?}: a build needing two notes must not pull a held input in"
+                    );
+                    assert!(store.ack_disposition(id, &redrive.st_hash()).unwrap());
+                    assert_eq!(
+                        unspent(&store, id),
+                        BTreeSet::from([stale[0], stale[1], healthy]),
+                        "{reason:?}: the acknowledgement lifts the hold"
+                    );
+                }
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen 2");
+                restore_snapshot(&mut store, id, &[stale[0], stale[1], healthy]);
+                assert_eq!(
+                    unspent(&store, id).len(),
+                    3,
+                    "{reason:?}: nothing is held after the acknowledgement"
+                );
+                drop(store);
+                remove_store_files(&path);
+            }
+        }
+
         /// After the host's spent write and the acknowledgement, nothing is
         /// held any more, across a reopen too: the restored spent state
         /// governs.
@@ -2795,6 +2867,69 @@ mod tests {
             assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
             drop(store);
             remove_store_files(&path);
+        }
+
+        /// A `Purged` or `DeserializeDropped` row whose other fields this
+        /// build cannot read still holds its notes, its typed refusal names
+        /// the key and the held notes, and acknowledging that key lifts them.
+        #[test]
+        fn an_unreadable_unresolved_disposition_is_acked_by_its_key() {
+            for (tag, reason, corruption) in [
+                (0x6Fu8, UnresolvedReason::Purged, "at = -1"),
+                (0x70, UnresolvedReason::DeserializeDropped, "at = -1"),
+                (0x71, UnresolvedReason::Purged, "reason = 'a_later_reason'"),
+                (
+                    0x72,
+                    UnresolvedReason::DeserializeDropped,
+                    "activity_id = zeroblob(31)",
+                ),
+            ] {
+                let path = temp_tree_path("disposition_unresolved_unreadable");
+                let id = SubwalletId::new([0xDD; 32], 2);
+                let input = [tag.wrapping_add(0x80); 32];
+                let redrive = spend(tag, &[input]);
+                {
+                    let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                    arm_reserved(&mut store, id, &redrive);
+                    store
+                        .resolve_redrive(
+                            id,
+                            &redrive.activity_id,
+                            ShieldedSpendDisposition::Unresolved(reason),
+                        )
+                        .unwrap();
+                    store
+                        .pending_conn
+                        .lock()
+                        .unwrap()
+                        .execute_batch(&format!(
+                            "PRAGMA ignore_check_constraints = ON; \
+                             UPDATE shielded_spend_dispositions SET {corruption};"
+                        ))
+                        .unwrap();
+                }
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                let (subwallet, st_hash, held) = unreadable(store.dispositions(id.wallet_id));
+                assert_eq!(
+                    (subwallet, st_hash, held),
+                    (id, redrive.st_hash(), vec![input]),
+                    "{reason:?} {corruption}"
+                );
+                restore_snapshot(&mut store, id, &[input]);
+                assert!(
+                    unspent(&store, id).is_empty(),
+                    "{reason:?} {corruption}: held"
+                );
+                assert!(store.ack_disposition(subwallet, &st_hash).unwrap());
+                assert_eq!(unspent(&store, id), BTreeSet::from([input]));
+                assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+                drop(store);
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen 2");
+                restore_snapshot(&mut store, id, &[input]);
+                assert_eq!(unspent(&store, id), BTreeSet::from([input]));
+                drop(store);
+                remove_store_files(&path);
+            }
         }
 
         #[test]
@@ -2947,6 +3082,7 @@ mod tests {
                 for disposition in [
                     ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected),
                     ShieldedSpendDisposition::Executed,
+                    ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
                 ] {
                     let path = temp_tree_path(trigger);
                     let id = SubwalletId::new([0xD3; 32], 0);
@@ -3000,10 +3136,9 @@ mod tests {
                             redrive
                         );
                         assert!(store.pending_redrives(id).unwrap().is_empty());
-                        let released = if disposition == ShieldedSpendDisposition::Executed {
-                            0
-                        } else {
-                            2
+                        let released = match disposition {
+                            ShieldedSpendDisposition::NotExecuted(_) => 2,
+                            _ => 0,
                         };
                         assert_eq!(unspent(&store, id).len(), released);
                     }
@@ -3013,10 +3148,9 @@ mod tests {
                     let dispositions = store.dispositions(id.wallet_id).unwrap();
                     assert_eq!(dispositions.len(), 1);
                     assert_eq!(dispositions[0].disposition, disposition);
-                    let held = if disposition == ShieldedSpendDisposition::Executed {
-                        vec![[0xE3; 32], [0xE4; 32]]
-                    } else {
-                        Vec::new()
+                    let held = match disposition {
+                        ShieldedSpendDisposition::NotExecuted(_) => Vec::new(),
+                        _ => vec![[0xE3; 32], [0xE4; 32]],
                     };
                     assert_eq!(dispositions[0].held_nullifiers, held);
                     drop(store);
@@ -3345,7 +3479,8 @@ mod tests {
                 (blob, blob, blob, "'executed'", "NULL", short),
                 (blob, blob, blob, "'executed'", "NULL", text),
                 (blob, blob, blob, "'not_executed'", "'rejected'", blob),
-                (blob, blob, blob, "'unresolved'", "'a_later_reason'", blob),
+                (blob, blob, blob, "'not_executed'", "'a_later_reason'", blob),
+                (blob, blob, blob, "'unresolved'", "'purged'", short),
             ] {
                 assert!(
                     insert(wallet, st_hash, activity, kind, reason, held).is_err(),
@@ -3363,6 +3498,17 @@ mod tests {
                 "zeroblob(64)",
             )
             .expect("an executed disposition holds whole nullifiers");
+            for reason in ["'purged'", "'a_later_reason'"] {
+                insert(
+                    blob,
+                    "randomblob(32)",
+                    blob,
+                    "'unresolved'",
+                    reason,
+                    "zeroblob(32)",
+                )
+                .expect("an unresolved disposition holds whole nullifiers");
+            }
             let insert_account = |account: &str| {
                 conn.execute(
                     &format!(
@@ -3381,7 +3527,7 @@ mod tests {
                 );
             }
             insert_account("4294967295").expect("the largest account index is storable");
-            assert_eq!(count(&conn, "shielded_spend_dispositions"), 3);
+            assert_eq!(count(&conn, "shielded_spend_dispositions"), 5);
             drop(conn);
             drop(store);
             remove_store_files(&path);
