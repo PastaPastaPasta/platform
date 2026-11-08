@@ -602,9 +602,14 @@ pub enum PlatformWalletError {
 
     /// An asset lock, whole-balance or of a fixed amount, needs more inputs
     /// than an asset lock may carry (`max_asset_lock_transaction_inputs`, 100:
-    /// Dash Core relay policy and Platform consensus alike). Nothing was sent:
-    /// a funded build refuses the lock before tracking it and releases its
-    /// reservation. Consolidating the coins lets a new lock fit.
+    /// Dash Core relay policy and Platform consensus alike). Nothing new was
+    /// sent: a funded build refuses the lock before tracking it and releases
+    /// its reservation, and a resume of a tracked `Built` / `Broadcast` row
+    /// over the cap is refused instead of re-sent, leaving the row tracked and
+    /// releasing nothing (an earlier attempt may still have reached peers).
+    /// Reservations do not survive a restart, so after one the row's inputs
+    /// are not held and may be spent elsewhere. Consolidating the coins lets a
+    /// new lock fit, once the inputs of a refused resume are no longer held.
     #[error("Asset lock requires {count} inputs, exceeding the limit of {max}")]
     AssetLockTooManyInputs { count: usize, max: usize },
 
