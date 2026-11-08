@@ -9,9 +9,11 @@ use drive_proof_verifier::types::{
 };
 
 use super::balance_tests::{register, tree_path};
+use super::store::disposition_contract::{arm_reserved, note, spend};
+use super::store::{ShieldedSpendDisposition, UnresolvedReason};
 use super::sync::pass_pause;
 use super::SubwalletId;
-use super::{FileBackedShieldedStore, NetworkShieldedCoordinator, ShieldedNote, ShieldedStore};
+use super::{FileBackedShieldedStore, NetworkShieldedCoordinator, ShieldedStore};
 use crate::changeset::{ShieldedSubwalletStartState, ShieldedSyncStartState};
 
 /// The chain's notes in this test, by position. None decrypts for any
@@ -25,8 +27,12 @@ const LIVE_WATERMARK: u64 = 2100;
 const SNAPSHOT_WATERMARK: u64 = 1000;
 
 const WALLET: [u8; 32] = [0x5A; 32];
+/// An input whose transition executed: Platform has its nullifier.
 const SPENT_NULLIFIER: [u8; 32] = [0x4E; 32];
+/// A healthy note nothing holds.
 const UNSPENT_NULLIFIER: [u8; 32] = [0x4F; 32];
+/// An input whose transition never executed.
+const NEVER_SPENT_NULLIFIER: [u8; 32] = [0x50; 32];
 
 fn pool_nullifier(position: u64) -> [u8; 32] {
     if position == SPENT_AT {
@@ -86,52 +92,84 @@ async fn pool_sdk() -> dash_sdk::Sdk {
     sdk
 }
 
-fn owned_note(position: u64, nullifier: [u8; 32], value: u64, is_spent: bool) -> ShieldedNote {
-    ShieldedNote {
-        position,
-        cmx: [position as u8; 32],
-        nullifier,
-        block_height: 1,
-        is_spent,
-        value,
-        note_data: vec![position as u8; 115],
+async fn unspent(coordinator: &NetworkShieldedCoordinator, id: SubwalletId) -> BTreeSet<[u8; 32]> {
+    super::store::disposition_contract::unspent(&*coordinator.store().read().await, id)
+}
+
+async fn spendable(coordinator: &NetworkShieldedCoordinator, id: SubwalletId) -> u64 {
+    coordinator
+        .store()
+        .read()
+        .await
+        .spendable_balance(id)
+        .unwrap()
+}
+
+fn spent(nullifier: [u8; 32]) -> super::ShieldedNote {
+    super::ShieldedNote {
+        is_spent: true,
+        ..note(nullifier)
     }
 }
 
-fn unspent_nullifiers(
-    coordinator: &NetworkShieldedCoordinator,
-    id: SubwalletId,
-) -> BTreeSet<[u8; 32]> {
-    let store = coordinator.store().try_read().expect("store idle");
-    store
-        .get_unspent_notes(id)
-        .unwrap()
-        .into_iter()
-        .map(|note| note.nullifier)
-        .collect()
+/// The host's older snapshot of `notes`, scanned up to [`SNAPSHOT_WATERMARK`].
+fn older_snapshot(id: SubwalletId, notes: &[super::ShieldedNote]) -> ShieldedSyncStartState {
+    ShieldedSyncStartState {
+        per_subwallet: BTreeMap::from([(
+            id,
+            ShieldedSubwalletStartState {
+                notes: notes.to_vec(),
+                has_sync_state: true,
+                last_synced_index: SNAPSHOT_WATERMARK,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    }
+}
+
+fn coordinator_on(sdk: dash_sdk::Sdk, path: &std::path::Path) -> Arc<NetworkShieldedCoordinator> {
+    Arc::new(NetworkShieldedCoordinator::new(
+        Arc::new(sdk),
+        dashcore::Network::Testnet,
+        path.to_path_buf(),
+        FileBackedShieldedStore::open_path(path, 100).unwrap(),
+    ))
+}
+
+fn remove_store_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm", ".lock"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// A wallet removed while a pass sits between its watermark read and its
 /// scan, then re-added from a snapshot older than its live state: the next
-/// pass still scans the restored note's spend, which landed between the
-/// snapshot's watermark and the live one.
+/// pass still scans the restored input's spend, which landed between the
+/// snapshot's watermark and the live one, and the input is not selectable
+/// before that.
 #[tokio::test]
 async fn a_removal_during_a_pass_leaves_the_restored_spend_scannable() {
     let path = tree_path();
-    let coordinator = Arc::new(NetworkShieldedCoordinator::new(
-        Arc::new(pool_sdk().await),
-        dashcore::Network::Testnet,
-        path.clone(),
-        FileBackedShieldedStore::open_path(&path, 100).unwrap(),
-    ));
+    let coordinator = coordinator_on(pool_sdk().await, &path);
     let id = SubwalletId::new(WALLET, 0);
     register(&coordinator, WALLET, &[0]).await;
     coordinator.mark_hydrated(WALLET, true).await;
     {
         let mut store = coordinator.store().write().await;
+        let executed = spend(0x61, &[SPENT_NULLIFIER]);
+        arm_reserved(&mut *store, id, &executed);
         store
-            .save_note(id, &owned_note(5, SPENT_NULLIFIER, 1000, true))
+            .resolve_redrive(
+                id,
+                &executed.activity_id,
+                ShieldedSpendDisposition::Executed,
+            )
             .unwrap();
+        // The live wallet already scanned the spend.
+        store.mark_spent(id, &SPENT_NULLIFIER).unwrap();
         store
             .set_last_synced_note_index(id, LIVE_WATERMARK)
             .unwrap();
@@ -157,38 +195,132 @@ async fn a_removal_during_a_pass_leaves_the_restored_spend_scannable() {
     }
 
     register(&coordinator, WALLET, &[0]).await;
-    let snapshot = ShieldedSyncStartState {
-        per_subwallet: BTreeMap::from([(
-            id,
-            ShieldedSubwalletStartState {
-                notes: vec![
-                    owned_note(5, SPENT_NULLIFIER, 1000, false),
-                    owned_note(6, UNSPENT_NULLIFIER, 300, false),
-                ],
-                has_sync_state: true,
-                last_synced_index: SNAPSHOT_WATERMARK,
-                ..Default::default()
-            },
-        )]),
-        ..Default::default()
-    };
+    coordinator
+        .restore_for_wallet(
+            WALLET,
+            &older_snapshot(id, &[note(SPENT_NULLIFIER), note(UNSPENT_NULLIFIER)]),
+        )
+        .await
+        .unwrap();
+    coordinator.mark_hydrated(WALLET, true).await;
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([UNSPENT_NULLIFIER]),
+        "the executed input is not selectable before a scan"
+    );
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([UNSPENT_NULLIFIER]),
+        "the spend between the snapshot's watermark and the live one must be scanned"
+    );
+    assert!(coordinator
+        .store()
+        .read()
+        .await
+        .get_all_notes(id)
+        .unwrap()
+        .iter()
+        .any(|stored| stored.nullifier == SPENT_NULLIFIER && stored.is_spent));
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
+/// A wallet removed and added again from an older host snapshot keeps its
+/// inputs held until its first pass: before it, neither the executed input
+/// nor the never-executed one is selectable or counted, even beside a
+/// healthy note. The pass marks the executed input spent and lifts both
+/// holds, so the never-executed input becomes selectable, and it stays so
+/// after a reopen.
+#[tokio::test]
+async fn a_re_added_wallet_keeps_its_holds_until_its_first_pass() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register(&coordinator, WALLET, &[0]).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    {
+        let mut store = coordinator.store().write().await;
+        for (redrive, disposition) in [
+            (
+                spend(0x62, &[SPENT_NULLIFIER]),
+                ShieldedSpendDisposition::Executed,
+            ),
+            (
+                spend(0x63, &[NEVER_SPENT_NULLIFIER]),
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+            ),
+        ] {
+            arm_reserved(&mut *store, id, &redrive);
+            store
+                .resolve_redrive(id, &redrive.activity_id, disposition)
+                .unwrap();
+        }
+    }
+    coordinator.unregister_wallet(WALLET).await;
+
+    register(&coordinator, WALLET, &[0]).await;
+    let snapshot = older_snapshot(
+        id,
+        &[
+            note(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+        ],
+    );
     coordinator
         .restore_for_wallet(WALLET, &snapshot)
         .await
         .unwrap();
     coordinator.mark_hydrated(WALLET, true).await;
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([UNSPENT_NULLIFIER]),
+        "held inputs are not selectable before the first pass"
+    );
+    assert_eq!(spendable(&coordinator, id).await, 1_000);
 
     let outcome = coordinator.sync(true).await;
     assert_eq!(outcome.success_count(), 1, "{outcome:?}");
     assert_eq!(
-        unspent_nullifiers(&coordinator, id),
-        BTreeSet::from([UNSPENT_NULLIFIER]),
-        "the spend between the snapshot's watermark and the live one must be scanned"
+        unspent(&coordinator, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the pass marks the executed input spent and releases the other"
     );
+    assert_eq!(spendable(&coordinator, id).await, 2_000);
+    let dispositions = coordinator
+        .store()
+        .read()
+        .await
+        .dispositions(WALLET)
+        .unwrap();
+    assert_eq!(dispositions.len(), 2, "the dispositions stay");
+    assert!(dispositions
+        .iter()
+        .all(|record| record.held_nullifiers.is_empty()));
     drop(coordinator);
-    for suffix in ["", "-wal", "-shm", ".lock"] {
-        let mut file = path.as_os_str().to_owned();
-        file.push(suffix);
-        let _ = std::fs::remove_file(file);
-    }
+
+    let reopened = coordinator_on(dash_sdk::Sdk::new_mock(), &path);
+    register(&reopened, WALLET, &[0]).await;
+    let host_rows = older_snapshot(
+        id,
+        &[
+            spent(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+        ],
+    );
+    reopened
+        .restore_for_wallet(WALLET, &host_rows)
+        .await
+        .unwrap();
+    assert_eq!(
+        unspent(&reopened, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the lifted hold stays lifted after a reopen"
+    );
+    drop(reopened);
+    remove_store_files(&path);
 }

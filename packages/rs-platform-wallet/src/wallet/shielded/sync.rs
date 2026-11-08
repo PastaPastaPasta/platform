@@ -685,9 +685,10 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // Scan-based spend detection. Now that THIS pass's receipts are
     // persisted (above), replay every scanned action's nullifier
     // against each subwallet — see [`apply_scanned_nullifier_spends`]
-    // for the ordering rationale.
+    // for the ordering rationale — then lift the holds a wallet removal
+    // left until this scan.
     let subwallet_ids: Vec<SubwalletId> = subwallets.iter().map(|(id, _)| *id).collect();
-    let newly_spent_per_subwallet = apply_scanned_nullifier_spends(
+    let newly_spent_per_subwallet = commit_scan(
         &mut *store,
         &subwallet_ids,
         &scanned_nullifiers,
@@ -768,6 +769,26 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
 /// Returns the per-subwallet count of notes newly flipped to spent and
 /// records each match on `changeset` via
 /// [`ShieldedChangeSet::record_nullifier_spent`].
+/// What a completed pass commits for its subwallets after saving its
+/// receipts, under its store write guard: the spent nullifiers it scanned
+/// ([`apply_scanned_nullifier_spends`]), then the lifting of the holds a
+/// wallet removal left until the subwallet's next completed scan. A held
+/// note therefore becomes selectable only together with its scanned spent
+/// state.
+pub(super) fn commit_scan<S: ShieldedStore>(
+    store: &mut S,
+    subwallet_ids: &[SubwalletId],
+    scanned_nullifiers: &[[u8; 32]],
+    changeset: &mut ShieldedChangeSet,
+) -> Result<BTreeMap<SubwalletId, usize>, S::Error> {
+    let newly_spent =
+        apply_scanned_nullifier_spends(store, subwallet_ids, scanned_nullifiers, changeset)?;
+    for id in subwallet_ids {
+        store.lift_holds_awaiting_scan(*id)?;
+    }
+    Ok(newly_spent)
+}
+
 fn apply_scanned_nullifier_spends<S: ShieldedStore>(
     store: &mut S,
     subwallet_ids: &[SubwalletId],
