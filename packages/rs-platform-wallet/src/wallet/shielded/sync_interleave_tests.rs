@@ -1,7 +1,7 @@
 //! A sync pass against a wallet that is removed and re-added around it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use drive_proof_verifier::types::{
@@ -11,10 +11,14 @@ use drive_proof_verifier::types::{
 use super::balance_tests::{register, tree_path};
 use super::store::disposition_contract::{arm_reserved, note, spend};
 use super::store::{ShieldedSpendDisposition, UnresolvedReason};
-use super::sync::pass_pause;
+use super::sync::pass_pause::{self, Point};
 use super::SubwalletId;
-use super::{FileBackedShieldedStore, NetworkShieldedCoordinator, ShieldedStore};
-use crate::changeset::{ShieldedSubwalletStartState, ShieldedSyncStartState};
+use super::{FileBackedShieldedStore, NetworkShieldedCoordinator, OrchardKeySet, ShieldedStore};
+use crate::changeset::{
+    ClientStartState, PersistenceError, PlatformWalletChangeSet, PlatformWalletPersistence,
+    ShieldedChangeSet, ShieldedSubwalletStartState, ShieldedSyncStartState,
+};
+use crate::wallet::persister::WalletPersister;
 
 /// The chain's notes in this test, by position. None decrypts for any
 /// wallet; each carries the nullifier its action spent.
@@ -226,6 +230,217 @@ async fn a_removal_during_a_pass_leaves_the_restored_spend_scannable() {
         .any(|stored| stored.nullifier == SPENT_NULLIFIER && stored.is_spent));
     drop(coordinator);
     remove_store_files(&path);
+}
+
+/// The host's persister for the wallet: commits each `store` inline and
+/// records what it took.
+struct Host {
+    saved: Mutex<Vec<ShieldedChangeSet>>,
+}
+
+impl Host {
+    fn inline() -> Arc<Self> {
+        Arc::new(Self {
+            saved: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Whether any changeset the host took touches `id`.
+    fn took_any_for(&self, id: SubwalletId) -> bool {
+        self.saved.lock().unwrap().iter().any(|changeset| {
+            changeset.notes_saved.contains_key(&id)
+                || changeset.nullifiers_spent.contains_key(&id)
+                || changeset.synced_indices.contains_key(&id)
+        })
+    }
+}
+
+impl PlatformWalletPersistence for Host {
+    fn store_commits_inline(&self) -> bool {
+        true
+    }
+
+    fn store(
+        &self,
+        _wallet_id: [u8; 32],
+        changeset: PlatformWalletChangeSet,
+    ) -> Result<(), PersistenceError> {
+        if let Some(shielded) = changeset.shielded {
+            self.saved.lock().unwrap().push(shielded);
+        }
+        Ok(())
+    }
+
+    fn flush(&self, _wallet_id: [u8; 32]) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+
+    fn load(&self) -> Result<ClientStartState, PersistenceError> {
+        Ok(ClientStartState::default())
+    }
+}
+
+/// Register [`WALLET`]'s account 0 with `host` as its persister, under the
+/// keys `register` uses.
+async fn register_with(coordinator: &NetworkShieldedCoordinator, host: &Arc<Host>) {
+    let views = BTreeMap::from([(
+        0,
+        OrchardKeySet::from_seed(&[42; 64], dashcore::Network::Testnet, 0)
+            .expect("test viewing key")
+            .viewing_keys(),
+    )]);
+    coordinator
+        .register_wallet(WALLET, views, WalletPersister::new(WALLET, host.clone()))
+        .await
+        .expect("register test wallet");
+}
+
+/// Hold the wallet's inputs: an executed spend of [`SPENT_NULLIFIER`] and an
+/// unresolved one of [`NEVER_SPENT_NULLIFIER`]. Returns their keys.
+async fn hold_inputs(coordinator: &NetworkShieldedCoordinator, id: SubwalletId) -> Vec<[u8; 32]> {
+    let mut store = coordinator.store().write().await;
+    let mut keys = Vec::new();
+    for (redrive, disposition) in [
+        (
+            spend(0x62, &[SPENT_NULLIFIER]),
+            ShieldedSpendDisposition::Executed,
+        ),
+        (
+            spend(0x63, &[NEVER_SPENT_NULLIFIER]),
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+        ),
+    ] {
+        arm_reserved(&mut *store, id, &redrive);
+        store
+            .resolve_redrive(id, &redrive.activity_id, disposition)
+            .unwrap();
+        keys.push(redrive.st_hash());
+    }
+    keys
+}
+
+/// The older snapshot in which both held inputs and the healthy note are
+/// unspent.
+fn snapshot_with_inputs_unspent(id: SubwalletId) -> ShieldedSyncStartState {
+    older_snapshot(
+        id,
+        &[
+            note(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+        ],
+    )
+}
+
+/// Neither held input is selectable or counted; the healthy note is.
+async fn assert_inputs_held(coordinator: &NetworkShieldedCoordinator, id: SubwalletId, why: &str) {
+    assert_eq!(
+        unspent(coordinator, id).await,
+        BTreeSet::from([UNSPENT_NULLIFIER]),
+        "{why}"
+    );
+    assert_eq!(spendable(coordinator, id).await, 1_000, "{why}");
+}
+
+/// A pass with an inline host lifts the holds the removal left, so the
+/// never-executed input becomes selectable: the holds were still waiting for
+/// a scan.
+async fn assert_holds_wait_for_a_scan(coordinator: &NetworkShieldedCoordinator, id: SubwalletId) {
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert_eq!(
+        unspent(coordinator, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the holds still wait for the wallet's next scan"
+    );
+}
+
+async fn wait_for(pause: &pass_pause::Pause) {
+    tokio::time::timeout(Duration::from_secs(60), pause.reached.acquire())
+        .await
+        .expect("the pass reaches its pause point")
+        .unwrap()
+        .forget();
+}
+
+/// A wallet removed after a pass took its subwallet list but before the pass
+/// took the store guard, and optionally added again under the same id and
+/// keys before the pass resumes: the pass writes no watermark and lifts no
+/// hold for it, and hands its host nothing. Restored from the older snapshot,
+/// neither held input is selectable or counted, and the holds still wait for
+/// the wallet's next scan.
+async fn removal_before_the_pass_guard(re_add_during_the_pause: bool) {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+
+    let pause = pass_pause::arm_at(
+        pass_pause::key(coordinator.store()),
+        Point::AfterListSnapshot,
+    );
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        coordinator.unregister_wallet(WALLET),
+    )
+    .await
+    .expect("a removal does not wait for a pass that holds no lock");
+    let host = Host::inline();
+    if re_add_during_the_pause {
+        register_with(&coordinator, &host).await;
+    }
+    pause.resume.add_permits(1);
+    pass.await.unwrap();
+
+    assert_eq!(
+        coordinator
+            .store()
+            .read()
+            .await
+            .last_synced_note_index(id)
+            .unwrap(),
+        0,
+        "the pass writes no watermark for the removed wallet"
+    );
+    assert!(
+        !host.took_any_for(id),
+        "the pass hands the re-added wallet's host nothing"
+    );
+
+    if !re_add_during_the_pause {
+        register_with(&coordinator, &host).await;
+    }
+    coordinator
+        .restore_for_wallet(WALLET, &snapshot_with_inputs_unspent(id))
+        .await
+        .unwrap();
+    coordinator.mark_hydrated(WALLET, true).await;
+    assert_inputs_held(
+        &coordinator,
+        id,
+        "held inputs are not selectable before a pass",
+    )
+    .await;
+    assert_holds_wait_for_a_scan(&coordinator, id).await;
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
+#[tokio::test]
+async fn a_removal_before_the_pass_guard_leaves_the_wallet_unscanned() {
+    removal_before_the_pass_guard(false).await;
+}
+
+#[tokio::test]
+async fn a_same_key_re_add_before_the_pass_guard_leaves_the_wallet_unscanned() {
+    removal_before_the_pass_guard(true).await;
 }
 
 /// A wallet removed and added again from an older host snapshot keeps its

@@ -263,6 +263,65 @@ pub struct NetworkShieldedCoordinator {
     /// counter before the load and re-reading it inside the transaction
     /// makes that snapshot detectably stale.
     clear_generation: std::sync::atomic::AtomicU64,
+
+    /// Per-wallet removal counts; see [`WalletRemovals`].
+    removals: WalletRemovals,
+}
+
+/// Per-wallet count of [`unregister_wallet`](NetworkShieldedCoordinator::unregister_wallet)
+/// calls, so a sync pass can skip a wallet removed after it took its
+/// subwallet list.
+///
+/// [`sync`](NetworkShieldedCoordinator::sync) lists the registered
+/// subwallets under `accounts.read` and takes the store write guard only
+/// later, so a removal can complete in between. The pass records each listed
+/// wallet's count with the list and compares it under the store write guard.
+/// A changed count means the wallet was removed, and maybe added again under
+/// the same id, after the list was taken: the pass then saves no note,
+/// advances no watermark and lifts no hold for it. Checking that the wallet
+/// is still registered could not tell a same-id re-add from no removal.
+///
+/// A removal bumps the count under `accounts.write`, before its purge, so a
+/// list taken under `accounts.read` pairs with the count of that same
+/// registration. The purge needs the store write guard, so a removal that
+/// has not purged yet when the pass holds the guard waits for the pass, and
+/// one that has purged already changed the count.
+///
+/// Lock order: `lifecycle` → `accounts` → `persisters` → `hydrated` →
+/// `store`. The map's std mutex comes last, taken under `accounts` (bump,
+/// list) or under `store` (compare), and is never held across an await.
+#[derive(Default)]
+struct WalletRemovals(std::sync::Mutex<BTreeMap<WalletId, u64>>);
+
+/// Each listed wallet's removal count when a sync pass took its list.
+type RemovalMarks = BTreeMap<WalletId, u64>;
+
+impl WalletRemovals {
+    fn counts(&self) -> std::sync::MutexGuard<'_, BTreeMap<WalletId, u64>> {
+        // Plain counters: a panic elsewhere cannot leave them half-written.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn record(&self, wallet_id: WalletId) {
+        *self.counts().entry(wallet_id).or_default() += 1;
+    }
+
+    fn marks(&self, wallet_ids: impl IntoIterator<Item = WalletId>) -> RemovalMarks {
+        let counts = self.counts();
+        wallet_ids
+            .into_iter()
+            .map(|wallet_id| (wallet_id, counts.get(&wallet_id).copied().unwrap_or(0)))
+            .collect()
+    }
+
+    /// Whether `wallet_id` was removed after `marks` were taken. A wallet
+    /// `marks` does not list counts as removed.
+    fn removed_since(&self, marks: &RemovalMarks, wallet_id: WalletId) -> bool {
+        let current = self.counts().get(&wallet_id).copied().unwrap_or(0);
+        marks.get(&wallet_id) != Some(&current)
+    }
 }
 
 /// Exclusive handle on one wallet's shielded install transaction,
@@ -401,6 +460,7 @@ impl NetworkShieldedCoordinator {
             lifecycle: tokio::sync::Mutex::new(()),
             hydrated: RwLock::new(std::collections::BTreeSet::new()),
             clear_generation: std::sync::atomic::AtomicU64::new(0),
+            removals: WalletRemovals::default(),
         }
     }
 
@@ -883,10 +943,11 @@ impl NetworkShieldedCoordinator {
         // restore could repopulate (and re-mark hydrated) the state
         // purged below after the purge ran.
         let _lifecycle = self.lifecycle.lock().await;
-        self.accounts
-            .write()
-            .await
-            .retain(|id, _| id.wallet_id != wallet_id);
+        {
+            let mut accounts = self.accounts.write().await;
+            accounts.retain(|id, _| id.wallet_id != wallet_id);
+            self.removals.record(wallet_id);
+        }
         self.persisters.write().await.remove(&wallet_id);
         self.hydrated.write().await.remove(&wallet_id);
         if let Err(e) = self.store.write().await.purge_wallet(wallet_id) {
@@ -1339,13 +1400,27 @@ impl NetworkShieldedCoordinator {
             return Self::cooldown_skip_summary(self).await;
         }
 
+        #[cfg(test)]
+        let pass_key = super::sync::pass_pause::key(&self.store);
         // Snapshot the flat subwallet registry. This Vec is both
         // the IVK fan-out for sync_notes_across and the
-        // identity-map for per-wallet summary demux below.
-        let subwallets: Vec<(SubwalletId, AccountViewingKeys)> = {
+        // identity-map for per-wallet summary demux below. Each
+        // wallet's removal count is taken with it (see `WalletRemovals`).
+        let (subwallets, removal_marks) = {
             let accounts = self.accounts.read().await;
-            accounts.iter().map(|(id, v)| (*id, v.clone())).collect()
+            let subwallets: Vec<(SubwalletId, AccountViewingKeys)> =
+                accounts.iter().map(|(id, v)| (*id, v.clone())).collect();
+            let marks = self
+                .removals
+                .marks(subwallets.iter().map(|(id, _)| id.wallet_id));
+            (subwallets, marks)
         };
+        #[cfg(test)]
+        super::sync::pass_pause::reached(
+            pass_key,
+            super::sync::pass_pause::Point::AfterListSnapshot,
+        )
+        .await;
 
         let mut summary = ShieldedSyncPassSummary::default();
         if subwallets.is_empty() {
@@ -1382,6 +1457,7 @@ impl NetworkShieldedCoordinator {
             &self.sdk,
             &self.store,
             &subwallets,
+            &|wallet_id| self.removals.removed_since(&removal_marks, wallet_id),
             on_progress.as_ref(),
             on_tree_progress.as_ref(),
         )
@@ -1390,6 +1466,11 @@ impl NetworkShieldedCoordinator {
             Ok(r) => r,
             Err(e) => return self.fail_all_wallets(&subwallets, &e),
         };
+        // The rest of the pass leaves a wallet the scan skipped as removed.
+        let subwallets: Vec<(SubwalletId, AccountViewingKeys)> = subwallets
+            .into_iter()
+            .filter(|(id, _)| !notes.removed_wallets.contains(&id.wallet_id))
+            .collect();
         // Scan-based spend detection now happens INSIDE
         // `sync_notes_across`: every scanned action's nullifier is
         // replayed against each subwallet's store as part of the note

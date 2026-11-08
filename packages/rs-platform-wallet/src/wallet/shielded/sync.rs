@@ -26,7 +26,7 @@
 //! [`NetworkShieldedCoordinator::sync`]:
 //!     super::coordinator::NetworkShieldedCoordinator::sync
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use dash_sdk::platform::shielded::{
@@ -148,6 +148,9 @@ pub struct MultiSyncNotesResult {
     /// subwallet. The caller decides whether to queue it on the
     /// shared `WalletPersister`.
     pub changeset: ShieldedChangeSet,
+    /// Wallets the pass skipped because they were removed after the caller
+    /// took its subwallet list. Nothing was saved for them.
+    pub removed_wallets: BTreeSet<crate::wallet::platform_wallet::WalletId>,
 }
 
 impl MultiSyncNotesResult {
@@ -186,6 +189,11 @@ impl MultiSyncNotesResult {
 /// `subwallets` must be non-empty; otherwise the function
 /// returns an empty result without contacting Platform.
 ///
+/// `removed_since_list` tells, under the pass's store write guard, whether a
+/// wallet was removed after the caller took `subwallets`. The pass skips such
+/// a wallet whole: it saves no note, advances no watermark and marks no hold
+/// for it, and lists it in [`MultiSyncNotesResult::removed_wallets`].
+///
 /// Privilege boundary: only the viewing-key half is required
 /// (FVK for nullifier derivation, IVK for trial decryption).
 /// No `SpendAuthorizingKey` is needed by sync — the spend
@@ -194,6 +202,7 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     sdk: &Arc<dash_sdk::Sdk>,
     store: &Arc<RwLock<S>>,
     subwallets: &[(SubwalletId, AccountViewingKeys)],
+    removed_since_list: &(dyn Fn(crate::wallet::platform_wallet::WalletId) -> bool + Sync),
     on_progress: Option<&super::coordinator::ShieldedProgressCallback>,
     on_tree_progress: Option<&super::coordinator::ShieldedTreeProgressCallback>,
 ) -> Result<MultiSyncNotesResult, PlatformWalletError> {
@@ -227,8 +236,27 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // back over the purged or restored one, so a restored note's spend
     // below it would never be scanned.
     let mut store = store.write().await;
+    // A removal purges under this guard, so from here on the set of removed
+    // wallets can only grow by removals whose purge waits for this pass.
+    let removed_wallets: BTreeSet<_> = subwallets
+        .iter()
+        .map(|(id, _)| id.wallet_id)
+        .filter(|wallet_id| removed_since_list(*wallet_id))
+        .collect();
+    let subwallets: Vec<(SubwalletId, AccountViewingKeys)> = subwallets
+        .iter()
+        .filter(|(id, _)| !removed_wallets.contains(&id.wallet_id))
+        .cloned()
+        .collect();
+    let subwallets = subwallets.as_slice();
+    if subwallets.is_empty() {
+        return Ok(MultiSyncNotesResult {
+            removed_wallets,
+            ..Default::default()
+        });
+    }
     #[cfg(test)]
-    pass_pause::after_watermark_read(store_key).await;
+    pass_pause::reached(store_key, pass_pause::Point::AfterWatermarkRead).await;
     let (watermarks, already_have, tree_size) = {
         let mut watermarks: BTreeMap<SubwalletId, u64> = BTreeMap::new();
         let mut min_idx: Option<u64> = None;
@@ -732,6 +760,7 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
         per_subwallet_newly_spent: newly_spent_per_subwallet,
         total_scanned: scanned_volume,
         changeset,
+        removed_wallets,
     })
 }
 
@@ -1074,8 +1103,8 @@ mod tests {
     }
 }
 
-/// Test-only pause point in a sync pass, right after it reads the
-/// watermarks, so a test can interleave a purge or restore there.
+/// Test-only pause points in a sync pass, so a test can interleave a
+/// removal, restore or crash there.
 #[cfg(test)]
 pub(super) mod pass_pause {
     use std::collections::HashMap;
@@ -1090,8 +1119,19 @@ pub(super) mod pass_pause {
         pub(crate) resume: Semaphore,
     }
 
-    fn armed() -> &'static Mutex<HashMap<usize, Arc<Pause>>> {
-        static ARMED: OnceLock<Mutex<HashMap<usize, Arc<Pause>>>> = OnceLock::new();
+    /// Where a pass stops.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) enum Point {
+        /// `sync()` has taken its subwallet list, not yet the store guard.
+        AfterListSnapshot,
+        /// The pass holds the store guard and read its watermarks.
+        AfterWatermarkRead,
+    }
+
+    type Armed = Mutex<HashMap<(usize, Point), Arc<Pause>>>;
+
+    fn armed() -> &'static Armed {
+        static ARMED: OnceLock<Armed> = OnceLock::new();
         ARMED.get_or_init(Default::default)
     }
 
@@ -1104,6 +1144,12 @@ pub(super) mod pass_pause {
     /// Stop the next pass over the store keyed `key` after its watermark
     /// read, until the test adds a permit to `resume`.
     pub(crate) fn arm(key: usize) -> Arc<Pause> {
+        arm_at(key, Point::AfterWatermarkRead)
+    }
+
+    /// Stop the next pass over the store keyed `key` at `point`, until the
+    /// test adds a permit to `resume`.
+    pub(crate) fn arm_at(key: usize, point: Point) -> Arc<Pause> {
         let pause = Arc::new(Pause {
             reached: Semaphore::new(0),
             resume: Semaphore::new(0),
@@ -1111,12 +1157,15 @@ pub(super) mod pass_pause {
         armed()
             .lock()
             .expect("pass pause registry")
-            .insert(key, pause.clone());
+            .insert((key, point), pause.clone());
         pause
     }
 
-    pub(super) async fn after_watermark_read(key: usize) {
-        let pause = armed().lock().expect("pass pause registry").remove(&key);
+    pub(crate) async fn reached(key: usize, point: Point) {
+        let pause = armed()
+            .lock()
+            .expect("pass pause registry")
+            .remove(&(key, point));
         if let Some(pause) = pause {
             pause.reached.add_permits(1);
             pause
