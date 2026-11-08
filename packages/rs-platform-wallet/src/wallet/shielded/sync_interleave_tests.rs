@@ -769,6 +769,58 @@ async fn a_clear_before_the_pass_guard_leaves_the_store_reset() {
     remove_store_files(&path);
 }
 
+/// A Clear whose reset fails while a pass that already scanned waits to
+/// hand its host the changeset: nothing was reset, so the pass goes on as if
+/// there had been no Clear. Its inline host takes the changeset, the holds
+/// the pass scanned lift, and the wallet stays registered.
+#[tokio::test]
+async fn a_failed_clear_leaves_a_scanned_pass_to_save_and_lift() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+
+    let pause = pass_pause::arm_at(pass_pause::key(coordinator.store()), Point::BeforeHostSave);
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    // The subwallet purge fails on a missing table, so the Clear fails.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("ALTER TABLE shielded_pending_spends RENAME TO unavailable_pending_spends;")
+        .unwrap();
+    assert!(coordinator.clear().await.is_err());
+    conn.execute_batch("ALTER TABLE unavailable_pending_spends RENAME TO shielded_pending_spends;")
+        .unwrap();
+    drop(conn);
+    pause.resume.add_permits(1);
+    let outcome = pass.await.unwrap();
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+
+    assert!(
+        host.took_spent(id, SPENT_NULLIFIER),
+        "the host takes the pass's changeset"
+    );
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the holds the pass scanned lift"
+    );
+    assert_eq!(
+        coordinator.registered_subwallets().await,
+        vec![id],
+        "a failed Clear keeps the registration"
+    );
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
 /// A pass that lists the wallets while a Clear waits for another pass's store
 /// guard: it lists them only after the Clear, so neither pass leaves a
 /// watermark or a commitment in the reset store.

@@ -1274,18 +1274,9 @@ impl NetworkShieldedCoordinator {
         // Taken before the store lock to keep the `lifecycle` → `store`
         // order.
         let _lifecycle = self.lifecycle.lock().await;
-        // Every wallet counts as removed (`WalletRemovals`). A pass that
-        // listed before this Clear would otherwise write its notes and its
-        // watermarks into the reset store; a restore never rewinds a
-        // watermark, so the rebound wallet's cold rebuild from index 0
-        // would never run. `accounts` stays write-locked until the
-        // registries are cleared, so no pass lists a wallet after its bump.
+        // Held until the registries are cleared, so no pass lists a wallet
+        // during this Clear; see the removal bump below.
         let mut accounts = self.accounts.write().await;
-        let wallet_ids: std::collections::BTreeSet<WalletId> =
-            accounts.keys().map(|id| id.wallet_id).collect();
-        for wallet_id in wallet_ids {
-            self.removals.record(wallet_id);
-        }
 
         // Reset the persistent store FIRST and bail before mutating any
         // coordinator registries if it fails. Clearing `accounts` / `persisters`
@@ -1348,6 +1339,22 @@ impl NetworkShieldedCoordinator {
                             "purge_all_subwallets failed: {e}"
                         ))
                     });
+                }
+            }
+            // Once the reset succeeded, every wallet counts as removed
+            // (`WalletRemovals`), under this store guard. A pass that listed
+            // before this Clear would otherwise write its notes and its
+            // watermarks into the reset store; a restore never rewinds a
+            // watermark, so the rebound wallet's cold rebuild from index 0
+            // would never run. A pass that scanned before this guard has its
+            // writes reset here, and a host save or lift it runs after this
+            // guard skips. A failed reset bumps nothing, so such a pass still
+            // hands its host what it left in the store.
+            if first_err.is_none() {
+                let wallet_ids: std::collections::BTreeSet<WalletId> =
+                    accounts.keys().map(|id| id.wallet_id).collect();
+                for wallet_id in wallet_ids {
+                    self.removals.record(wallet_id);
                 }
             }
         }
