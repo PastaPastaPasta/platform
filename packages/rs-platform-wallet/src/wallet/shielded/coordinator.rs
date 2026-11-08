@@ -1358,6 +1358,12 @@ impl NetworkShieldedCoordinator {
                 }
             }
         }
+        #[cfg(test)]
+        super::sync::pass_pause::reached(
+            super::sync::pass_pause::key(&self.store),
+            super::sync::pass_pause::Point::AfterClearReset,
+        )
+        .await;
         // Hydration and snapshot validity go regardless of the outcome.
         // Either reset may fail after changing part of its persistent state,
         // so the next identical bind must not fast-path over a potentially

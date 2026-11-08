@@ -821,9 +821,9 @@ async fn a_failed_clear_leaves_a_scanned_pass_to_save_and_lift() {
     remove_store_files(&path);
 }
 
-/// A pass that lists the wallets while a Clear waits for another pass's store
-/// guard: it lists them only after the Clear, so neither pass leaves a
-/// watermark or a commitment in the reset store.
+/// A pass that starts after a Clear reset the store but before it cleared
+/// the registries: it lists the wallets only after the Clear, so it leaves
+/// no watermark or commitment in the reset store.
 #[tokio::test]
 async fn a_pass_listing_during_a_clear_writes_nothing_into_the_reset_store() {
     let path = tree_path();
@@ -833,32 +833,31 @@ async fn a_pass_listing_during_a_clear_writes_nothing_into_the_reset_store() {
     coordinator.mark_hydrated(WALLET, true).await;
 
     let key = pass_pause::key(coordinator.store());
-    let in_guard = pass_pause::arm_at(key, Point::AfterWatermarkRead);
-    let first = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.sync(true).await }
-    });
-    wait_for(&in_guard).await;
+    let reset = pass_pause::arm_at(key, Point::AfterClearReset);
     let clear = tokio::spawn({
         let coordinator = coordinator.clone();
         async move { coordinator.clear().await }
     });
-    // Let the Clear start and wait for the first pass's store guard.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for(&reset).await;
     let listed = pass_pause::arm_at(key, Point::AfterListSnapshot);
-    let second = tokio::spawn({
-        let coordinator = coordinator.clone();
-        async move { coordinator.sync(true).await }
-    });
-    // A pass that lists during the Clear stops here; one that waits for it
-    // does not get here before the Clear ends.
-    let _ = tokio::time::timeout(Duration::from_secs(2), listed.reached.acquire()).await;
-    listed.resume.add_permits(1);
-    in_guard.resume.add_permits(1);
-    first.await.unwrap();
+    let mut pass = Box::pin(coordinator.sync(true));
+    // One poll takes the pass as far as it can go now: to its list, unless
+    // the Clear still holds `accounts`.
+    let polled = std::future::Future::poll(
+        pass.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    );
+    assert!(polled.is_pending());
+    let listed_during_the_clear = listed.reached.try_acquire().is_ok();
+    reset.resume.add_permits(1);
     clear.await.unwrap().unwrap();
-    second.await.unwrap();
+    listed.resume.add_permits(1);
+    pass.await;
 
+    assert!(
+        !listed_during_the_clear,
+        "no pass lists the wallets while the Clear holds them"
+    );
     let store = coordinator.store().read().await;
     assert_eq!(
         store.last_synced_note_index(id).unwrap(),

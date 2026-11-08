@@ -1152,6 +1152,9 @@ pub(super) mod pass_pause {
         /// The host save returned; `sync()` has not taken the store guard
         /// to lift the scanned holds yet.
         BeforeScanLift,
+        /// `clear()` has reset the store and released the store guard, and
+        /// still holds `accounts`.
+        AfterClearReset,
     }
 
     type Armed = Mutex<HashMap<(usize, Point), Arc<Pause>>>;
