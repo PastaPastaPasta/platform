@@ -371,7 +371,10 @@ pub enum ShieldedDispositionRefusal {
     /// overwritten; reads of its wallet's dispositions and writes for its
     /// transition are refused until
     /// [`ShieldedStore::ack_disposition`]`(subwallet, st_hash)` removes it.
-    /// The notes it holds stay excluded until then.
+    /// The notes it holds, `held_nullifiers`, stay excluded until then, so
+    /// the host acks it only once its spent state for them is durable.
+    /// The list is empty when the row holds nothing or the list itself cannot
+    /// be read.
     #[error(
         "unreadable shielded spend disposition for account {} transition {}: {detail}",
         subwallet.account_index,
@@ -380,6 +383,7 @@ pub enum ShieldedDispositionRefusal {
     Unreadable {
         subwallet: SubwalletId,
         st_hash: [u8; 32],
+        held_nullifiers: Vec<[u8; 32]>,
         detail: String,
     },
     /// A redrive for this transition or activity is still armed in the
@@ -1933,7 +1937,8 @@ pub(super) mod disposition_contract {
     }
 
     /// A note two unacknowledged dispositions hold stays excluded until both
-    /// are acknowledged.
+    /// are acknowledged. An ack naming another account, or an identical
+    /// second resolution, leaves a hold in place.
     pub(crate) fn ack_lifts_only_its_own_hold<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
         let id = SubwalletId::new([0xCE; 32], 1);
         let shared = [0xB6; 32];
@@ -1948,6 +1953,26 @@ pub(super) mod disposition_contract {
             .resolve_redrive(id, &second.activity_id, ShieldedSpendDisposition::Executed)
             .unwrap();
         assert!(unspent(store, id).is_empty());
+
+        assert!(
+            !store
+                .ack_disposition(SubwalletId::new(id.wallet_id, 2), &first.st_hash())
+                .unwrap(),
+            "an ack naming another account acknowledges nothing"
+        );
+        let before = store.dispositions(id.wallet_id).unwrap();
+        arm_reserved(store, id, &first);
+        assert_eq!(
+            store
+                .resolve_redrive(id, &first.activity_id, ShieldedSpendDisposition::Executed)
+                .expect("an identical resolution completes"),
+            first
+        );
+        assert_eq!(store.dispositions(id.wallet_id).unwrap(), before);
+        assert!(
+            unspent(store, id).is_empty(),
+            "an identical resolution keeps the hold"
+        );
 
         assert!(store.ack_disposition(id, &first.st_hash()).unwrap());
         assert_eq!(

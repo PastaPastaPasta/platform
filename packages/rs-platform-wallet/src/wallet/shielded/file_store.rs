@@ -267,7 +267,9 @@ impl FileBackedShieldedStore {
                 "CREATE TABLE IF NOT EXISTS shielded_spend_dispositions (
                     wallet_id     BLOB    NOT NULL
                         CHECK (typeof(wallet_id) = 'blob' AND length(wallet_id) = 32),
-                    account_index INTEGER NOT NULL,
+                    account_index INTEGER NOT NULL
+                        CHECK (typeof(account_index) = 'integer'
+                               AND account_index BETWEEN 0 AND 4294967295),
                     st_hash       BLOB    NOT NULL
                         CHECK (typeof(st_hash) = 'blob' AND length(st_hash) = 32),
                     activity_id   BLOB    NOT NULL
@@ -317,8 +319,10 @@ impl FileBackedShieldedStore {
     /// spend would otherwise offer those notes again once the host restores
     /// them unspent. Only the key and the list are read, so a row whose other
     /// fields this build cannot decode still holds its notes. The schema
-    /// rejects a malformed list; one read anyway is skipped with a warning
-    /// and its disposition still reads and can be acknowledged.
+    /// rejects a malformed key or list; a row that has one anyway holds
+    /// nothing and is skipped with a warning, and reading its wallet's
+    /// dispositions fails as corrupted. Platform's nullifier set still
+    /// refuses a second spend of its notes.
     fn rehydrate_disposition_holds(&mut self) -> Result<(), FileShieldedStoreError> {
         let conn = self.pending_conn.lock().expect("pending_conn mutex");
         let mut stmt = conn
@@ -725,11 +729,19 @@ impl FileBackedShieldedStore {
             }
             _ => None,
         };
+        let stored_held =
+            row.get::<_, Vec<u8>>(7)
+                .ok()
+                .and_then(|held| match held.as_chunks::<32>() {
+                    (held, []) => Some(held.to_vec()),
+                    _ => None,
+                });
         let corrupted = |detail: String| match stored_key {
             Some((subwallet, st_hash)) => {
                 FileShieldedStoreError::Disposition(ShieldedDispositionRefusal::Unreadable {
                     subwallet,
                     st_hash,
+                    held_nullifiers: stored_held.clone().unwrap_or_default(),
                     detail,
                 })
             }
@@ -2485,8 +2497,8 @@ mod tests {
         }
 
         /// Run a contract check on a fresh file store, then reopen it and
-        /// require the durable dispositions and redrive records to equal what
-        /// the live store reported.
+        /// require the durable dispositions, redrive records and held notes to
+        /// equal what the live store reported.
         fn contract_survives_reopen(
             tag: &str,
             check: impl FnOnce(&mut FileBackedShieldedStore) -> Vec<WalletId>,
@@ -2507,10 +2519,14 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
-            let live = snapshot(&store);
+            let live = (snapshot(&store), store.disposition_holds.clone());
             drop(store);
             let reopened = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-            assert_eq!(snapshot(&reopened), live, "durable state must match memory");
+            assert_eq!(
+                (snapshot(&reopened), reopened.disposition_holds.clone()),
+                live,
+                "durable state must match memory"
+            );
             drop(reopened);
             remove_store_files(&path);
         }
@@ -2589,6 +2605,7 @@ mod tests {
                 ShieldedDispositionRefusal::Unreadable {
                     subwallet: SubwalletId::new([0x72; 32], 4),
                     st_hash: [0x73; 32],
+                    held_nullifiers: vec![[0x74; 32]],
                     detail: "unknown".to_owned(),
                 },
             ] {
@@ -2601,16 +2618,20 @@ mod tests {
             }
         }
 
-        /// The typed refusal for an unreadable stored disposition, naming its key.
+        /// The typed refusal for an unreadable stored disposition: its key and
+        /// the notes it holds.
         fn unreadable<T: std::fmt::Debug>(
             result: Result<T, FileShieldedStoreError>,
-        ) -> (SubwalletId, [u8; 32]) {
+        ) -> (SubwalletId, [u8; 32], Vec<[u8; 32]>) {
             match result {
                 Err(FileShieldedStoreError::Disposition(
                     ShieldedDispositionRefusal::Unreadable {
-                        subwallet, st_hash, ..
+                        subwallet,
+                        st_hash,
+                        held_nullifiers,
+                        ..
                     },
-                )) => (subwallet, st_hash),
+                )) => (subwallet, st_hash, held_nullifiers),
                 other => panic!("expected an unreadable disposition, got {other:?}"),
             }
         }
@@ -2761,8 +2782,12 @@ mod tests {
                     .unwrap();
             }
             let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-            let (subwallet, st_hash) = unreadable(store.dispositions(id.wallet_id));
-            assert_eq!((subwallet, st_hash), (id, redrive.st_hash()));
+            let (subwallet, st_hash, held) = unreadable(store.dispositions(id.wallet_id));
+            assert_eq!(
+                (subwallet, st_hash, held),
+                (id, redrive.st_hash(), vec![input]),
+                "the refusal names the row to acknowledge and the notes it holds"
+            );
             restore_snapshot(&mut store, id, &[input]);
             assert!(unspent(&store, id).is_empty());
             assert!(store.ack_disposition(subwallet, &st_hash).unwrap());
@@ -2988,10 +3013,12 @@ mod tests {
                     let dispositions = store.dispositions(id.wallet_id).unwrap();
                     assert_eq!(dispositions.len(), 1);
                     assert_eq!(dispositions[0].disposition, disposition);
-                    assert_eq!(
-                        dispositions[0].held_nullifiers,
-                        held_by_resolution(&redrive, disposition)
-                    );
+                    let held = if disposition == ShieldedSpendDisposition::Executed {
+                        vec![[0xE3; 32], [0xE4; 32]]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(dispositions[0].held_nullifiers, held);
                     drop(store);
                     remove_store_files(&path);
                 }
@@ -3050,7 +3077,7 @@ mod tests {
                     ],
                 )
                 .unwrap();
-            let key = (id, redrive.st_hash());
+            let key = (id, redrive.st_hash(), Vec::new());
 
             assert_eq!(unreadable(store.dispositions(id.wallet_id)), key);
             assert_eq!(
@@ -3088,7 +3115,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(reason, "a_later_reason", "the row is kept as written");
             }
-            let (subwallet, st_hash) = unreadable(store.dispositions(id.wallet_id));
+            let (subwallet, st_hash, _) = unreadable(store.dispositions(id.wallet_id));
             assert!(store.ack_disposition(subwallet, &st_hash).unwrap());
             assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
             drop(store);
@@ -3144,7 +3171,7 @@ mod tests {
 
             assert!(corrupted(
                 store
-                    .record_disposition(id, &redrive.st_hash(), &redrive.activity_id, rejected,)
+                    .record_disposition(id, &redrive.st_hash(), &redrive.activity_id, rejected)
                     .map(|_| ())
             ));
             arm_reserved(&mut store, id, &redrive);
@@ -3174,6 +3201,8 @@ mod tests {
                 ("at = -1", true),
                 ("account_index = -1", false),
                 ("account_index = 4294967296", false),
+                ("account_index = 'zero'", false),
+                ("account_index = 1.5", false),
                 ("reason = 'a_later_reason'", true),
                 ("disposition = 'unresolved', reason = 'refused'", true),
             ] {
@@ -3188,22 +3217,37 @@ mod tests {
                         ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Refused),
                     )
                     .unwrap());
-                store
+                let rejected = store
                     .pending_conn
                     .lock()
                     .unwrap()
                     .execute_batch(&format!(
                         "UPDATE shielded_spend_dispositions SET {corruption};"
                     ))
-                    .unwrap();
-
+                    .map_err(|e| e.to_string());
                 if key_readable {
+                    rejected.unwrap();
                     assert_eq!(
                         unreadable(store.dispositions(id.wallet_id)),
-                        (id, [0x65; 32]),
+                        (id, [0x65; 32], Vec::new()),
                         "{corruption} must fail the read, naming the row to acknowledge"
                     );
                 } else {
+                    assert!(
+                        matches!(&rejected, Err(e) if e.contains("CHECK constraint failed")),
+                        "the schema must reject {corruption}: {rejected:?}"
+                    );
+                    // A file written outside this schema can still hold one.
+                    store
+                        .pending_conn
+                        .lock()
+                        .unwrap()
+                        .execute_batch(&format!(
+                            "PRAGMA ignore_check_constraints = ON; \
+                             UPDATE shielded_spend_dispositions SET {corruption}; \
+                             PRAGMA ignore_check_constraints = OFF;"
+                        ))
+                        .unwrap();
                     assert!(
                         matches!(
                             store.dispositions(id.wallet_id),
@@ -3223,6 +3267,40 @@ mod tests {
                 drop(store);
                 remove_store_files(&path);
             }
+        }
+
+        /// A held list under a key the schema would reject does not block the
+        /// open; it holds nothing and its wallet's dispositions read as
+        /// corrupted.
+        #[test]
+        fn a_hold_with_an_unreadable_key_does_not_block_the_open() {
+            let path = temp_tree_path("disposition_hold_bad_key");
+            let id = SubwalletId::new([0xDB; 32], 0);
+            let redrive = spend(0x6B, &[[0xED; 32]]);
+            {
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                arm_reserved(&mut store, id, &redrive);
+                store
+                    .resolve_redrive(id, &redrive.activity_id, ShieldedSpendDisposition::Executed)
+                    .unwrap();
+                store
+                    .pending_conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "PRAGMA ignore_check_constraints = ON; \
+                         UPDATE shielded_spend_dispositions SET account_index = 'zero';",
+                    )
+                    .unwrap();
+            }
+            let store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+            assert!(store.disposition_holds.is_empty());
+            assert!(matches!(
+                store.dispositions(id.wallet_id),
+                Err(FileShieldedStoreError::RecoveryCorrupted { .. })
+            ));
+            drop(store);
+            remove_store_files(&path);
         }
 
         #[test]
@@ -3285,7 +3363,25 @@ mod tests {
                 "zeroblob(64)",
             )
             .expect("an executed disposition holds whole nullifiers");
-            assert_eq!(count(&conn, "shielded_spend_dispositions"), 2);
+            let insert_account = |account: &str| {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO shielded_spend_dispositions \
+                         (wallet_id, account_index, st_hash, activity_id, disposition, reason, at) \
+                         VALUES (zeroblob(32), {account}, randomblob(32), zeroblob(32), \
+                                 'not_executed', 'refused', 1)"
+                    ),
+                    [],
+                )
+            };
+            for account in ["NULL", "-1", "4294967296", "'zero'", "1.5", "x'00'"] {
+                assert!(
+                    insert_account(account).is_err(),
+                    "account {account} must be rejected"
+                );
+            }
+            insert_account("4294967295").expect("the largest account index is storable");
+            assert_eq!(count(&conn, "shielded_spend_dispositions"), 3);
             drop(conn);
             drop(store);
             remove_store_files(&path);
