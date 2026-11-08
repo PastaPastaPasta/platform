@@ -713,7 +713,7 @@ async fn a_crash_before_the_host_save_keeps_the_scanned_holds() {
 /// pass's spent state, so the holds stay until their dispositions are
 /// acknowledged.
 #[tokio::test]
-async fn a_later_passs_save_leaves_an_earlier_passs_holds() {
+async fn a_later_save_leaves_the_holds_an_earlier_pass_scanned() {
     let path = tree_path();
     let coordinator = coordinator_on(pool_sdk().await, &path);
     let id = SubwalletId::new(WALLET, 0);
