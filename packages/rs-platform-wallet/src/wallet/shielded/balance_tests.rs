@@ -15,7 +15,7 @@ use crate::error::PlatformWalletError;
 use crate::wallet::persister::{NoPlatformPersistence, WalletPersister};
 use drive_proof_verifier::types::{ShieldedEncryptedNotes, ShieldedEncryptedNotesQuery};
 
-fn tree_path() -> PathBuf {
+pub(super) fn tree_path() -> PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -32,7 +32,11 @@ fn coordinator(path: &std::path::Path) -> NetworkShieldedCoordinator {
     )
 }
 
-async fn register(coordinator: &NetworkShieldedCoordinator, wallet_id: [u8; 32], accounts: &[u32]) {
+pub(super) async fn register(
+    coordinator: &NetworkShieldedCoordinator,
+    wallet_id: [u8; 32],
+    accounts: &[u32],
+) {
     let views = accounts
         .iter()
         .map(|account| {

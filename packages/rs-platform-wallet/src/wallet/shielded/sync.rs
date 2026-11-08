@@ -200,6 +200,8 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     if subwallets.is_empty() {
         return Ok(MultiSyncNotesResult::default());
     }
+    #[cfg(test)]
+    let store_key = pass_pause::key(store);
 
     // Snapshot each subwallet's watermark and the shared tree's
     // current leaf count. Two distinct quantities drive the rest
@@ -217,8 +219,17 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // caught-up subwallet doesn't re-derive nullifiers for notes
     // it already stored, while a lagging one still saves from its
     // own start.
+    //
+    // Both are read under the write guard the whole pass holds (see
+    // below), never under a separate read guard. A purge or restore
+    // that ran between this read and the scan would leave the pass
+    // scanning from a watermark the store no longer has, and writing it
+    // back over the purged or restored one, so a restored note's spend
+    // below it would never be scanned.
+    let mut store = store.write().await;
+    #[cfg(test)]
+    pass_pause::after_watermark_read(store_key).await;
     let (watermarks, already_have, tree_size) = {
-        let store = store.read().await;
         let mut watermarks: BTreeMap<SubwalletId, u64> = BTreeMap::new();
         let mut min_idx: Option<u64> = None;
         for (id, _) in subwallets {
@@ -302,14 +313,13 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
         }));
     }
 
-    // Acquire the store write lock for the whole interleaved consume.
-    // This is the only writer during a pass, so holding it across
+    // The store write guard taken above covers the whole interleaved
+    // consume. This is the only writer during a pass, so holding it across
     // `stream.next().await` is safe: the stream's producer side is the
     // SDK's network fetch loop, which never touches the store, so there
     // is no lock-ordering deadlock. Backpressure is pull-based — a slow
     // append simply polls the stream less often, capping in-flight
     // network fetches at `max_concurrent`.
-    let mut store = store.write().await;
 
     let stream = sync_shielded_notes_stream(sdk, &driver_ivk, aligned_start, Some(sync_config));
     futures::pin_mut!(stream);
@@ -1040,6 +1050,61 @@ mod tests {
         assert!(!newly_spent.contains_key(&b));
         assert!(store.get_unspent_notes(a).unwrap().is_empty());
         assert_eq!(store.get_unspent_notes(b).unwrap().len(), 1);
+    }
+}
+
+/// Test-only pause point in a sync pass, right after it reads the
+/// watermarks, so a test can interleave a purge or restore there.
+#[cfg(test)]
+pub(super) mod pass_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::{RwLock, Semaphore};
+
+    /// One armed pause: the pass adds a permit to `reached` when it stops,
+    /// and waits for a permit on `resume`.
+    pub(crate) struct Pause {
+        pub(crate) reached: Semaphore,
+        pub(crate) resume: Semaphore,
+    }
+
+    fn armed() -> &'static Mutex<HashMap<usize, Arc<Pause>>> {
+        static ARMED: OnceLock<Mutex<HashMap<usize, Arc<Pause>>>> = OnceLock::new();
+        ARMED.get_or_init(Default::default)
+    }
+
+    /// Identifies a store, so a pause armed by one test stops only passes
+    /// over that test's store.
+    pub(crate) fn key<S>(store: &Arc<RwLock<S>>) -> usize {
+        Arc::as_ptr(store) as *const () as usize
+    }
+
+    /// Stop the next pass over the store keyed `key` after its watermark
+    /// read, until the test adds a permit to `resume`.
+    pub(crate) fn arm(key: usize) -> Arc<Pause> {
+        let pause = Arc::new(Pause {
+            reached: Semaphore::new(0),
+            resume: Semaphore::new(0),
+        });
+        armed()
+            .lock()
+            .expect("pass pause registry")
+            .insert(key, pause.clone());
+        pause
+    }
+
+    pub(super) async fn after_watermark_read(key: usize) {
+        let pause = armed().lock().expect("pass pause registry").remove(&key);
+        if let Some(pause) = pause {
+            pause.reached.add_permits(1);
+            pause
+                .resume
+                .acquire()
+                .await
+                .expect("pass pause resume")
+                .forget();
+        }
     }
 }
 
