@@ -26,8 +26,10 @@ use key_wallet::wallet::Wallet;
 use crate::changeset::{AccountRegistrationEntry, PlatformWalletChangeSet};
 use crate::error::PlatformWalletError;
 use crate::wallet::core::{InBroadcastPin, WalletGeneration};
-use crate::wallet::platform_wallet::PlatformWalletInfo;
+use crate::wallet::platform_wallet::{PlatformWalletInfo, WalletId};
 use crate::ASSET_LOCK_FUNDING_SOURCES;
+use key_wallet_manager::WalletManager;
+use tokio::sync::RwLock;
 
 use super::manager::{AssetLockManager, DEFAULT_FEE_PER_KB};
 use super::tracked::{AssetLockStatus, TrackedAssetLock};
@@ -1054,6 +1056,18 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             return Err(error);
         }
 
+        // Until the tracking write, nothing but this call knows the signed
+        // lock, so a cancellation at any await below frees its inputs: see
+        // `UntrackedLockPin`. Every deliberate exit reclaims the pin first.
+        let untracked = UntrackedLockPin {
+            pin: Some(in_broadcast_pin),
+            wallet_manager: &self.wallet_manager,
+            wallet_id: self.wallet_id,
+            funding_accounts: &funding_accounts,
+            tx: &tx,
+            reservation_token,
+        };
+
         // LIFECYCLE GATE. The build's manager guard ended when the fenced build
         // returned, so from here on the wallet can be removed — or removed and
         // re-created under the same id as a new generation — while this call
@@ -1074,12 +1088,12 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         let Some(build_generation) = self
             .current_generation()
             .await
-            .filter(|generation| in_broadcast_pin.is_on(generation))
+            .filter(|generation| untracked.is_on(generation))
         else {
             drop(build_persist_guard);
             return Err(self
                 .abandon_build_of_a_left_wallet(
-                    in_broadcast_pin,
+                    untracked.into_pin(),
                     &funding_accounts,
                     &tx,
                     reservation_token,
@@ -1093,12 +1107,12 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         if !self
             .current_generation()
             .await
-            .is_some_and(|generation| in_broadcast_pin.is_on(&generation))
+            .is_some_and(|generation| untracked.is_on(&generation))
         {
             drop(build_persist_guard);
             return Err(self
                 .abandon_build_of_a_left_wallet(
-                    in_broadcast_pin,
+                    untracked.into_pin(),
                     &funding_accounts,
                     &tx,
                     reservation_token,
@@ -1147,7 +1161,7 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
                 // inputs that provably never went to the wire (same shape as
                 // the drain-floor branch).
                 drop(build_persist_guard);
-                let mut in_broadcast_pin = in_broadcast_pin;
+                let mut in_broadcast_pin = untracked.into_pin();
                 in_broadcast_pin.settle_released_on_drop();
                 crate::wallet::reservations::release_reservation_after_rejected_broadcast(
                     &self.wallet_manager,
@@ -1195,13 +1209,16 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         else {
             return Err(self
                 .abandon_build_of_a_left_wallet(
-                    in_broadcast_pin,
+                    untracked.into_pin(),
                     &funding_accounts,
                     &tx,
                     reservation_token,
                 )
                 .await);
         };
+        // Tracked: a resume can now send the lock, so a cancellation from here
+        // on must leave the pin's pending-spend default in place.
+        let in_broadcast_pin = untracked.into_pin();
         self.queue_asset_lock_changeset(cs_built);
 
         tracing::debug!(
@@ -1464,6 +1481,87 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
         self.queue_asset_lock_changeset(cs_final);
 
         Ok(proof)
+    }
+}
+
+/// The in-broadcast pin of a signed asset lock that nothing else knows of yet:
+/// it is not tracked, so no resume can re-drive it, and it has not reached the
+/// broadcaster.
+///
+/// The funded build holds one across every await between the input-cap check
+/// and its tracking write: the liveness check, the wait for the wallet
+/// generation's lifecycle gate (as long as a teardown takes), the funding-pool
+/// persist and the tracking write itself. If the build's future is dropped at
+/// one of them, nothing can have sent the transaction, so the guard frees what
+/// the build holds: its own reservation, owner-guarded by the build's token,
+/// then the fence. Left to the pin's pending-spend default, the inputs would
+/// stay fenced until an observed spend that never comes, and the fence map
+/// outlives generations, so for the life of the process.
+///
+/// Every exit the build takes on purpose reclaims the pin with
+/// [`into_pin`](Self::into_pin) and settles it itself.
+struct UntrackedLockPin<'a> {
+    pin: Option<InBroadcastPin>,
+    wallet_manager: &'a Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+    wallet_id: WalletId,
+    funding_accounts: &'a [AccountType],
+    tx: &'a Transaction,
+    reservation_token: Option<key_wallet::ReservationToken>,
+}
+
+impl UntrackedLockPin<'_> {
+    fn is_on(&self, generation: &Arc<WalletGeneration>) -> bool {
+        self.pin.as_ref().is_some_and(|pin| pin.is_on(generation))
+    }
+
+    fn into_pin(mut self) -> InBroadcastPin {
+        self.pin.take().expect("the pin is reclaimed once")
+    }
+}
+
+impl Drop for UntrackedLockPin<'_> {
+    fn drop(&mut self) {
+        let Some(mut pin) = self.pin.take() else {
+            return;
+        };
+        pin.settle_released_on_drop();
+        // Only the owner-guarded release, as in
+        // `abandon_build_of_a_left_wallet`: the id may name another generation
+        // by now, and a build without a token reserved nothing.
+        let Some(token) = self.reservation_token else {
+            return;
+        };
+        // `Drop` cannot await. The manager lock is normally free here; when it
+        // is not, the release moves to a task, which keeps the fence raised
+        // until it has run. With no runtime left the fence still comes down,
+        // and the reservation waits for key-wallet's expiry sweep.
+        if let Ok(wm) = self.wallet_manager.try_read() {
+            crate::wallet::reservations::release_reservation_in(
+                &wm,
+                &self.wallet_id,
+                self.funding_accounts,
+                self.tx,
+                Some(token),
+            );
+            drop(wm);
+            drop(pin);
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let wallet_manager = Arc::clone(self.wallet_manager);
+            let wallet_id = self.wallet_id;
+            let funding_accounts = self.funding_accounts.to_vec();
+            let tx = self.tx.clone();
+            runtime.spawn(async move {
+                crate::wallet::reservations::release_reservation_after_rejected_broadcast(
+                    &wallet_manager,
+                    &wallet_id,
+                    &funding_accounts,
+                    &tx,
+                    Some(token),
+                )
+                .await;
+                drop(pin);
+            });
+        }
     }
 }
 
@@ -4432,6 +4530,88 @@ mod tests {
             .filter_map(|al| al.asset_locks.get(&out_point))
             .any(|entry| entry.status == AssetLockStatus::Built);
         assert!(queued_built);
+    }
+
+    /// A build cancelled while it waits at the lifecycle gate, behind a
+    /// teardown that in the end leaves the wallet in place, had signed a lock
+    /// nothing else knows of. Its reservation and its fence go with it, so the
+    /// same coin funds the next build at once.
+    #[tokio::test]
+    async fn a_build_cancelled_at_the_lifecycle_gate_frees_its_coins() {
+        let (wallet_manager, wallet_id, generation, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let funded = the_only_funded_outpoint(&wallet_manager, wallet_id).await;
+        let (manager, persistence) = asset_lock_manager_over(
+            Arc::clone(&wallet_manager),
+            wallet_id,
+            Arc::new(CountingOkBroadcaster::default()),
+        );
+
+        let teardown = generation.teardown_guard().await;
+        let mut build = Box::pin(broadcast_registration_lock(&manager, &signer));
+        tokio::select! {
+            biased;
+            result = &mut build => panic!("the build cannot pass a held gate: {result:?}"),
+            () = wait_for_lifecycle_gate_arrival(&manager) => {}
+        }
+        drop(build);
+        drop(teardown);
+
+        assert_eq!(
+            generation.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Free,
+            "the cancelled build's fence comes down"
+        );
+        assert_eq!(manager.broadcaster.calls(), 0);
+        assert!(!stored_any_asset_lock_row(&persistence));
+        let rebuild = broadcast_registration_lock(&manager, &signer).await;
+        assert!(rebuild.is_ok(), "{rebuild:?}");
+        assert_eq!(manager.broadcaster.calls(), 1);
+    }
+
+    /// As above, with the manager lock taken when the build is dropped: the
+    /// release runs once the lock frees, and the fence stays up until it has.
+    #[tokio::test]
+    async fn a_build_cancelled_while_the_manager_is_busy_frees_its_coins_after() {
+        let (wallet_manager, wallet_id, generation, signer) =
+            funded_wallet_manager(StandardAccountType::BIP44Account).await;
+        let funded = the_only_funded_outpoint(&wallet_manager, wallet_id).await;
+        let (manager, _) = asset_lock_manager_over(
+            Arc::clone(&wallet_manager),
+            wallet_id,
+            Arc::new(CountingOkBroadcaster::default()),
+        );
+
+        let teardown = generation.teardown_guard().await;
+        let mut build = Box::pin(broadcast_registration_lock(&manager, &signer));
+        tokio::select! {
+            biased;
+            result = &mut build => panic!("the build cannot pass a held gate: {result:?}"),
+            () = wait_for_lifecycle_gate_arrival(&manager) => {}
+        }
+        let busy = wallet_manager.write().await;
+        drop(build);
+        assert_eq!(
+            generation.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Fenced,
+            "the fence stays up until the reservation is released"
+        );
+        drop(busy);
+        drop(teardown);
+
+        for _ in 0..10_000 {
+            if generation.try_probe_in_broadcast(&funded) == InBroadcastProbe::Free {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            generation.try_probe_in_broadcast(&funded),
+            InBroadcastProbe::Free
+        );
+        let rebuild = broadcast_registration_lock(&manager, &signer).await;
+        assert!(rebuild.is_ok(), "{rebuild:?}");
+        assert_eq!(manager.broadcaster.calls(), 1);
     }
 
     /// Runs `hook` once, inside the first store `fires_on` picks. The build

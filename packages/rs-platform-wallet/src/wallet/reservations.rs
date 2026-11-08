@@ -231,6 +231,18 @@ pub(crate) async fn release_reservation_after_rejected_broadcast(
     // untouched, so a read lock suffices — this cleanup does not
     // serialize concurrent sends.
     let wm = wallet_manager.read().await;
+    release_reservation_in(&wm, wallet_id, funding_accounts, tx, reservation_token);
+}
+
+/// The release of [`release_reservation_after_rejected_broadcast`], for a
+/// caller that already holds the manager lock and cannot await it.
+pub(crate) fn release_reservation_in(
+    wm: &WalletManager<PlatformWalletInfo>,
+    wallet_id: &WalletId,
+    funding_accounts: &[AccountType],
+    tx: &Transaction,
+    reservation_token: Option<key_wallet::ReservationToken>,
+) {
     let Some((_, info)) = wm.get_wallet_and_info(wallet_id) else {
         tracing::warn!(
             wallet_id = %hex::encode(wallet_id),
