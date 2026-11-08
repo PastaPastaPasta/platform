@@ -2779,9 +2779,27 @@ mod tests {
 
         coordinator.clear().await.expect("clear should succeed");
 
-        // Reopen the persisted file with a FRESH handle: this reads the
-        // on-disk tables cold (no shared in-memory frontier), so a non-zero
-        // size here would mean clear() never wrote the disk.
+        // Read the persisted file through a FRESH tree handle while the
+        // store still lives: this reads the on-disk tables cold (no shared
+        // in-memory frontier), so a non-zero size here would mean clear()
+        // never wrote the disk.
+        let cold = grovedb_commitment_tree::ClientPersistentCommitmentTree::open(
+            rusqlite::Connection::open(&db_path).expect("open the persisted file"),
+            100,
+        )
+        .expect("open a cold tree handle");
+        assert_eq!(
+            cold.max_leaf_position()
+                .unwrap()
+                .map_or(0, |position| u64::from(position) + 1),
+            0,
+            "on-disk commitment tree must read 0 through a cold handle after clear"
+        );
+        drop(cold);
+
+        // One live store per file: release the coordinator's store, then
+        // reopen the file as a store.
+        drop(coordinator);
         let reopened = FileBackedShieldedStore::open_path(&db_path, 100)
             .expect("reopen persisted store after clear");
         assert_eq!(

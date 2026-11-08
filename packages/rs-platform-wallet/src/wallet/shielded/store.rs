@@ -248,6 +248,9 @@ pub enum UnresolvedReason {
     /// notes was no longer reserved, or one was already marked spent (as a
     /// restored snapshot does). The spend may belong to another transition.
     Unattributable,
+    /// The first send failed without a definitive verdict, so the transition
+    /// may still execute.
+    Cancelled,
 }
 
 /// A stored disposition string that this build does not know. Decoding never
@@ -283,6 +286,7 @@ impl ShieldedSpendDisposition {
             Self::Unresolved(UnresolvedReason::DeserializeDropped) => Some("deserialize_dropped"),
             Self::Unresolved(UnresolvedReason::Purged) => Some("purged"),
             Self::Unresolved(UnresolvedReason::Unattributable) => Some("unattributable"),
+            Self::Unresolved(UnresolvedReason::Cancelled) => Some("cancelled"),
         }
     }
 
@@ -308,6 +312,9 @@ impl ShieldedSpendDisposition {
             ("unresolved", Some("purged")) => Some(Self::Unresolved(UnresolvedReason::Purged)),
             ("unresolved", Some("unattributable")) => {
                 Some(Self::Unresolved(UnresolvedReason::Unattributable))
+            }
+            ("unresolved", Some("cancelled")) => {
+                Some(Self::Unresolved(UnresolvedReason::Cancelled))
             }
             _ => None,
         };
@@ -877,6 +884,13 @@ pub trait ShieldedStore: Send + Sync {
     /// per-wallet. Used when a wallet is removed or its shielded
     /// binding is cleared so a later re-bind resyncs from index 0
     /// rather than resuming behind the stale watermark.
+    ///
+    /// The wallet's unacknowledged dispositions are kept, but they stop
+    /// holding notes: their
+    /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
+    /// become empty, durably in the same step. A wallet added again under the
+    /// same id rebuilds its spent state from Platform's nullifiers by scanning,
+    /// and nothing would acknowledge a removed wallet's dispositions.
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error>;
 
     /// Drop the account-scoped state and nullifier-backed redrives for exactly
@@ -1733,6 +1747,13 @@ impl ShieldedStore for InMemoryShieldedStore {
 
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error> {
         self.subwallets.retain(|id, _| id.wallet_id != wallet_id);
+        for record in self
+            .dispositions
+            .values_mut()
+            .filter(|record| record.subwallet.wallet_id == wallet_id)
+        {
+            record.held_nullifiers.clear();
+        }
         Ok(())
     }
 
@@ -2284,14 +2305,16 @@ pub(super) mod disposition_contract {
         assert_eq!(before.1.len(), 2);
 
         store.purge_subwallet(first).unwrap();
-        store.purge_wallet(first.wallet_id).unwrap();
         store.purge_all_subwallets().unwrap();
 
-        assert_eq!(
+        let after = || {
             (
                 store.dispositions(first.wallet_id).unwrap(),
                 store.dispositions(other.wallet_id).unwrap(),
-            ),
+            )
+        };
+        assert_eq!(
+            after(),
             before,
             "purges must leave every unacknowledged disposition"
         );
@@ -2300,9 +2323,87 @@ pub(super) mod disposition_contract {
             .unwrap();
         assert!(
             unspent(store, first).is_empty(),
-            "and the notes an Executed disposition holds"
+            "and an account or all-subwallet purge leaves the notes an Executed disposition holds"
+        );
+
+        store.purge_wallet(first.wallet_id).unwrap();
+        let released: Vec<_> = before
+            .0
+            .into_iter()
+            .map(|record| ShieldedSpendDispositionRecord {
+                held_nullifiers: Vec::new(),
+                ..record
+            })
+            .collect();
+        assert_eq!(
+            (
+                store.dispositions(first.wallet_id).unwrap(),
+                store.dispositions(other.wallet_id).unwrap(),
+            ),
+            (released, before.1),
+            "a wallet purge keeps the dispositions but empties their held lists"
         );
         vec![first.wallet_id, other.wallet_id]
+    }
+
+    /// Removing a wallet releases its holds, durably, and keeps its
+    /// dispositions: added again under the same id, the scan's spent state
+    /// decides its notes. Another wallet's holds stay.
+    pub(crate) fn purge_wallet_releases_its_holds<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC0; 32], 1);
+        let other = SubwalletId::new([0xBC; 32], 0);
+        let executed = spend(0x26, &[[0x96; 32]]);
+        let purged = spend(0x27, &[[0x97; 32], [0x98; 32]]);
+        let kept = spend(0x28, &[[0x99; 32]]);
+        arm_reserved(store, id, &executed);
+        arm_reserved(store, id, &purged);
+        arm_reserved(store, other, &kept);
+        for (subwallet, redrive, disposition) in [
+            (id, &executed, ShieldedSpendDisposition::Executed),
+            (
+                id,
+                &purged,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
+            ),
+            (other, &kept, ShieldedSpendDisposition::Executed),
+        ] {
+            store
+                .resolve_redrive(subwallet, &redrive.activity_id, disposition)
+                .unwrap();
+        }
+        assert!(unspent(store, id).is_empty());
+        let before = store.dispositions(id.wallet_id).unwrap();
+
+        store.purge_wallet(id.wallet_id).unwrap();
+        // The wallet is added again and its scan reports the notes unspent.
+        let inputs = [[0x96; 32], [0x97; 32], [0x98; 32]];
+        for nullifier in inputs {
+            store.save_note(id, &note(nullifier)).unwrap();
+        }
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from(inputs),
+            "the removed wallet's holds are gone"
+        );
+        assert_eq!(store.spendable_balance(id).unwrap(), 3_000);
+        let after = store.dispositions(id.wallet_id).unwrap();
+        assert_eq!(after.len(), before.len(), "its dispositions stay");
+        for (after, before) in after.iter().zip(&before) {
+            assert_eq!(
+                (after.st_hash, after.activity_id, after.disposition),
+                (before.st_hash, before.activity_id, before.disposition)
+            );
+            assert!(after.held_nullifiers.is_empty());
+        }
+
+        store.save_note(other, &note([0x99; 32])).unwrap();
+        assert!(
+            unspent(store, other).is_empty(),
+            "another wallet's hold stays"
+        );
+        vec![id.wallet_id, other.wallet_id]
     }
 
     pub(crate) fn resolve_keeps_reservations_another_redrive_holds<S: ShieldedStore>(
@@ -2435,6 +2536,7 @@ pub(super) mod disposition_contract {
             (0x23u8, UnresolvedReason::DeserializeDropped),
             (0x24, UnresolvedReason::Purged),
             (0x25, UnresolvedReason::Unattributable),
+            (0x29, UnresolvedReason::Cancelled),
         ]
         .into_iter()
         .map(|(tag, reason)| {
@@ -2494,9 +2596,13 @@ pub(super) mod disposition_contract {
             ShieldedSpendDisposition::Unresolved(UnresolvedReason::DeserializeDropped);
         let purged = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
         let unattributable = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable);
+        let cancelled = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled);
         store
             .resolve_redrive(id, &dropped.activity_id, deserialize_dropped)
             .unwrap();
+        assert!(store
+            .record_disposition(id, &[0x1D; 32], &[0x1D; 32], cancelled)
+            .unwrap());
         assert!(store
             .record_disposition(id, &[0x1B; 32], &[0x1B; 32], purged)
             .unwrap());
@@ -2514,6 +2620,7 @@ pub(super) mod disposition_contract {
             (dropped.st_hash(), dropped.activity_id, deserialize_dropped),
             ([0x1B; 32], [0x1B; 32], purged),
             ([0x1C; 32], [0x1C; 32], unattributable),
+            ([0x1D; 32], [0x1D; 32], cancelled),
         ];
         expected.sort_by_key(|(st_hash, _, _)| *st_hash);
         assert_eq!(got, expected);
@@ -3163,6 +3270,11 @@ mod tests {
                 "unresolved",
                 Some("unattributable"),
             ),
+            (
+                Unresolved(UnresolvedReason::Cancelled),
+                "unresolved",
+                Some("cancelled"),
+            ),
         ];
         for (disposition, kind, reason) in table {
             assert_eq!(disposition.kind_str(), kind);
@@ -3177,6 +3289,7 @@ mod tests {
             ("not_executed", None),
             ("not_executed", Some("purged")),
             ("not_executed", Some("unattributable")),
+            ("not_executed", Some("cancelled")),
             ("unresolved", None),
             ("unresolved", Some("refused")),
             ("unresolved", Some("a_later_reason")),
@@ -3262,6 +3375,11 @@ mod tests {
         disposition_contract::unresolved_resolutions_hold_until_ack(
             &mut InMemoryShieldedStore::new(),
         );
+    }
+
+    #[test]
+    fn in_memory_purge_wallet_releases_its_holds() {
+        disposition_contract::purge_wallet_releases_its_holds(&mut InMemoryShieldedStore::new());
     }
 
     #[test]

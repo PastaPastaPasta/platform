@@ -42,6 +42,9 @@ pub enum FileShieldedStoreError {
     },
     /// A disposition write or redrive resolution was refused. Nothing changed.
     Disposition(ShieldedDispositionRefusal),
+    /// Another live store, in this process or another, already owns the file
+    /// at `path`. Nothing was opened; drop that store before opening again.
+    AlreadyOpen { path: PathBuf },
 }
 
 impl fmt::Display for FileShieldedStoreError {
@@ -56,6 +59,11 @@ impl fmt::Display for FileShieldedStoreError {
                 "damaged shielded recovery record (account {account_index:?}): {reason}"
             ),
             Self::Disposition(refusal) => write!(f, "{refusal}"),
+            Self::AlreadyOpen { path } => write!(
+                f,
+                "shielded store {} is already open in another live store",
+                path.display()
+            ),
         }
     }
 }
@@ -90,6 +98,9 @@ impl From<FileShieldedStoreError> for PlatformWalletError {
             },
             FileShieldedStoreError::Disposition(refusal) => {
                 Self::ShieldedDispositionRefused(refusal)
+            }
+            error @ FileShieldedStoreError::AlreadyOpen { .. } => {
+                Self::ShieldedStoreError(error.to_string())
             }
         }
     }
@@ -137,8 +148,14 @@ pub struct FileBackedShieldedStore {
     /// until the disposition is acknowledged. A copy of the table's
     /// `nullifiers` column, loaded at open and changed only after the
     /// statement that changes the column commits. Kept outside `subwallets`,
-    /// so purges, which leave dispositions, leave it too.
+    /// so purges, which leave dispositions, leave it too, except
+    /// [`ShieldedStore::purge_wallet`], which empties a removed wallet's holds.
     disposition_holds: BTreeMap<(SubwalletId, [u8; 32]), Vec<[u8; 32]>>,
+    /// Exclusive lock on the sidecar `<path>.lock`, held for the store's
+    /// lifetime so only one live store owns the file: the holds above and
+    /// the reservations in `subwallets` are per instance. The last field, so
+    /// it is released after both connections close.
+    _owner_lock: std::fs::File,
 }
 
 impl FileBackedShieldedStore {
@@ -205,11 +222,20 @@ impl FileBackedShieldedStore {
     /// `last_synced_note_index`. A torn WAL on power loss would at worst
     /// require resync from the last checkpoint, which is the same cost the
     /// host already accepts on a fresh install.
+    ///
+    /// One live store per file. Holds and reservations live in the store, so
+    /// a second store on the same file would not see them. The store takes an
+    /// exclusive lock on the sidecar `<path>.lock` for its lifetime, and an
+    /// open while another store, in this process or another, holds it fails
+    /// at once with [`FileShieldedStoreError::AlreadyOpen`]. Drop the store
+    /// before opening the file again. The OS releases the lock when the
+    /// process exits, so a crash leaves nothing stale.
     pub fn open_path(
         path: impl AsRef<Path>,
         max_checkpoints: usize,
     ) -> Result<Self, FileShieldedStoreError> {
         let path = path.as_ref().to_path_buf();
+        let owner_lock = Self::lock_owner(&path)?;
         let conn = Self::open_tuned_connection(&path)?;
         let tree = ClientPersistentCommitmentTree::open(conn, max_checkpoints)
             .map_err(|e| FileShieldedStoreError::Storage(format!("open commitment tree: {e}")))?;
@@ -307,10 +333,40 @@ impl FileBackedShieldedStore {
             subwallets: BTreeMap::new(),
             pending_conn: Mutex::new(pending_conn),
             disposition_holds: BTreeMap::new(),
+            _owner_lock: owner_lock,
         };
         store.rehydrate_pending_spends()?;
         store.rehydrate_disposition_holds()?;
         Ok(store)
+    }
+
+    /// Take the store's lifetime lock on the sidecar `<path>.lock`. The SQLite
+    /// file itself is never locked here, so SQLite's own locking is untouched.
+    fn lock_owner(path: &Path) -> Result<std::fs::File, FileShieldedStoreError> {
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                FileShieldedStoreError::Storage(format!(
+                    "open store lock {}: {e}",
+                    Path::new(&lock_path).display()
+                ))
+            })?;
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => Err(FileShieldedStoreError::AlreadyOpen {
+                path: path.to_path_buf(),
+            }),
+            Err(std::fs::TryLockError::Error(e)) => Err(FileShieldedStoreError::Storage(format!(
+                "lock store {}: {e}",
+                Path::new(&lock_path).display()
+            ))),
+        }
     }
 
     /// Load the notes every unacknowledged disposition holds (an `Executed` or
@@ -1383,20 +1439,38 @@ impl ShieldedStore for FileBackedShieldedStore {
         // wallet_id — SQL before memory, so an Err return means neither
         // store was touched (fail-atomic) rather than a memory purge
         // the caller can't distinguish from a no-op.
+        // The wallet's dispositions stay, but stop holding notes, in the
+        // same transaction.
         {
-            let conn = self.pending_conn.lock().expect("pending_conn mutex");
-            conn.execute(
+            let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| FileShieldedStoreError::Storage(format!("begin wallet purge: {e}")))?;
+            tx.execute(
                 "DELETE FROM shielded_pending_spends WHERE wallet_id = ?1",
                 rusqlite::params![wallet_id.as_slice()],
             )
             .map_err(|e| {
                 FileShieldedStoreError::Storage(format!("purge pending spends for wallet: {e}"))
             })?;
+            tx.execute(
+                "UPDATE shielded_spend_dispositions SET nullifiers = x'' \
+                 WHERE wallet_id = ?1 AND length(nullifiers) > 0",
+                rusqlite::params![wallet_id.as_slice()],
+            )
+            .map_err(|e| {
+                FileShieldedStoreError::Storage(format!("release holds for wallet: {e}"))
+            })?;
+            tx.commit().map_err(|e| {
+                FileShieldedStoreError::Storage(format!("commit wallet purge: {e}"))
+            })?;
         }
         // Per-subwallet note / watermark / checkpoint state is
         // in-memory only (`subwallets`); the commitment tree in
         // SQLite is chain-wide and intentionally left intact.
         self.subwallets.retain(|id, _| id.wallet_id != wallet_id);
+        self.disposition_holds
+            .retain(|(id, _), _| id.wallet_id != wallet_id);
         Ok(())
     }
 
@@ -2483,7 +2557,7 @@ mod tests {
         use super::*;
 
         fn remove_store_files(path: &std::path::Path) {
-            for suffix in ["", "-wal", "-shm"] {
+            for suffix in ["", "-wal", "-shm", ".lock"] {
                 let mut file = path.as_os_str().to_owned();
                 file.push(suffix);
                 let _ = std::fs::remove_file(file);
@@ -2595,6 +2669,141 @@ mod tests {
             contract_survives_reopen("disposition_unattributable", |store| {
                 disposition_contract::shared_note_resolves_unattributable(store)
             });
+        }
+
+        #[test]
+        fn purge_wallet_releases_its_holds() {
+            contract_survives_reopen("disposition_purge_wallet_holds", |store| {
+                disposition_contract::purge_wallet_releases_its_holds(store)
+            });
+        }
+
+        /// A wallet purge's release is durable: after a reopen and a same-id
+        /// re-add whose scan reports the notes unspent, they are selectable,
+        /// and the disposition is still listed with an empty held list.
+        #[test]
+        fn a_purged_wallets_holds_stay_gone_after_reopen() {
+            let path = temp_tree_path("disposition_purge_wallet_reopen");
+            let id = SubwalletId::new([0xDE; 32], 0);
+            let input = [0xF3; 32];
+            let redrive = spend(0x73, &[input]);
+            {
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                arm_reserved(&mut store, id, &redrive);
+                store
+                    .resolve_redrive(
+                        id,
+                        &redrive.activity_id,
+                        ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+                    )
+                    .unwrap();
+                store.purge_wallet(id.wallet_id).unwrap();
+            }
+            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+            assert!(store.disposition_holds.is_empty());
+            restore_snapshot(&mut store, id, &[input]);
+            assert_eq!(unspent(&store, id), BTreeSet::from([input]));
+            assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
+            let dispositions = store.dispositions(id.wallet_id).unwrap();
+            assert_eq!(dispositions.len(), 1);
+            assert_eq!(dispositions[0].st_hash, redrive.st_hash());
+            assert!(dispositions[0].held_nullifiers.is_empty());
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// The store refused a second open of `path` because a live store
+        /// owns it.
+        fn assert_already_open<T>(result: Result<T, FileShieldedStoreError>, path: &Path) {
+            match result {
+                Err(FileShieldedStoreError::AlreadyOpen { path: refused }) => {
+                    assert_eq!(refused, path)
+                }
+                Err(other) => panic!("expected AlreadyOpen, got {other}"),
+                Ok(_) => panic!("a second open of a live store must be refused"),
+            }
+        }
+
+        /// One live store per file. A second store would not see the first
+        /// one's holds, so it is refused while the first lives, and the file
+        /// opens again once the first is dropped, with its holds.
+        #[test]
+        fn a_second_open_of_a_live_store_is_refused() {
+            let path = temp_tree_path("store_owner_lock");
+            let id = SubwalletId::new([0xDF; 32], 0);
+            let input = [0xF4; 32];
+            let healthy = [0xF5; 32];
+            let redrive = spend(0x74, &[input]);
+            let mut first = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+            assert_already_open(FileBackedShieldedStore::open_path(&path, 100), &path);
+
+            arm_reserved(&mut first, id, &redrive);
+            first
+                .resolve_redrive(id, &redrive.activity_id, ShieldedSpendDisposition::Executed)
+                .unwrap();
+            assert_already_open(FileBackedShieldedStore::open_path(&path, 100), &path);
+            assert!(matches!(
+                PlatformWalletError::from(FileShieldedStoreError::AlreadyOpen {
+                    path: path.clone()
+                }),
+                PlatformWalletError::ShieldedStoreError(message)
+                    if message.contains(&path.display().to_string())
+            ));
+
+            drop(first);
+            let mut second =
+                FileBackedShieldedStore::open_path(&path, 100).expect("opens once dropped");
+            restore_snapshot(&mut second, id, &[input, healthy]);
+            assert_eq!(unspent(&second, id), BTreeSet::from([healthy]));
+            drop(second);
+            remove_store_files(&path);
+        }
+
+        const LOCK_PROBE_PATH: &str = "PLATFORM_WALLET_STORE_LOCK_PROBE_PATH";
+        const LOCK_PROBE_EXPECT: &str = "PLATFORM_WALLET_STORE_LOCK_PROBE_EXPECT";
+
+        /// Run in a child process by `another_process_cannot_open_a_live_store`;
+        /// a no-op otherwise.
+        #[test]
+        fn store_lock_probe_child() {
+            let Ok(path) = std::env::var(LOCK_PROBE_PATH) else {
+                return;
+            };
+            let path = std::path::PathBuf::from(path);
+            let opened = FileBackedShieldedStore::open_path(&path, 100);
+            match std::env::var(LOCK_PROBE_EXPECT).as_deref() {
+                Ok("refused") => assert_already_open(opened, &path),
+                _ => drop(opened.expect("the file is free")),
+            }
+        }
+
+        #[test]
+        fn another_process_cannot_open_a_live_store() {
+            let path = temp_tree_path("store_owner_lock_process");
+            let probe = |expect: &str| {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "wallet::shielded::file_store::tests::dispositions::store_lock_probe_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(LOCK_PROBE_PATH, &path)
+                    .env(LOCK_PROBE_EXPECT, expect)
+                    .output()
+                    .expect("spawn the test binary");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "the child expecting {expect} failed: {stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            let store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+            probe("refused");
+            drop(store);
+            probe("opens");
+            remove_store_files(&path);
         }
 
         #[test]
@@ -2731,6 +2940,7 @@ mod tests {
                 (0x6Cu8, UnresolvedReason::DeserializeDropped),
                 (0x6D, UnresolvedReason::Purged),
                 (0x6E, UnresolvedReason::Unattributable),
+                (0x75, UnresolvedReason::Cancelled),
             ] {
                 let path = temp_tree_path("disposition_unresolved_crash");
                 let id = SubwalletId::new([0xDC; 32], 0);
@@ -2946,6 +3156,7 @@ mod tests {
                 Unresolved(UnresolvedReason::DeserializeDropped),
                 Unresolved(UnresolvedReason::Purged),
                 Unresolved(UnresolvedReason::Unattributable),
+                Unresolved(UnresolvedReason::Cancelled),
             ];
             let written = {
                 let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
@@ -2977,7 +3188,7 @@ mod tests {
             {
                 let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen 2");
                 assert_eq!(store.dispositions(id.wallet_id).unwrap(), written[1..]);
-                for tag in 2..=8u8 {
+                for tag in 2..=9u8 {
                     assert!(store.ack_disposition(id, &[tag; 32]).unwrap());
                 }
             }
