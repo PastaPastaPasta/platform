@@ -27,7 +27,10 @@ use super::keys::{AccountViewingKeys, OrchardKeySet};
 use super::note_selection::{
     select_notes_for_denomination, select_notes_with_fee, ShieldedFeeKind,
 };
-use super::store::{PendingRedrive, ShieldedNote, ShieldedStore, SubwalletId};
+use super::store::{
+    AsDispositionRefusal, NotExecutedReason, PendingRedrive, ShieldedDispositionRefusal,
+    ShieldedNote, ShieldedSpendDisposition, ShieldedStore, SubwalletId, UnresolvedReason,
+};
 use crate::broadcast_outcome::{broadcast_definitely_failed, carries_consensus_rejection};
 use crate::changeset::{PlatformWalletChangeSet, ShieldedChangeSet};
 use crate::error::{preserve_signer_key_unavailable_or, PlatformWalletError};
@@ -264,7 +267,7 @@ pub(super) async fn queue_shielded_activity<S: ShieldedStore>(
 /// Returns `&[]` for any non-shielded variant (none reach the recorder).
 /// Each shielded variant's `actions()` comes from its own accessor /
 /// methods trait, so the relevant traits are imported locally.
-fn shielded_actions(st: &StateTransition) -> &[dpp::shielded::SerializedAction] {
+pub(super) fn shielded_actions(st: &StateTransition) -> &[dpp::shielded::SerializedAction] {
     // `actions()` is on each type's accessor trait; Shield exposes `actions`
     // only as a public field on its V0 struct, so match down to that
     // variant for it.
@@ -1545,7 +1548,7 @@ pub(in crate::wallet) async fn identity_top_up_from_pool_with_metadata<
                 None,
             )
             .await;
-            cancel_pending(store, id, &selected_notes).await;
+            cancel_pending(store, id, &selected_notes, &pending_entry, &e).await;
             Err(e)
         }
     }
@@ -1742,7 +1745,7 @@ pub async fn unshield<S: ShieldedStore, P: OrchardProver>(
                 None,
             )
             .await;
-            cancel_pending(store, id, &selected_notes).await;
+            cancel_pending(store, id, &selected_notes, &pending_entry, &e).await;
             Err(e)
         }
     }
@@ -1899,7 +1902,7 @@ pub async fn transfer<S: ShieldedStore, P: OrchardProver>(
                 None,
             )
             .await;
-            cancel_pending(store, id, &selected_notes).await;
+            cancel_pending(store, id, &selected_notes, &pending_entry, &e).await;
             Err(e)
         }
     }
@@ -2068,7 +2071,7 @@ pub async fn withdraw<S: ShieldedStore, P: OrchardProver>(
                 None,
             )
             .await;
-            cancel_pending(store, id, &selected_notes).await;
+            cancel_pending(store, id, &selected_notes, &pending_entry, &e).await;
             Err(e)
         }
     }
@@ -2443,7 +2446,7 @@ where
                     None,
                 )
                 .await;
-                cancel_pending(store, id, &selected_notes).await;
+                cancel_pending(store, id, &selected_notes, &pending_entry, &e).await;
             }
             Err(e)
         }
@@ -2755,6 +2758,13 @@ async fn mark_notes_spent<S: ShieldedStore>(
     let mut changeset = ShieldedChangeSet::default();
     {
         let mut store = store.write().await;
+        // Resolve every redrive these notes belong to before marking any
+        // of them, so a failed write leaves them all unmarked.
+        for note in notes {
+            store
+                .resolve_redrives_spending(id, &note.nullifier, None)
+                .map_err(|e| PlatformWalletError::ShieldedStoreError(e.to_string()))?;
+        }
         for note in notes {
             if store
                 .mark_spent(id, &note.nullifier)
@@ -2854,15 +2864,75 @@ async fn finalize_pending<S: ShieldedStore>(
     mark_notes_spent(store, persister, wallet_id, id, notes).await
 }
 
+/// Whether a failed first send proves the transition never executed. Only
+/// a typed consensus error is proof. Every other failure, including a
+/// consensus rejection carried as text, may be a transport failure after
+/// delivery.
+fn first_send_rejected(error: &PlatformWalletError) -> bool {
+    matches!(error, PlatformWalletError::AddressNonceMismatch { .. })
+}
+
+/// Resolve `id`'s redrive for `activity_id` as `disposition` (see
+/// [`ShieldedStore::resolve_redrive`]). Returns `false` when no such redrive
+/// is armed, which is not an error: there is nothing to record.
+fn resolve_if_armed<S: ShieldedStore>(
+    store: &mut S,
+    id: SubwalletId,
+    activity_id: &[u8; 32],
+    disposition: ShieldedSpendDisposition,
+) -> Result<bool, S::Error> {
+    match store.resolve_redrive(id, activity_id, disposition) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.disposition_refusal(),
+                Some(ShieldedDispositionRefusal::RedriveNotFound { .. })
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Roll back a reservation when the broadcast / wait fails.
 /// Best-effort and doesn't surface its own errors — the caller
 /// is already returning the broadcast error.
+///
+/// While the store records spend dispositions, a redrive armed for the
+/// spend's activity is resolved instead, which releases the reservations. A
+/// typed consensus verdict (`first_send`) writes `NotExecuted(Rejected)`;
+/// any other failure writes `Unresolved(Cancelled)`, which holds the notes
+/// until the disposition is acknowledged, since the transition may still
+/// execute. If the write fails, nothing is released.
 async fn cancel_pending<S: ShieldedStore>(
     store: &Arc<RwLock<S>>,
     id: SubwalletId,
     notes: &[ShieldedNote],
+    pending_entry: &Option<super::activity::ShieldedActivityEntry>,
+    first_send: &PlatformWalletError,
 ) {
     let mut store = store.write().await;
+    if let (true, Some(entry)) = (store.records_spend_dispositions(), pending_entry) {
+        let rejected = first_send_rejected(first_send);
+        let disposition = if rejected {
+            ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected)
+        } else {
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled)
+        };
+        match resolve_if_armed(&mut *store, id, &entry.id, disposition) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cancel_pending: resolving the armed redrive failed; keeping the \
+                     reservations for the redrive and prune passes"
+                );
+                return;
+            }
+        }
+    }
     for note in notes {
         if let Err(e) = store.clear_pending(id, &note.nullifier) {
             tracing::warn!(
@@ -3209,6 +3279,10 @@ pub(super) async fn redrive_pending_identity_shields<S: ShieldedStore>(
 /// Runs after the scan's spent-note reconcile (a landed spend's record
 /// was already dropped by the `mark_spent` hook, so anything still
 /// armed here is genuinely unresolved).
+///
+/// While the store records spend dispositions, every resolution writes one
+/// first, and a failed write is returned after the remaining records were
+/// tried, so the sync pass reports it and the next pass retries.
 pub(super) async fn redrive_pending_spends<S: ShieldedStore>(
     sdk: &Arc<dash_sdk::Sdk>,
     store: &Arc<RwLock<S>>,
@@ -3216,19 +3290,31 @@ pub(super) async fn redrive_pending_spends<S: ShieldedStore>(
     wallet_id: WalletId,
     id: SubwalletId,
     recorded: &std::collections::HashSet<[u8; 32]>,
-) {
+) -> Result<(), PlatformWalletError> {
     use dpp::serialization::PlatformDeserializableTrusted;
 
-    let redrives = match store.read().await.pending_redrives(id) {
+    let (redrives, recording) = {
+        let guard = store.read().await;
+        (
+            guard.pending_redrives(id),
+            guard.records_spend_dispositions(),
+        )
+    };
+    let redrives = match redrives {
         Ok(r) => r,
         Err(e) => {
             warn!(
                 error = %e,
                 "redrive: pending_redrives failed; skipping subwallet"
             );
-            return;
+            return if recording {
+                Err(PlatformWalletError::ShieldedStoreError(e.to_string()))
+            } else {
+                Ok(())
+            };
         }
     };
+    let mut failure = None;
     for redrive in redrives {
         // Empty-nullifier identity debits are wallet-wide and are driven by
         // `redrive_pending_identity_shields`, independently of spending anchors.
@@ -3248,12 +3334,30 @@ pub(super) async fn redrive_pending_spends<S: ShieldedStore>(
                     "redrive: stored transition failed to deserialize; dropping the record \
                      (the prune backstop still frees the notes)"
                 );
-                if let Err(e) = store.write().await.clear_redrive(id, &redrive.activity_id) {
-                    warn!(error = %e, "redrive: clear_redrive failed");
+                if let Err(e) = drop_undeserializable_redrive(store, id, &redrive.activity_id).await
+                {
+                    failure = Some(e);
                 }
                 continue;
             }
         };
+        // A record armed before its first send becomes possibly sent here,
+        // durably, before anything goes out. While dispositions are recorded,
+        // a record resolved since it was read (for example abandoned) is not
+        // sent.
+        match store
+            .write()
+            .await
+            .mark_redrive_sent(id, &redrive.activity_id)
+        {
+            Ok(false) if recording => continue,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "redrive: could not record the send; skipping the record");
+                failure = Some(PlatformWalletError::ShieldedStoreError(e.to_string()));
+                continue;
+            }
+        }
         let broadcast_result = st.broadcast(sdk, None).await;
         let err_display = broadcast_result
             .as_ref()
@@ -3289,25 +3393,11 @@ pub(super) async fn redrive_pending_spends<S: ShieldedStore>(
                     "redrive: definitive consensus rejection; the spend can never execute — \
                      releasing the reservation"
                 );
+                if let Err(e) =
+                    release_rejected_redrive(store, persister, wallet_id, id, &redrive).await
                 {
-                    let mut guard = store.write().await;
-                    for n in &redrive.nullifiers {
-                        // Also drops the redrive record via the
-                        // clear_pending hook.
-                        if let Err(e) = guard.clear_pending(id, n) {
-                            warn!(error = %e, "redrive: clear_pending failed");
-                        }
-                    }
+                    failure = Some(e);
                 }
-                record_activity_status_by_id(
-                    store,
-                    persister,
-                    wallet_id,
-                    id,
-                    &redrive.activity_id,
-                    ShieldedActivityStatus::Failed,
-                )
-                .await;
             }
             RedriveBroadcastOutcome::Inconclusive => {
                 // `AlreadyExists` (still in a mempool after a lost-ACK
@@ -3323,6 +3413,82 @@ pub(super) async fn redrive_pending_spends<S: ShieldedStore>(
             }
         }
     }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Drop `id`'s redrive whose stored transition no longer deserializes.
+/// While the store records spend dispositions it is resolved
+/// `Unresolved(DeserializeDropped)` instead, which holds its notes until the
+/// disposition is acknowledged, and a failed write is returned.
+async fn drop_undeserializable_redrive<S: ShieldedStore>(
+    store: &Arc<RwLock<S>>,
+    id: SubwalletId,
+    activity_id: &[u8; 32],
+) -> Result<(), PlatformWalletError> {
+    let mut guard = store.write().await;
+    if !guard.records_spend_dispositions() {
+        if let Err(e) = guard.clear_redrive(id, activity_id) {
+            warn!(error = %e, "redrive: clear_redrive failed");
+        }
+        return Ok(());
+    }
+    guard
+        .resolve_redrive(
+            id,
+            activity_id,
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::DeserializeDropped),
+        )
+        .map(drop)
+        .map_err(|e| {
+            warn!(error = %e, "redrive: recording the dropped record failed");
+            PlatformWalletError::ShieldedStoreError(e.to_string())
+        })
+}
+
+/// Release `redrive` after a re-broadcast drew a definitive consensus
+/// rejection and flip its activity to Failed. While the store records spend
+/// dispositions it is resolved `NotExecuted(Rejected)` first; the activity
+/// flips only if that committed, a record something else already resolved is
+/// left alone, and a failed write is returned.
+async fn release_rejected_redrive<S: ShieldedStore>(
+    store: &Arc<RwLock<S>>,
+    persister: Option<&WalletPersister>,
+    wallet_id: WalletId,
+    id: SubwalletId,
+    redrive: &PendingRedrive,
+) -> Result<(), PlatformWalletError> {
+    {
+        let mut guard = store.write().await;
+        if guard.records_spend_dispositions() {
+            let rejected = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
+            match resolve_if_armed(&mut *guard, id, &redrive.activity_id, rejected) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    warn!(error = %e, "redrive: recording the rejection failed");
+                    return Err(PlatformWalletError::ShieldedStoreError(e.to_string()));
+                }
+            }
+        } else {
+            for n in &redrive.nullifiers {
+                // Also drops the redrive record via the
+                // clear_pending hook.
+                if let Err(e) = guard.clear_pending(id, n) {
+                    warn!(error = %e, "redrive: clear_pending failed");
+                }
+            }
+        }
+    }
+    record_activity_status_by_id(
+        store,
+        persister,
+        wallet_id,
+        id,
+        &redrive.activity_id,
+        ShieldedActivityStatus::Failed,
+    )
+    .await;
+    Ok(())
 }
 
 /// Broadcast a built shielded spend transition (unshield / transfer /
@@ -3940,7 +4106,9 @@ mod redrive_tests {
             .expect("arm identity guard");
         let recorded = [anchor].into_iter().collect();
 
-        redrive_pending_spends(&sdk, &store, None, wallet_id, id, &recorded).await;
+        redrive_pending_spends(&sdk, &store, None, wallet_id, id, &recorded)
+            .await
+            .expect("gate-off redrive pass never fails");
 
         let retained = store.read().await.pending_redrives(id).expect("guard");
         assert_eq!(retained.len(), 1);
@@ -3986,7 +4154,9 @@ mod redrive_tests {
         let recorded: std::collections::HashSet<[u8; 32]> =
             [[11u8; 32], [12u8; 32]].into_iter().collect();
 
-        redrive_pending_spends(&sdk, &store, None, wallet_id, id, &recorded).await;
+        redrive_pending_spends(&sdk, &store, None, wallet_id, id, &recorded)
+            .await
+            .expect("gate-off redrive pass never fails");
 
         let left = store.read().await.pending_redrives(id).unwrap();
         let ids: Vec<[u8; 32]> = left.iter().map(|r| r.activity_id).collect();
@@ -4760,5 +4930,567 @@ mod select_recorded_spends_tests {
             Err(other) => panic!("expected ShieldedNoRecordedAnchor, got error: {other:?}"),
             Ok(_) => panic!("expected ShieldedNoRecordedAnchor, got Ok"),
         }
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use crate::wallet::shielded::activity::ShieldedActivityEntry;
+    use crate::wallet::shielded::file_store::FileBackedShieldedStore;
+    use crate::wallet::shielded::store::disposition_contract::{
+        arm_reserved, assert_holds_by_value, note, spend, unspent,
+    };
+    use crate::wallet::shielded::store::ShieldedSpendDispositionRecord;
+    use std::collections::BTreeSet;
+
+    const N1: [u8; 32] = [0x61; 32];
+    const N2: [u8; 32] = [0x62; 32];
+
+    struct TestStore {
+        path: RemoveOnDrop,
+        store: Arc<RwLock<FileBackedShieldedStore>>,
+    }
+
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", ".lock"] {
+                let mut file = self.0.as_os_str().to_owned();
+                file.push(suffix);
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
+
+    impl TestStore {
+        fn open(tag: &str, recording: bool) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("shielded_release_ops_{tag}_{nanos}.sqlite"));
+            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+            store.set_records_spend_dispositions(recording);
+            Self {
+                path: RemoveOnDrop(path),
+                store: Arc::new(RwLock::new(store)),
+            }
+        }
+
+        /// Close the store and open it again from disk.
+        fn reopen(self) -> Self {
+            let Self { path, store } = self;
+            drop(Arc::try_unwrap(store).ok().expect("sole owner"));
+            let store = FileBackedShieldedStore::open_path(&path.0, 100).expect("reopen");
+            Self {
+                path,
+                store: Arc::new(RwLock::new(store)),
+            }
+        }
+
+        async fn dispositions(&self, id: SubwalletId) -> Vec<ShieldedSpendDispositionRecord> {
+            self.store.read().await.dispositions(id.wallet_id).unwrap()
+        }
+
+        async fn disposition_of(
+            &self,
+            id: SubwalletId,
+            redrive: &PendingRedrive,
+        ) -> Option<ShieldedSpendDisposition> {
+            self.dispositions(id)
+                .await
+                .into_iter()
+                .find(|record| {
+                    record.st_hash == redrive.st_hash() && record.activity_id == redrive.activity_id
+                })
+                .map(|record| record.disposition)
+        }
+
+        /// See [`assert_holds_by_value`].
+        async fn assert_holds(&self, id: SubwalletId, redrives: &[&PendingRedrive]) {
+            assert_holds_by_value(&self.dispositions(id).await, redrives);
+        }
+
+        /// The notes the disposition of `redrive`'s transition holds.
+        async fn held_by(&self, id: SubwalletId, redrive: &PendingRedrive) -> Vec<[u8; 32]> {
+            self.dispositions(id)
+                .await
+                .into_iter()
+                .find(|record| record.st_hash == redrive.st_hash())
+                .expect("disposition")
+                .held_nullifiers
+        }
+
+        async fn save_pending_entry(&self, id: SubwalletId, activity_id: [u8; 32]) {
+            self.store
+                .write()
+                .await
+                .save_activity(id, &pending_entry(activity_id))
+                .unwrap();
+        }
+
+        async fn status(&self, id: SubwalletId, activity_id: &[u8; 32]) -> ShieldedActivityStatus {
+            self.store
+                .read()
+                .await
+                .get_activity_by_entry_id(id, activity_id)
+                .unwrap()
+                .expect("activity")
+                .status
+        }
+    }
+
+    fn pending_entry(activity_id: [u8; 32]) -> ShieldedActivityEntry {
+        ShieldedActivityEntry {
+            id: activity_id,
+            kind: ShieldedActivityKind::Sent,
+            direction: ShieldedDirection::Out,
+            amount: 1,
+            fee: None,
+            counterparty: None,
+            memo: None,
+            block_height: None,
+            status: ShieldedActivityStatus::Pending,
+            created_at_ms: 1,
+            min_note_position: None,
+            note_cmxs: vec![],
+            spent_nullifiers: vec![],
+        }
+    }
+
+    fn notes(redrive: &PendingRedrive) -> Vec<ShieldedNote> {
+        redrive.nullifiers.iter().map(|n| note(*n)).collect()
+    }
+
+    #[tokio::test]
+    async fn definitive_rejection_records_not_executed_first() {
+        let test = TestStore::open("rejection", true);
+        let id = SubwalletId::new([0xD1; 32], 0);
+        let first = spend(0x71, &[N1, N2]);
+        arm_reserved(&mut *test.store.write().await, id, &first);
+        test.save_pending_entry(id, first.activity_id).await;
+
+        // A failed write releases nothing and leaves the activity alone.
+        test.store.read().await.fail_disposition_writes(true);
+        assert!(
+            release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            test.store.read().await.pending_redrives(id).unwrap(),
+            vec![first.clone()]
+        );
+        assert!(unspent(&*test.store.read().await, id).is_empty());
+        assert_eq!(
+            test.status(id, &first.activity_id).await,
+            ShieldedActivityStatus::Pending
+        );
+        test.store.read().await.fail_disposition_writes(false);
+
+        release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
+            .await
+            .unwrap();
+        let rejected = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
+        assert_eq!(test.disposition_of(id, &first).await, Some(rejected));
+        assert_eq!(
+            unspent(&*test.store.read().await, id),
+            BTreeSet::from([N1, N2])
+        );
+        assert_eq!(
+            test.status(id, &first.activity_id).await,
+            ShieldedActivityStatus::Failed
+        );
+        // A record something else already resolved is left alone.
+        release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
+            .await
+            .unwrap();
+
+        let test = test.reopen();
+        assert_eq!(test.disposition_of(id, &first).await, Some(rejected));
+        test.assert_holds(id, &[&first]).await;
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_off_definitive_rejection_writes_no_disposition() {
+        let test = TestStore::open("rejection_off", false);
+        let id = SubwalletId::new([0xD2; 32], 0);
+        let first = spend(0x72, &[N1, N2]);
+        arm_reserved(&mut *test.store.write().await, id, &first);
+        test.save_pending_entry(id, first.activity_id).await;
+        release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
+            .await
+            .unwrap();
+        assert!(test.dispositions(id).await.is_empty());
+        assert_eq!(
+            unspent(&*test.store.read().await, id),
+            BTreeSet::from([N1, N2])
+        );
+        assert_eq!(
+            test.status(id, &first.activity_id).await,
+            ShieldedActivityStatus::Failed
+        );
+        let test = test.reopen();
+        assert!(test.dispositions(id).await.is_empty());
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn deserialize_drop_records_unresolved() {
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let test = TestStore::open("deserialize_drop", true);
+        let id = SubwalletId::new([0xD3; 32], 0);
+        // `spend` bytes never deserialize into a transition.
+        let first = spend(0x73, &[N1]);
+        arm_reserved(&mut *test.store.write().await, id, &first);
+        let recorded = [first.anchor].into_iter().collect();
+
+        test.store.read().await.fail_disposition_writes(true);
+        assert!(
+            redrive_pending_spends(&sdk, &test.store, None, id.wallet_id, id, &recorded)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            test.store.read().await.pending_redrives(id).unwrap(),
+            vec![first.clone()]
+        );
+        test.store.read().await.fail_disposition_writes(false);
+
+        redrive_pending_spends(&sdk, &test.store, None, id.wallet_id, id, &recorded)
+            .await
+            .unwrap();
+        let dropped = ShieldedSpendDisposition::Unresolved(UnresolvedReason::DeserializeDropped);
+        assert_eq!(test.disposition_of(id, &first).await, Some(dropped));
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+        assert!(
+            unspent(&*test.store.read().await, id).is_empty(),
+            "the dropped record holds its note until acknowledged"
+        );
+        let test = test.reopen();
+        assert_eq!(test.disposition_of(id, &first).await, Some(dropped));
+        test.assert_holds(id, &[&first]).await;
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_off_deserialize_drop_writes_no_disposition() {
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let test = TestStore::open("deserialize_drop_off", false);
+        let id = SubwalletId::new([0xD4; 32], 0);
+        let first = spend(0x74, &[N1]);
+        arm_reserved(&mut *test.store.write().await, id, &first);
+        let recorded = [first.anchor].into_iter().collect();
+        redrive_pending_spends(&sdk, &test.store, None, id.wallet_id, id, &recorded)
+            .await
+            .unwrap();
+        assert!(test.dispositions(id).await.is_empty());
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+        assert!(unspent(&*test.store.read().await, id).is_empty());
+        let test = test.reopen();
+        assert!(test.dispositions(id).await.is_empty());
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_after_armed_first_send_records_disposition() {
+        let test = TestStore::open("cancel_armed", true);
+        let id = SubwalletId::new([0xD5; 32], 0);
+        // Armed by hand before the first send.
+        let rejected = spend(0x75, &[N1]);
+        let unproven = spend(0x76, &[N2]);
+        let unarmed_note = [0x63; 32];
+        {
+            let mut store = test.store.write().await;
+            arm_reserved(&mut *store, id, &rejected);
+            arm_reserved(&mut *store, id, &unproven);
+            store.save_note(id, &note(unarmed_note)).unwrap();
+            store.mark_pending(id, &unarmed_note).unwrap();
+        }
+        let verdict = nonce_rejection();
+        let transport = PlatformWalletError::ShieldedBroadcastFailed("connection reset".to_owned());
+
+        test.store.read().await.fail_disposition_writes(true);
+        cancel_pending(
+            &test.store,
+            id,
+            &notes(&rejected),
+            &Some(pending_entry(rejected.activity_id)),
+            &verdict,
+        )
+        .await;
+        assert!(
+            unspent(&*test.store.read().await, id).is_empty(),
+            "a failed write releases nothing"
+        );
+        test.store.read().await.fail_disposition_writes(false);
+
+        cancel_pending(
+            &test.store,
+            id,
+            &notes(&rejected),
+            &Some(pending_entry(rejected.activity_id)),
+            &verdict,
+        )
+        .await;
+        cancel_pending(
+            &test.store,
+            id,
+            &notes(&unproven),
+            &Some(pending_entry(unproven.activity_id)),
+            &transport,
+        )
+        .await;
+        // No redrive armed for the activity: nothing is written.
+        cancel_pending(
+            &test.store,
+            id,
+            &[note(unarmed_note)],
+            &Some(pending_entry([0x77; 32])),
+            &verdict,
+        )
+        .await;
+        let rejected_disposition =
+            ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
+        let cancelled = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled);
+        assert_eq!(
+            test.disposition_of(id, &rejected).await,
+            Some(rejected_disposition)
+        );
+        assert_eq!(test.disposition_of(id, &unproven).await, Some(cancelled));
+        assert_eq!(test.dispositions(id).await.len(), 2);
+        assert_eq!(
+            unspent(&*test.store.read().await, id),
+            BTreeSet::from([N1, unarmed_note]),
+            "an unproven failure holds its notes until acknowledged"
+        );
+        assert!(
+            test.store
+                .read()
+                .await
+                .stale_pending_spends(id)
+                .unwrap()
+                .is_empty(),
+            "a held note gives the prune backstop nothing to release"
+        );
+        assert_eq!(test.held_by(id, &rejected).await, Vec::<[u8; 32]>::new());
+        assert_eq!(test.held_by(id, &unproven).await, vec![N2]);
+        let test = test.reopen();
+        assert_eq!(
+            test.disposition_of(id, &rejected).await,
+            Some(rejected_disposition)
+        );
+        assert_eq!(test.disposition_of(id, &unproven).await, Some(cancelled));
+        test.assert_holds(id, &[&rejected, &unproven]).await;
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+        {
+            let mut store = test.store.write().await;
+            store.save_note(id, &note(N1)).unwrap();
+            store.save_note(id, &note(N2)).unwrap();
+            assert_eq!(
+                unspent(&*store, id),
+                BTreeSet::from([N1]),
+                "the hold survives a reopen"
+            );
+            assert!(store.ack_disposition(id, &unproven.st_hash()).unwrap());
+            assert_eq!(unspent(&*store, id), BTreeSet::from([N1, N2]));
+        }
+    }
+
+    fn nonce_rejection() -> PlatformWalletError {
+        PlatformWalletError::AddressNonceMismatch {
+            address: dpp::address_funds::PlatformAddress::P2pkh([7; 20]),
+            provided_nonce: 1,
+            expected_nonce: 2,
+        }
+    }
+
+    #[test]
+    fn only_a_typed_consensus_verdict_proves_a_first_send_rejected() {
+        assert!(first_send_rejected(&nonce_rejection()));
+        assert!(!first_send_rejected(
+            &PlatformWalletError::ShieldedBroadcastFailed("connection refused".to_owned())
+        ));
+    }
+
+    #[tokio::test]
+    async fn switch_off_cancel_writes_no_disposition() {
+        let test = TestStore::open("cancel_off", false);
+        let id = SubwalletId::new([0xD6; 32], 0);
+        let first = spend(0x78, &[N1]);
+        arm_reserved(&mut *test.store.write().await, id, &first);
+        cancel_pending(
+            &test.store,
+            id,
+            &notes(&first),
+            &Some(pending_entry(first.activity_id)),
+            &nonce_rejection(),
+        )
+        .await;
+        assert!(test.dispositions(id).await.is_empty());
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(unspent(&*test.store.read().await, id), BTreeSet::from([N1]));
+        let test = test.reopen();
+        assert!(test.dispositions(id).await.is_empty());
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_resolves_every_record_before_marking_any_note() {
+        let test = TestStore::open("finalize", true);
+        let wallet_id = [0xD7; 32];
+        let id = SubwalletId::new(wallet_id, 0);
+        let first = spend(0x79, &[N1]);
+        let second = spend(0x7A, &[N2]);
+        {
+            let mut store = test.store.write().await;
+            arm_reserved(&mut *store, id, &first);
+            arm_reserved(&mut *store, id, &second);
+        }
+        let both = [note(N1), note(N2)];
+        // Only the second note's resolution fails.
+        test.store
+            .read()
+            .await
+            .fail_disposition_write_for(&second.activity_id, true);
+        assert!(finalize_pending(&test.store, None, wallet_id, id, &both)
+            .await
+            .is_err());
+        assert!(
+            test.store
+                .read()
+                .await
+                .get_all_notes(id)
+                .unwrap()
+                .iter()
+                .all(|n| !n.is_spent),
+            "a failed write marks no note spent"
+        );
+        test.store
+            .read()
+            .await
+            .fail_disposition_write_for(&second.activity_id, false);
+        finalize_pending(&test.store, None, wallet_id, id, &both)
+            .await
+            .unwrap();
+        assert!(test
+            .store
+            .read()
+            .await
+            .get_all_notes(id)
+            .unwrap()
+            .iter()
+            .all(|n| n.is_spent));
+        // This send's success says nothing about other records holding its
+        // notes.
+        let unattributable = Some(ShieldedSpendDisposition::Unresolved(
+            UnresolvedReason::Unattributable,
+        ));
+        assert_eq!(test.disposition_of(id, &first).await, unattributable);
+        assert_eq!(test.disposition_of(id, &second).await, unattributable);
+        let test = test.reopen();
+        assert_eq!(test.dispositions(id).await.len(), 2);
+        test.assert_holds(id, &[&first, &second]).await;
+    }
+
+    #[tokio::test]
+    async fn redrive_marks_an_unsent_record_sent_before_broadcasting() {
+        use dpp::serialization::PlatformSerializable;
+        use dpp::state_transition::shield_from_identity_transition::v0::ShieldFromIdentityTransitionV0;
+
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let test = TestStore::open("unsent_redrive", true);
+        let id = SubwalletId::new([0xD8; 32], 0);
+        // Any transition that deserializes reaches the broadcast; the mock
+        // SDK then fails it as inconclusive.
+        let transition: StateTransition = ShieldFromIdentityTransitionV0 {
+            identity_id: [0x7B; 32].into(),
+            amount: 1_000,
+            actions: vec![],
+            anchor: [1; 32],
+            proof: vec![],
+            binding_signature: [0; 64],
+            nonce: 1,
+            user_fee_increase: 0,
+            signature_public_key_id: 1,
+            signature: dpp::platform_value::BinaryData::new(vec![]),
+        }
+        .into();
+        let mut first = spend(0x7C, &[N1]);
+        first.st_bytes = transition.serialize_to_bytes().unwrap();
+        {
+            let mut store = test.store.write().await;
+            store.save_note(id, &note(N1)).unwrap();
+            store.mark_pending(id, &N1).unwrap();
+            store.arm_unsent_redrive(id, first.clone()).unwrap();
+        }
+        let recorded = [first.anchor].into_iter().collect();
+        redrive_pending_spends(&sdk, &test.store, None, id.wallet_id, id, &recorded)
+            .await
+            .unwrap();
+        let store = test.store.read().await;
+        assert_eq!(
+            store.redrive_row_unsent(id, &first.activity_id),
+            Some(false)
+        );
+        assert_eq!(store.pending_redrives(id).unwrap()[0].attempts, 1);
     }
 }

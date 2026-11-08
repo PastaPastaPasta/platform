@@ -23,9 +23,10 @@ use grovedb_commitment_tree::{ClientPersistentCommitmentTree, Position, Retentio
 
 use super::balance::{ShieldedBalanceSource, ShieldedLocalAccountBalance};
 use super::store::{
-    disposition_to_write, held_by_resolution, AsDispositionRefusal, PendingRedrive,
-    ShieldedDispositionRefusal, ShieldedNote, ShieldedOutgoingNote, ShieldedSpendDisposition,
-    ShieldedSpendDispositionRecord, ShieldedStore, StalePendingSpend, SubwalletId, SubwalletState,
+    disposition_to_write, held_by_resolution, AsDispositionRefusal, NotExecutedReason,
+    PendingRedrive, ShieldedDispositionRefusal, ShieldedNote, ShieldedOutgoingNote,
+    ShieldedSpendDisposition, ShieldedSpendDispositionRecord, ShieldedStore, StalePendingSpend,
+    SubwalletId, SubwalletState, UnresolvedReason,
 };
 use crate::error::PlatformWalletError;
 use crate::wallet::platform_wallet::WalletId;
@@ -163,6 +164,9 @@ pub struct FileBackedShieldedStore {
     /// the subwallet's next completed scan. A copy of the table's
     /// `released_by_scan` column, kept like `disposition_holds`.
     holds_awaiting_scan: BTreeSet<(SubwalletId, [u8; 32])>,
+    /// [`ShieldedStore::records_spend_dispositions`]. Off at open; only the
+    /// owning coordinator turns it on.
+    records_dispositions: bool,
     /// Exclusive lock on the sidecar `<path>.lock`, held for the store's
     /// lifetime so only one live store owns the file: the holds above and
     /// the reservations in `subwallets` are per instance. The last field, so
@@ -178,6 +182,13 @@ impl FileBackedShieldedStore {
             .range((id, [0u8; 32])..=(id, [0xFF; 32]))
             .flat_map(|(_, nullifiers)| nullifiers.iter().copied())
             .collect()
+    }
+
+    /// Turn [`ShieldedStore::records_spend_dispositions`] on or off. Taken
+    /// under the store's write guard, so it changes between operations and
+    /// never inside one.
+    pub(super) fn set_records_spend_dispositions(&mut self, on: bool) {
+        self.records_dispositions = on;
     }
 
     /// Called under the coordinator's store read guard so amount and provenance
@@ -271,6 +282,7 @@ impl FileBackedShieldedStore {
                     attempts      INTEGER NOT NULL DEFAULT 0,
                     identity_nonce_finalized INTEGER NOT NULL DEFAULT 0,
                     identity_user_abandoned INTEGER NOT NULL DEFAULT 0,
+                    unsent        INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (wallet_id, account_index, activity_id)
                 )",
                 [],
@@ -278,7 +290,8 @@ impl FileBackedShieldedStore {
             .map_err(|e| {
                 FileShieldedStoreError::Storage(format!("create pending_spends table: {e}"))
             })?;
-        // Additive, idempotent migration: old guards remain active.
+        // Additive, idempotent migration: old guards remain active, and a
+        // record written before `unsent` existed reads as possibly sent.
         let columns = {
             let mut statement = pending_conn
                 .prepare("PRAGMA table_info(shielded_pending_spends)")
@@ -293,7 +306,11 @@ impl FileBackedShieldedStore {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| FileShieldedStoreError::Storage(format!("read pending column: {e}")))?
         };
-        for column in ["identity_nonce_finalized", "identity_user_abandoned"] {
+        for column in [
+            "identity_nonce_finalized",
+            "identity_user_abandoned",
+            "unsent",
+        ] {
             if !columns.iter().any(|existing| existing == column) {
                 pending_conn.execute(&format!("ALTER TABLE shielded_pending_spends ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"), [])
                     .map_err(|e| FileShieldedStoreError::Storage(format!("upgrade pending schema: {e}")))?;
@@ -381,6 +398,7 @@ impl FileBackedShieldedStore {
             pending_conn: Mutex::new(pending_conn),
             disposition_holds: BTreeMap::new(),
             holds_awaiting_scan: BTreeSet::new(),
+            records_dispositions: false,
             _owner_lock: owner_lock,
         };
         store.rehydrate_pending_spends()?;
@@ -541,7 +559,8 @@ impl FileBackedShieldedStore {
         let mut stmt = conn
             .prepare(
                 "SELECT wallet_id, account_index, activity_id, anchor, nullifiers, st_bytes, \
-                 attempts, identity_nonce_finalized, identity_user_abandoned FROM shielded_pending_spends",
+                 attempts, identity_nonce_finalized, identity_user_abandoned, unsent \
+                 FROM shielded_pending_spends",
             )
             .map_err(|e| FileShieldedStoreError::Storage(format!("prepare rehydrate: {e}")))?;
         let rows = stmt
@@ -562,6 +581,7 @@ impl FileBackedShieldedStore {
                         row.get::<_, u32>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 })();
                 Ok((classifiable_st_bytes, decoded))
@@ -586,6 +606,7 @@ impl FileBackedShieldedStore {
                 attempts,
                 identity_nonce_finalized,
                 identity_user_abandoned,
+                unsent,
             ) = match decoded {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -610,8 +631,13 @@ impl FileBackedShieldedStore {
                 };
                 if !matches!(identity_nonce_finalized, 0 | 1)
                     || !matches!(identity_user_abandoned, 0 | 1)
+                    || !matches!(unsent, 0 | 1)
                 {
                     return Err(corrupted("invalid recovery-state flag"));
+                }
+                let unsent = unsent == 1;
+                if unsent && nullifiers.is_empty() {
+                    return Err(corrupted("never-broadcast flag on an identity debit"));
                 }
                 let identity_nonce_finalized = identity_nonce_finalized == 1;
                 let identity_user_abandoned = identity_user_abandoned == 1;
@@ -647,6 +673,7 @@ impl FileBackedShieldedStore {
                 let nullifiers: Vec<[u8; 32]> = nullifiers.as_chunks::<32>().0.to_vec();
                 Ok((
                     SubwalletId::new(wallet_id, account_index),
+                    unsent,
                     PendingRedrive {
                         activity_id,
                         anchor,
@@ -658,7 +685,7 @@ impl FileBackedShieldedStore {
                     },
                 ))
             })();
-            let (id, redrive) = match decoded {
+            let (id, unsent, redrive) = match decoded {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     if let Some(kind) = note_spend_kind {
@@ -678,7 +705,11 @@ impl FileBackedShieldedStore {
                 sw.mark_pending(n);
                 sw.set_pending_spend(n, redrive.anchor, redrive.activity_id);
             }
-            sw.arm_redrive(redrive);
+            if unsent {
+                sw.arm_unsent_redrive(redrive);
+            } else {
+                sw.arm_redrive(redrive);
+            }
         }
         Ok(())
     }
@@ -982,6 +1013,325 @@ impl FileBackedShieldedStore {
     }
 }
 
+impl FileBackedShieldedStore {
+    /// Resolve `id`'s note-spend redrives, each with its disposition, in one
+    /// transaction, as [`ShieldedStore::resolve_redrive`] resolves one: every
+    /// disposition is written with the notes it holds
+    /// ([`held_by_resolution`]) and every redrive row deleted, or nothing is.
+    /// Memory changes only after the commit: the holds are cached and each
+    /// redrive's reservations released.
+    fn commit_resolutions(
+        &mut self,
+        id: SubwalletId,
+        resolutions: &[([u8; 32], ShieldedSpendDisposition)],
+    ) -> Result<Vec<PendingRedrive>, FileShieldedStoreError> {
+        let mut planned = Vec::with_capacity(resolutions.len());
+        {
+            let sw = self.subwallets.get(&id);
+            for (activity_id, disposition) in resolutions {
+                let redrive = sw
+                    .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
+                        activity_id: *activity_id,
+                    })?
+                    .redrive_to_resolve(activity_id, *disposition)?;
+                planned.push((
+                    *activity_id,
+                    redrive.st_hash(),
+                    *disposition,
+                    held_by_resolution(redrive, *disposition),
+                ));
+            }
+        }
+        // Every durable effect commits in this one transaction, before any
+        // memory changes; an early return rolls it back.
+        let mut written = Vec::with_capacity(planned.len());
+        {
+            let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| {
+                    FileShieldedStoreError::Storage(format!("begin redrive resolution: {e}"))
+                })?;
+            for (activity_id, st_hash, disposition, held) in &planned {
+                let existing = Self::read_disposition(&tx, id.wallet_id, st_hash)?;
+                let record = disposition_to_write(
+                    existing.as_ref(),
+                    id,
+                    st_hash,
+                    activity_id,
+                    *disposition,
+                    held,
+                )?;
+                if let Some(record) = record {
+                    Self::insert_disposition(&tx, &record)?;
+                    written.push(record);
+                }
+                let deleted = tx
+                    .execute(
+                        "DELETE FROM shielded_pending_spends \
+                         WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
+                        rusqlite::params![
+                            id.wallet_id.as_slice(),
+                            id.account_index,
+                            activity_id.as_slice(),
+                        ],
+                    )
+                    .map_err(|e| {
+                        FileShieldedStoreError::Storage(format!("delete resolved redrive row: {e}"))
+                    })?;
+                if deleted != 1 {
+                    return Err(FileShieldedStoreError::Storage(format!(
+                        "armed redrive for activity {} has no durable row; nothing was resolved",
+                        hex::encode(activity_id)
+                    )));
+                }
+            }
+            tx.commit().map_err(|e| {
+                FileShieldedStoreError::Storage(format!("commit redrive resolution: {e}"))
+            })?;
+        }
+        self.cache_holds(written);
+        let Some(sw) = self.subwallets.get_mut(&id) else {
+            return Err(FileShieldedStoreError::Storage(
+                "subwallet vanished during redrive resolution".into(),
+            ));
+        };
+        planned
+            .iter()
+            .map(|(activity_id, ..)| {
+                sw.remove_redrive_and_release(activity_id).ok_or_else(|| {
+                    FileShieldedStoreError::Storage(format!(
+                        "redrive for activity {} vanished during resolution",
+                        hex::encode(activity_id)
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// Cache the holds of dispositions whose rows just committed.
+    fn cache_holds(&mut self, written: Vec<ShieldedSpendDispositionRecord>) {
+        for record in written {
+            if !record.held_nullifiers.is_empty() {
+                self.disposition_holds
+                    .insert((record.subwallet, record.st_hash), record.held_nullifiers);
+            }
+        }
+    }
+
+    /// Resolve `id`'s note-spend redrive for `activity_id` after its
+    /// transition's outputs were observed on chain: `Executed` while the
+    /// redrive alone still reserves every one of its unspent notes, otherwise
+    /// `Unresolved(Unattributable)`. Either value holds the redrive's notes
+    /// until the disposition is acknowledged.
+    pub(super) fn resolve_observed_execution(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<(), FileShieldedStoreError> {
+        let disposition = self
+            .subwallets
+            .get(&id)
+            .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
+                activity_id: *activity_id,
+            })?
+            .observed_execution_disposition(activity_id);
+        self.resolve_redrive(id, activity_id, disposition).map(drop)
+    }
+
+    /// Resolve `id`'s note-spend redrive for `activity_id` as
+    /// `NotExecuted(Abandoned)` and release its notes, only while the store
+    /// shows it was never broadcast. Refused with
+    /// [`ShieldedDispositionRefusal::NotRecording`] while the disposition
+    /// switch is off and with
+    /// [`ShieldedDispositionRefusal::MayHaveBeenBroadcast`] once it may have
+    /// gone out; nothing changes on any error.
+    pub(super) fn abandon_unsent_redrive(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<PendingRedrive, FileShieldedStoreError> {
+        let abandoned = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Abandoned);
+        if !self.records_dispositions {
+            return Err(ShieldedDispositionRefusal::NotRecording.into());
+        }
+        let sw = self
+            .subwallets
+            .get(&id)
+            .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
+                activity_id: *activity_id,
+            })?;
+        sw.redrive_to_resolve(activity_id, abandoned)?;
+        if !sw.redrive_is_unsent(activity_id) {
+            return Err(ShieldedDispositionRefusal::MayHaveBeenBroadcast {
+                activity_id: *activity_id,
+            }
+            .into());
+        }
+        self.resolve_redrive(id, activity_id, abandoned)
+    }
+
+    /// Whether any note `id`'s redrive for `activity_id` spends is already
+    /// marked spent.
+    pub(super) fn redrive_spends_a_spent_note(
+        &self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> bool {
+        self.subwallets
+            .get(&id)
+            .is_some_and(|sw| sw.redrive_spends_a_spent_note(activity_id))
+    }
+
+    /// Delete pending-spend rows with `delete` in one transaction, and drop
+    /// the in-scope subwallets' state with `drop_memory` after the commit.
+    /// While the disposition switch is on, every armed note-spend redrive in
+    /// scope is first resolved [`UnresolvedReason::Purged`] in the same
+    /// transaction, holding its notes as [`ShieldedStore::resolve_redrive`]
+    /// does; a conflicting disposition fails the purge with nothing changed.
+    fn purge_pending(
+        &mut self,
+        in_scope: impl Fn(&SubwalletId) -> bool,
+        delete: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<()>,
+        drop_memory: impl FnOnce(&mut Self),
+        what: &str,
+    ) -> Result<(), FileShieldedStoreError> {
+        let purged_disposition = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
+        let purged: Vec<(SubwalletId, PendingRedrive)> = if self.records_dispositions {
+            self.subwallets
+                .iter()
+                .filter(|(id, _)| in_scope(id))
+                .flat_map(|(id, sw)| {
+                    sw.pending_redrives()
+                        .into_iter()
+                        .filter(|redrive| !redrive.nullifiers.is_empty())
+                        .map(|redrive| (*id, redrive))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut written = Vec::with_capacity(purged.len());
+        {
+            let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| FileShieldedStoreError::Storage(format!("begin purge: {e}")))?;
+            for (id, redrive) in &purged {
+                let st_hash = redrive.st_hash();
+                let existing = Self::read_disposition(&tx, id.wallet_id, &st_hash)?;
+                if let Some(record) = disposition_to_write(
+                    existing.as_ref(),
+                    *id,
+                    &st_hash,
+                    &redrive.activity_id,
+                    purged_disposition,
+                    &held_by_resolution(redrive, purged_disposition),
+                )? {
+                    Self::insert_disposition(&tx, &record)?;
+                    written.push(record);
+                }
+            }
+            delete(&tx)
+                .map_err(|e| FileShieldedStoreError::Storage(format!("purge {what}: {e}")))?;
+            tx.commit()
+                .map_err(|e| FileShieldedStoreError::Storage(format!("commit purge: {e}")))?;
+        }
+        self.cache_holds(written);
+        drop_memory(self);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl FileBackedShieldedStore {
+    fn set_failure_trigger(&self, name: &str, event: &str, table: &str, when: &str, fail: bool) {
+        let conn = self.pending_conn.lock().expect("pending_conn mutex");
+        let sql = if fail {
+            format!(
+                "CREATE TEMP TRIGGER IF NOT EXISTS {name} BEFORE {event} ON {table} {when} \
+                 BEGIN SELECT RAISE(ABORT, 'injected {name}'); END;"
+            )
+        } else {
+            format!("DROP TRIGGER IF EXISTS temp.{name}")
+        };
+        conn.execute_batch(&sql).expect("failure trigger");
+    }
+
+    /// Make every disposition insert fail until turned off again.
+    pub(super) fn fail_disposition_writes(&self, fail: bool) {
+        self.set_failure_trigger(
+            "fail_disposition_writes",
+            "INSERT",
+            "shielded_spend_dispositions",
+            "",
+            fail,
+        );
+    }
+
+    /// Make the disposition insert for `activity_id` fail until turned off
+    /// again.
+    pub(super) fn fail_disposition_write_for(&self, activity_id: &[u8; 32], fail: bool) {
+        self.set_failure_trigger(
+            "fail_disposition_write_for",
+            "INSERT",
+            "shielded_spend_dispositions",
+            &format!("WHEN NEW.activity_id = X'{}'", hex::encode(activity_id)),
+            fail,
+        );
+    }
+
+    /// Make every redrive row delete fail until turned off again.
+    pub(super) fn fail_redrive_row_deletes(&self, fail: bool) {
+        self.set_failure_trigger(
+            "fail_redrive_row_deletes",
+            "DELETE",
+            "shielded_pending_spends",
+            "",
+            fail,
+        );
+    }
+
+    /// Store a reason this build cannot read on `id`'s disposition of
+    /// `st_hash`.
+    pub(super) fn corrupt_disposition_reason(&self, id: SubwalletId, st_hash: &[u8; 32]) {
+        let conn = self.pending_conn.lock().expect("pending_conn mutex");
+        let changed = conn
+            .execute(
+                "UPDATE shielded_spend_dispositions SET reason = 'a_later_reason' \
+                 WHERE wallet_id = ?1 AND account_index = ?2 AND st_hash = ?3",
+                rusqlite::params![
+                    id.wallet_id.as_slice(),
+                    id.account_index,
+                    st_hash.as_slice()
+                ],
+            )
+            .expect("corrupt disposition");
+        assert_eq!(changed, 1);
+    }
+
+    /// The durable never-broadcast flag of `id`'s redrive row, if any.
+    pub(super) fn redrive_row_unsent(
+        &self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Option<bool> {
+        let conn = self.pending_conn.lock().expect("pending_conn mutex");
+        conn.query_row(
+            "SELECT unsent FROM shielded_pending_spends \
+             WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
+            rusqlite::params![
+                id.wallet_id.as_slice(),
+                id.account_index,
+                activity_id.as_slice()
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|unsent| unsent == 1)
+    }
+}
+
 impl ShieldedStore for FileBackedShieldedStore {
     type Error = FileShieldedStoreError;
 
@@ -1021,6 +1371,10 @@ impl ShieldedStore for FileBackedShieldedStore {
     }
 
     fn mark_spent(&mut self, id: SubwalletId, nullifier: &[u8; 32]) -> Result<bool, Self::Error> {
+        // With the disposition switch on, every record this nullifier
+        // resolves is durably resolved first, and the in-memory drop below
+        // then finds none.
+        self.resolve_redrives_spending(id, nullifier, None)?;
         let Some(sw) = self.subwallets.get_mut(&id) else {
             return Ok(false);
         };
@@ -1063,6 +1417,18 @@ impl ShieldedStore for FileBackedShieldedStore {
         let Some(sw) = self.subwallets.get_mut(&id) else {
             return Ok(false);
         };
+        if self.records_dispositions {
+            // Resolving an armed record must leave a disposition, which only
+            // its resolver can choose. Without one, release memory only: rows
+            // this open could not decode stay on disk.
+            if let Some(activity_id) = sw.redrives_carrying(nullifier).first() {
+                return Err(ShieldedDispositionRefusal::RedriveArmed {
+                    activity_id: *activity_id,
+                }
+                .into());
+            }
+            return Ok(sw.clear_pending(nullifier));
+        }
         let removed = sw.clear_pending(nullifier);
         if removed {
             // Same log-don't-abort rationale as `mark_spent` above.
@@ -1207,74 +1573,10 @@ impl ShieldedStore for FileBackedShieldedStore {
         activity_id: &[u8; 32],
         disposition: ShieldedSpendDisposition,
     ) -> Result<PendingRedrive, Self::Error> {
-        let (st_hash, held) = {
-            let redrive = self
-                .subwallets
-                .get(&id)
-                .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
-                    activity_id: *activity_id,
-                })?
-                .redrive_to_resolve(activity_id, disposition)?;
-            (redrive.st_hash(), held_by_resolution(redrive, disposition))
-        };
-        // Every durable effect commits in this one transaction, before any
-        // memory changes; an early return rolls it back.
-        let record = {
-            let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| {
-                    FileShieldedStoreError::Storage(format!("begin redrive resolution: {e}"))
-                })?;
-            let existing = Self::read_disposition(&tx, id.wallet_id, &st_hash)?;
-            let record = disposition_to_write(
-                existing.as_ref(),
-                id,
-                &st_hash,
-                activity_id,
-                disposition,
-                &held,
-            )?;
-            if let Some(record) = &record {
-                Self::insert_disposition(&tx, record)?;
-            }
-            let deleted = tx
-                .execute(
-                    "DELETE FROM shielded_pending_spends \
-                     WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
-                    rusqlite::params![
-                        id.wallet_id.as_slice(),
-                        id.account_index,
-                        activity_id.as_slice(),
-                    ],
-                )
-                .map_err(|e| {
-                    FileShieldedStoreError::Storage(format!("delete resolved redrive row: {e}"))
-                })?;
-            if deleted != 1 {
-                return Err(FileShieldedStoreError::Storage(format!(
-                    "armed redrive for activity {} has no durable row; nothing was resolved",
-                    hex::encode(activity_id)
-                )));
-            }
-            tx.commit().map_err(|e| {
-                FileShieldedStoreError::Storage(format!("commit redrive resolution: {e}"))
-            })?;
-            record
-        };
-        if let Some(record) = record.filter(|record| !record.held_nullifiers.is_empty()) {
-            self.disposition_holds
-                .insert((id, st_hash), record.held_nullifiers);
-        }
-        self.subwallets
-            .get_mut(&id)
-            .and_then(|sw| sw.remove_redrive_and_release(activity_id))
-            .ok_or_else(|| {
-                FileShieldedStoreError::Storage(format!(
-                    "redrive for activity {} vanished during resolution",
-                    hex::encode(activity_id)
-                ))
-            })
+        let mut resolved = self.commit_resolutions(id, &[(*activity_id, disposition)])?;
+        Ok(resolved
+            .pop()
+            .expect("one resolution resolves exactly one redrive"))
     }
 
     fn record_disposition(
@@ -1453,6 +1755,129 @@ impl ShieldedStore for FileBackedShieldedStore {
         Ok(())
     }
 
+    fn records_spend_dispositions(&self) -> bool {
+        self.records_dispositions
+    }
+
+    fn resolve_redrives_spending(
+        &mut self,
+        id: SubwalletId,
+        nullifier: &[u8; 32],
+        spending_action_cmx: Option<&[u8; 32]>,
+    ) -> Result<(), Self::Error> {
+        if !self.records_dispositions {
+            return Ok(());
+        }
+        let Some(sw) = self.subwallets.get(&id) else {
+            return Ok(());
+        };
+        if !sw.knows_nullifier(nullifier) {
+            return Ok(());
+        }
+        let resolutions: Vec<_> = sw
+            .redrives_carrying(nullifier)
+            .into_iter()
+            .map(|activity_id| {
+                let disposition =
+                    sw.spent_note_disposition(&activity_id, nullifier, spending_action_cmx);
+                (activity_id, disposition)
+            })
+            .collect();
+        if resolutions.is_empty() {
+            return Ok(());
+        }
+        self.commit_resolutions(id, &resolutions)?;
+        Ok(())
+    }
+
+    fn arm_unsent_redrive(
+        &mut self,
+        id: SubwalletId,
+        redrive: PendingRedrive,
+    ) -> Result<(), Self::Error> {
+        if !self.records_dispositions {
+            return Err(ShieldedDispositionRefusal::NotRecording.into());
+        }
+        if redrive.nullifiers.is_empty() {
+            return Err(ShieldedDispositionRefusal::IdentityDebit {
+                activity_id: redrive.activity_id,
+            }
+            .into());
+        }
+        // A record already armed may have been broadcast. A row this open
+        // could not decode also blocks the insert below.
+        if self
+            .subwallets
+            .get(&id)
+            .is_some_and(|sw| sw.redrive_attempts(&redrive.activity_id).is_some())
+        {
+            return Err(ShieldedDispositionRefusal::RedriveArmed {
+                activity_id: redrive.activity_id,
+            }
+            .into());
+        }
+        {
+            let conn = self.pending_conn.lock().expect("pending_conn mutex");
+            conn.execute(
+                "INSERT INTO shielded_pending_spends \
+                 (wallet_id, account_index, activity_id, anchor, nullifiers, st_bytes, attempts, identity_nonce_finalized, identity_user_abandoned, unsent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 1)",
+                rusqlite::params![
+                    id.wallet_id.as_slice(),
+                    id.account_index,
+                    redrive.activity_id.as_slice(),
+                    redrive.anchor.as_slice(),
+                    redrive.nullifiers.as_flattened(),
+                    redrive.st_bytes,
+                    redrive.attempts,
+                ],
+            )
+            .map_err(|e| FileShieldedStoreError::Storage(format!("persist unsent redrive: {e}")))?;
+        }
+        self.subwallets
+            .entry(id)
+            .or_default()
+            .arm_unsent_redrive(redrive);
+        Ok(())
+    }
+
+    fn mark_redrive_sent(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        let Some(sw) = self.subwallets.get(&id) else {
+            return Ok(false);
+        };
+        if !sw.redrive_is_unsent(activity_id) {
+            return Ok(sw.redrive_attempts(activity_id).is_some());
+        }
+        {
+            let conn = self.pending_conn.lock().expect("pending_conn mutex");
+            let updated = conn
+                .execute(
+                    "UPDATE shielded_pending_spends SET unsent = 0 \
+                     WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
+                    rusqlite::params![
+                        id.wallet_id.as_slice(),
+                        id.account_index,
+                        activity_id.as_slice(),
+                    ],
+                )
+                .map_err(|e| FileShieldedStoreError::Storage(format!("mark redrive sent: {e}")))?;
+            if updated != 1 {
+                return Err(FileShieldedStoreError::Storage(format!(
+                    "unsent redrive for activity {} has no durable row",
+                    hex::encode(activity_id)
+                )));
+            }
+        }
+        if let Some(sw) = self.subwallets.get_mut(&id) {
+            sw.unsent_redrives.remove(activity_id);
+        }
+        Ok(true)
+    }
+
     fn record_outgoing_note(
         &mut self,
         id: SubwalletId,
@@ -1615,42 +2040,38 @@ impl ShieldedStore for FileBackedShieldedStore {
         // wallet_id — SQL before memory, so an Err return means neither
         // store was touched (fail-atomic) rather than a memory purge
         // the caller can't distinguish from a no-op.
-        // The wallet's dispositions stay and keep holding their notes; the
-        // marker for the next completed scan is in the same transaction.
-        {
-            let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| FileShieldedStoreError::Storage(format!("begin wallet purge: {e}")))?;
-            tx.execute(
-                "DELETE FROM shielded_pending_spends WHERE wallet_id = ?1",
-                rusqlite::params![wallet_id.as_slice()],
-            )
-            .map_err(|e| {
-                FileShieldedStoreError::Storage(format!("purge pending spends for wallet: {e}"))
-            })?;
-            tx.execute(
-                "UPDATE shielded_spend_dispositions SET released_by_scan = 1 \
-                 WHERE wallet_id = ?1 AND length(nullifiers) > 0",
-                rusqlite::params![wallet_id.as_slice()],
-            )
-            .map_err(|e| {
-                FileShieldedStoreError::Storage(format!("mark holds for the next scan: {e}"))
-            })?;
-            tx.commit().map_err(|e| {
-                FileShieldedStoreError::Storage(format!("commit wallet purge: {e}"))
-            })?;
-        }
+        // The wallet's dispositions stay and keep holding their notes, the
+        // Purged ones written here included; the marker for the next
+        // completed scan is in the same transaction.
+        //
         // Per-subwallet note / watermark / checkpoint state is
         // in-memory only (`subwallets`); the commitment tree in
         // SQLite is chain-wide and intentionally left intact.
-        self.subwallets.retain(|id, _| id.wallet_id != wallet_id);
-        self.holds_awaiting_scan.extend(
-            self.disposition_holds
-                .keys()
-                .filter(|(id, _)| id.wallet_id == wallet_id),
-        );
-        Ok(())
+        self.purge_pending(
+            |id| id.wallet_id == wallet_id,
+            |conn| {
+                conn.execute(
+                    "DELETE FROM shielded_pending_spends WHERE wallet_id = ?1",
+                    rusqlite::params![wallet_id.as_slice()],
+                )?;
+                conn.execute(
+                    "UPDATE shielded_spend_dispositions SET released_by_scan = 1 \
+                     WHERE wallet_id = ?1 AND length(nullifiers) > 0",
+                    rusqlite::params![wallet_id.as_slice()],
+                )?;
+                Ok(())
+            },
+            |store| {
+                store.subwallets.retain(|id, _| id.wallet_id != wallet_id);
+                store.holds_awaiting_scan.extend(
+                    store
+                        .disposition_holds
+                        .keys()
+                        .filter(|(id, _)| id.wallet_id == wallet_id),
+                );
+            },
+            "pending spends for wallet",
+        )
     }
 
     fn purge_subwallet(&mut self, id: SubwalletId) -> Result<(), Self::Error> {
@@ -1658,46 +2079,48 @@ impl ShieldedStore for FileBackedShieldedStore {
         // Empty-nullifier ShieldFromIdentity guards are wallet-wide: the signed
         // debit remains executable after its recipient account is re-bound, so
         // retain those rows and their minimal in-memory state.
-        {
-            let conn = self.pending_conn.lock().expect("pending_conn mutex");
-            conn.execute(
-                "DELETE FROM shielded_pending_spends \
-                 WHERE wallet_id = ?1 AND account_index = ?2 \
-                   AND length(nullifiers) > 0",
-                rusqlite::params![id.wallet_id.as_slice(), id.account_index],
-            )
-            .map_err(|e| {
-                FileShieldedStoreError::Storage(format!("purge pending spends for subwallet: {e}"))
-            })?;
-        }
-        let identity_redrives = self
-            .subwallets
-            .get(&id)
-            .map(SubwalletState::identity_redrives)
-            .unwrap_or_default();
-        self.subwallets.remove(&id);
-        if !identity_redrives.is_empty() {
-            let retained = self.subwallets.entry(id).or_default();
-            for redrive in identity_redrives {
-                retained.arm_redrive(redrive);
-            }
-        }
-        Ok(())
+        self.purge_pending(
+            |scoped| *scoped == id,
+            |conn| {
+                conn.execute(
+                    "DELETE FROM shielded_pending_spends \
+                     WHERE wallet_id = ?1 AND account_index = ?2 \
+                       AND length(nullifiers) > 0",
+                    rusqlite::params![id.wallet_id.as_slice(), id.account_index],
+                )
+                .map(drop)
+            },
+            |store| {
+                let identity_redrives = store
+                    .subwallets
+                    .get(&id)
+                    .map(SubwalletState::identity_redrives)
+                    .unwrap_or_default();
+                store.subwallets.remove(&id);
+                if !identity_redrives.is_empty() {
+                    let retained = store.subwallets.entry(id).or_default();
+                    for redrive in identity_redrives {
+                        retained.arm_redrive(redrive);
+                    }
+                }
+            },
+            "pending spends for subwallet",
+        )
     }
 
     fn purge_all_subwallets(&mut self) -> Result<(), Self::Error> {
         // Durable redrive rows for every wallet go with the in-memory
         // purge; SQL first for the same fail-atomic reason as
         // `purge_wallet`.
-        {
-            let conn = self.pending_conn.lock().expect("pending_conn mutex");
-            conn.execute("DELETE FROM shielded_pending_spends", [])
-                .map_err(|e| {
-                    FileShieldedStoreError::Storage(format!("purge all pending spends: {e}"))
-                })?;
-        }
-        self.subwallets.clear();
-        Ok(())
+        self.purge_pending(
+            |_| true,
+            |conn| {
+                conn.execute("DELETE FROM shielded_pending_spends", [])
+                    .map(drop)
+            },
+            |store| store.subwallets.clear(),
+            "all pending spends",
+        )
     }
 
     fn reset_commitment_tree(&mut self) -> Result<(), Self::Error> {
@@ -1929,6 +2352,8 @@ mod tests {
             "identity_nonce_finalized = 2",
             "identity_user_abandoned = -1",
             "identity_user_abandoned = 1, nullifiers = zeroblob(32)",
+            "unsent = 2",
+            "unsent = 1",
         ] {
             let path = temp_tree_path("corrupt_recovery_metadata");
             let mut store = FileBackedShieldedStore::open_path(&path, 100).unwrap();
@@ -4189,6 +4614,678 @@ mod tests {
             insert_account("4294967295").expect("the largest account index is storable");
             assert_eq!(count(&conn, "shielded_spend_dispositions"), 5);
             drop(conn);
+            drop(store);
+            remove_store_files(&path);
+        }
+    }
+
+    mod release_paths {
+        use super::super::super::store::disposition_contract::{
+            action_cmx, arm_reserved, assert_holds_by_value, note, spend, spend_with_actions,
+            unspent,
+        };
+        use super::super::super::store::{
+            NotExecutedReason, ShieldedSpendDisposition, UnresolvedReason,
+        };
+        use super::*;
+        use std::collections::BTreeSet;
+        use ShieldedSpendDisposition::{Executed, NotExecuted, Unresolved};
+
+        const N1: [u8; 32] = [0x91; 32];
+        const N2: [u8; 32] = [0x92; 32];
+
+        fn remove_store_files(path: &std::path::Path) {
+            for suffix in ["", "-wal", "-shm", ".lock"] {
+                let mut file = path.as_os_str().to_owned();
+                file.push(suffix);
+                let _ = std::fs::remove_file(file);
+            }
+        }
+
+        fn open(path: &std::path::Path, recording: bool) -> FileBackedShieldedStore {
+            let mut store = FileBackedShieldedStore::open_path(path, 100).expect("open");
+            store.set_records_spend_dispositions(recording);
+            store
+        }
+
+        /// The unacknowledged disposition of `redrive`'s transition in `id`'s
+        /// wallet, with the activity it names.
+        fn disposition_of(
+            store: &FileBackedShieldedStore,
+            id: SubwalletId,
+            redrive: &PendingRedrive,
+        ) -> Option<([u8; 32], ShieldedSpendDisposition)> {
+            store
+                .dispositions(id.wallet_id)
+                .expect("dispositions")
+                .into_iter()
+                .find(|record| record.st_hash == redrive.st_hash())
+                .map(|record| (record.activity_id, record.disposition))
+        }
+
+        fn restore_unspent(
+            store: &mut FileBackedShieldedStore,
+            id: SubwalletId,
+            nullifiers: &[[u8; 32]],
+        ) {
+            for nullifier in nullifiers {
+                store.save_note(id, &note(*nullifier)).unwrap();
+            }
+        }
+
+        #[test]
+        fn a_spent_note_resolves_executed_only_with_its_spending_action() {
+            let path = temp_tree_path("release_spending_action");
+            let id = SubwalletId::new([0xE1; 32], 0);
+            let proven = spend_with_actions(0x41, &[N1, N2]);
+            let other_action = spend_with_actions(0x57, &[[0x97; 32]]);
+            let unobserved = spend_with_actions(0x58, &[[0x98; 32]]);
+            let mut store = open(&path, true);
+            for redrive in [&proven, &other_action, &unobserved] {
+                arm_reserved(&mut store, id, redrive);
+            }
+            store.save_note(id, &note([0x93; 32])).unwrap();
+
+            store
+                .resolve_redrives_spending(id, &N1, Some(&action_cmx(0x41, &N1)))
+                .unwrap();
+            // The note was spent by an action this record does not contain.
+            store
+                .resolve_redrives_spending(id, &[0x97; 32], Some(&action_cmx(0x41, &[0x97; 32])))
+                .unwrap();
+            // Marked spent with no observed action.
+            assert!(store.mark_spent(id, &[0x98; 32]).unwrap());
+            // A note no redrive reserves writes nothing.
+            store
+                .resolve_redrives_spending(id, &[0x93; 32], Some(&[0x93; 32]))
+                .unwrap();
+            assert!(store.mark_spent(id, &[0x93; 32]).unwrap());
+
+            let unattributable = Unresolved(UnresolvedReason::Unattributable);
+            let expected = [
+                (&proven, Executed),
+                (&other_action, unattributable),
+                (&unobserved, unattributable),
+            ];
+            for (redrive, disposition) in expected {
+                assert_eq!(
+                    disposition_of(&store, id, redrive),
+                    Some((redrive.activity_id, disposition))
+                );
+            }
+            assert_eq!(store.dispositions(id.wallet_id).unwrap().len(), 3);
+            assert!(store.pending_redrives(id).unwrap().is_empty());
+            drop(store);
+
+            let store = open(&path, true);
+            for (redrive, disposition) in expected {
+                assert_eq!(
+                    disposition_of(&store, id, redrive),
+                    Some((redrive.activity_id, disposition))
+                );
+            }
+            assert_holds_by_value(
+                &store.dispositions(id.wallet_id).unwrap(),
+                &[&proven, &other_action, &unobserved],
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn mark_spent_without_proof_records_unattributable() {
+            let path = temp_tree_path("release_mark_spent_unattributable");
+            let id = SubwalletId::new([0xE2; 32], 0);
+            // Two records reserving the same note: its spend proves neither.
+            let first = spend(0x42, &[N1]);
+            let second = spend(0x43, &[N1, N2]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &first);
+            arm_reserved(&mut store, id, &second);
+
+            assert!(store.mark_spent(id, &N1).unwrap());
+            let unattributable = Unresolved(UnresolvedReason::Unattributable);
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((first.activity_id, unattributable))
+            );
+            assert_eq!(
+                disposition_of(&store, id, &second),
+                Some((second.activity_id, unattributable))
+            );
+            assert!(store.pending_redrives(id).unwrap().is_empty());
+            drop(store);
+
+            let store = open(&path, true);
+            assert_eq!(store.dispositions(id.wallet_id).unwrap().len(), 2);
+            assert_holds_by_value(
+                &store.dispositions(id.wallet_id).unwrap(),
+                &[&first, &second],
+            );
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((first.activity_id, unattributable))
+            );
+            assert_eq!(
+                disposition_of(&store, id, &second),
+                Some((second.activity_id, unattributable))
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn mark_spent_of_an_already_spent_note_records_unattributable() {
+            let path = temp_tree_path("release_restore_spent");
+            let id = SubwalletId::new([0xE3; 32], 0);
+            let first = spend(0x45, &[N1]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &first);
+            drop(store);
+
+            // A restore saves the note already spent, then marks it.
+            let mut store = open(&path, true);
+            let mut spent = note(N1);
+            spent.is_spent = true;
+            store.save_note(id, &spent).unwrap();
+            assert!(!store.mark_spent(id, &N1).unwrap());
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((
+                    first.activity_id,
+                    Unresolved(UnresolvedReason::Unattributable)
+                ))
+            );
+            drop(store);
+            let store = open(&path, true);
+            assert!(store.pending_redrives(id).unwrap().is_empty());
+            assert_holds_by_value(&store.dispositions(id.wallet_id).unwrap(), &[&first]);
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((
+                    first.activity_id,
+                    Unresolved(UnresolvedReason::Unattributable)
+                ))
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn mark_spent_write_failure_changes_nothing_when_recording() {
+            let path = temp_tree_path("release_mark_spent_failure");
+            let id = SubwalletId::new([0xE5; 32], 0);
+            let first = spend(0x47, &[N1]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &first);
+            store.fail_disposition_writes(true);
+            assert!(store.mark_spent(id, &N1).is_err());
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first.clone()]);
+            assert!(store
+                .get_all_notes(id)
+                .unwrap()
+                .iter()
+                .all(|note| !note.is_spent));
+            assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+            store.fail_disposition_writes(false);
+            assert!(
+                store.mark_spent(id, &N1).unwrap(),
+                "the retry still reports the spend"
+            );
+            drop(store);
+            let store = open(&path, true);
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((
+                    first.activity_id,
+                    Unresolved(UnresolvedReason::Unattributable)
+                )),
+                "a spend seen without its action proves nothing about this record"
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn clear_pending_refuses_an_armed_redrive_when_recording() {
+            let path = temp_tree_path("release_clear_pending");
+            let id = SubwalletId::new([0xE6; 32], 0);
+            let first = spend(0x48, &[N1]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &first);
+            let refusal = store.clear_pending(id, &N1).unwrap_err();
+            assert!(matches!(
+                refusal,
+                FileShieldedStoreError::Disposition(ShieldedDispositionRefusal::RedriveArmed { activity_id })
+                    if activity_id == first.activity_id
+            ));
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first.clone()]);
+            assert!(unspent(&store, id).is_empty());
+            // An unarmed reservation is released in memory only.
+            store.save_note(id, &note(N2)).unwrap();
+            store.mark_pending(id, &N2).unwrap();
+            assert!(store.clear_pending(id, &N2).unwrap());
+            assert_eq!(unspent(&store, id), BTreeSet::from([N2]));
+            drop(store);
+            let store = open(&path, true);
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first]);
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn purge_records_unresolved() {
+            let path = temp_tree_path("release_purge");
+            let wallet = [0xE7; 32];
+            let account0 = SubwalletId::new(wallet, 0);
+            let account1 = SubwalletId::new(wallet, 1);
+            let other = SubwalletId::new([0xE8; 32], 0);
+            let in_account0 = spend(0x49, &[N1]);
+            let identity_debit = spend(0x4A, &[]);
+            let in_account1 = spend(0x4B, &[N2]);
+            let in_other = spend(0x4C, &[[0x95; 32]]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, account0, &in_account0);
+            arm_reserved(&mut store, account0, &identity_debit);
+            arm_reserved(&mut store, account1, &in_account1);
+            arm_reserved(&mut store, other, &in_other);
+            let purged = Unresolved(UnresolvedReason::Purged);
+
+            store.purge_subwallet(account0).unwrap();
+            assert_eq!(
+                disposition_of(&store, account0, &in_account0),
+                Some((in_account0.activity_id, purged))
+            );
+            assert_eq!(disposition_of(&store, account0, &in_account1), None);
+            assert_eq!(
+                store.pending_redrives(account0).unwrap(),
+                vec![identity_debit.clone()]
+            );
+
+            store.purge_wallet(wallet).unwrap();
+            assert_eq!(
+                disposition_of(&store, account1, &in_account1),
+                Some((in_account1.activity_id, purged))
+            );
+            assert_eq!(
+                disposition_of(&store, account0, &identity_debit),
+                None,
+                "an identity debit keeps its own model and writes no disposition"
+            );
+
+            store.purge_all_subwallets().unwrap();
+            assert_eq!(
+                disposition_of(&store, other, &in_other),
+                Some((in_other.activity_id, purged))
+            );
+            drop(store);
+
+            let store = open(&path, true);
+            assert_eq!(store.dispositions(wallet).unwrap().len(), 2);
+            assert_eq!(
+                disposition_of(&store, other, &in_other),
+                Some((in_other.activity_id, purged))
+            );
+            assert_holds_by_value(
+                &store.dispositions(wallet).unwrap(),
+                &[&in_account0, &in_account1],
+            );
+            assert_holds_by_value(&store.dispositions(other.wallet_id).unwrap(), &[&in_other]);
+            assert!(store
+                .pending_redrives_for_wallet(wallet)
+                .unwrap()
+                .is_empty());
+            assert!(store.pending_redrives(other).unwrap().is_empty());
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn purge_disposition_write_failure_purges_nothing() {
+            let path = temp_tree_path("release_purge_failure");
+            let id = SubwalletId::new([0xE9; 32], 0);
+            let first = spend(0x4D, &[N1]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &first);
+            store.fail_disposition_writes(true);
+            assert!(store.purge_wallet(id.wallet_id).is_err());
+            assert!(store.purge_subwallet(id).is_err());
+            assert!(store.purge_all_subwallets().is_err());
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first.clone()]);
+            drop(store);
+            let store = open(&path, true);
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first]);
+            assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// Every store path that resolves or purges a note-spend redrive
+        /// holds what the spend may have spent: all its inputs for `Executed`
+        /// and `Unresolved`, none for `NotExecuted`. Checked against the
+        /// redrives themselves, before and after a reopen.
+        #[test]
+        fn every_resolution_path_holds_what_it_may_have_spent() {
+            let path = temp_tree_path("release_every_path");
+            let id = SubwalletId::new([0xEB; 32], 0);
+            let dropped = SubwalletId::new([0xEB; 32], 1);
+            let removed = SubwalletId::new([0xEC; 32], 0);
+            let cleared = SubwalletId::new([0xED; 32], 0);
+            let proven = spend_with_actions(0x60, &[[0xA0; 32], [0xA1; 32]]);
+            let unproven = spend_with_actions(0x61, &[[0xA2; 32]]);
+            let marked = spend(0x62, &[[0xA3; 32]]);
+            let cancelled = spend(0x63, &[[0xA4; 32]]);
+            let deserialize_dropped = spend(0x64, &[[0xA5; 32]]);
+            let rejected = spend(0x65, &[[0xA6; 32]]);
+            let pruned = spend(0x66, &[[0xA7; 32]]);
+            let observed = spend(0x67, &[[0xA8; 32]]);
+            let abandoned = spend(0x68, &[[0xA9; 32]]);
+            let in_dropped = spend(0x69, &[[0xAA; 32]]);
+            let in_removed = spend(0x6A, &[[0xAB; 32]]);
+            let in_cleared = spend(0x6B, &[[0xAC; 32]]);
+            let mut store = open(&path, true);
+            for redrive in [
+                &proven,
+                &unproven,
+                &marked,
+                &cancelled,
+                &deserialize_dropped,
+                &rejected,
+                &pruned,
+                &observed,
+            ] {
+                arm_reserved(&mut store, id, redrive);
+            }
+            for nullifier in &abandoned.nullifiers {
+                store.save_note(id, &note(*nullifier)).unwrap();
+                store.mark_pending(id, nullifier).unwrap();
+            }
+            store.arm_unsent_redrive(id, abandoned.clone()).unwrap();
+            arm_reserved(&mut store, dropped, &in_dropped);
+            arm_reserved(&mut store, removed, &in_removed);
+            arm_reserved(&mut store, cleared, &in_cleared);
+
+            store
+                .resolve_redrives_spending(id, &[0xA0; 32], Some(&action_cmx(0x60, &[0xA0; 32])))
+                .unwrap();
+            store
+                .resolve_redrives_spending(id, &[0xA2; 32], Some(&[0xEE; 32]))
+                .unwrap();
+            assert!(store.mark_spent(id, &[0xA3; 32]).unwrap());
+            for (redrive, disposition) in [
+                (&cancelled, Unresolved(UnresolvedReason::Cancelled)),
+                (
+                    &deserialize_dropped,
+                    Unresolved(UnresolvedReason::DeserializeDropped),
+                ),
+                (&rejected, NotExecuted(NotExecutedReason::Rejected)),
+                (&pruned, NotExecuted(NotExecutedReason::Pruned)),
+            ] {
+                store
+                    .resolve_redrive(id, &redrive.activity_id, disposition)
+                    .unwrap();
+            }
+            store
+                .resolve_observed_execution(id, &observed.activity_id)
+                .unwrap();
+            store
+                .abandon_unsent_redrive(id, &abandoned.activity_id)
+                .unwrap();
+            store.purge_subwallet(dropped).unwrap();
+            store.purge_wallet(removed.wallet_id).unwrap();
+            // Only the inputs of spends that never executed are selectable.
+            let released = BTreeSet::from([[0xA6; 32], [0xA7; 32], [0xA9; 32]]);
+            assert_eq!(unspent(&store, id), released);
+            store.purge_all_subwallets().unwrap();
+
+            let unattributable = Unresolved(UnresolvedReason::Unattributable);
+            let purged = Unresolved(UnresolvedReason::Purged);
+            let expected = [
+                (id, &proven, Executed),
+                (id, &unproven, unattributable),
+                (id, &marked, unattributable),
+                (id, &cancelled, Unresolved(UnresolvedReason::Cancelled)),
+                (
+                    id,
+                    &deserialize_dropped,
+                    Unresolved(UnresolvedReason::DeserializeDropped),
+                ),
+                (id, &rejected, NotExecuted(NotExecutedReason::Rejected)),
+                (id, &pruned, NotExecuted(NotExecutedReason::Pruned)),
+                (id, &observed, Executed),
+                (id, &abandoned, NotExecuted(NotExecutedReason::Abandoned)),
+                (dropped, &in_dropped, purged),
+                (removed, &in_removed, purged),
+                (cleared, &in_cleared, purged),
+            ];
+            let check = |store: &FileBackedShieldedStore| {
+                let mut records = Vec::new();
+                for wallet in [id.wallet_id, removed.wallet_id, cleared.wallet_id] {
+                    records.extend(store.dispositions(wallet).unwrap());
+                }
+                assert_eq!(records.len(), expected.len());
+                for (subwallet, redrive, disposition) in expected {
+                    assert_eq!(
+                        disposition_of(store, subwallet, redrive),
+                        Some((redrive.activity_id, disposition))
+                    );
+                }
+                let redrives: Vec<&PendingRedrive> =
+                    expected.iter().map(|(_, redrive, _)| *redrive).collect();
+                assert_holds_by_value(&records, &redrives);
+            };
+            check(&store);
+            drop(store);
+            let mut store = open(&path, true);
+            check(&store);
+            for (subwallet, redrive, _) in expected {
+                restore_unspent(&mut store, subwallet, &redrive.nullifiers);
+            }
+            assert_eq!(unspent(&store, id), released);
+            for subwallet in [dropped, removed, cleared] {
+                assert!(unspent(&store, subwallet).is_empty());
+            }
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn release_kill_reopen_respend_keeps_first_disposition() {
+            let path = temp_tree_path("release_respend");
+            let id = SubwalletId::new([0xEA; 32], 0);
+            let first = spend_with_actions(0x4E, &[N1, N2]);
+            let pruned = NotExecuted(NotExecutedReason::Pruned);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &first);
+            store
+                .resolve_redrive(id, &first.activity_id, pruned)
+                .unwrap();
+            drop(store);
+
+            // Killed and reopened: the host restores the notes unspent and a
+            // later spend of our own reuses them.
+            let mut store = open(&path, true);
+            restore_unspent(&mut store, id, &[N1, N2]);
+            assert_eq!(unspent(&store, id), BTreeSet::from([N1, N2]));
+            let respend = spend_with_actions(0x4F, &[N1, N2]);
+            for nullifier in &respend.nullifiers {
+                store.mark_pending(id, nullifier).unwrap();
+                store
+                    .set_pending_spend(id, nullifier, respend.anchor, respend.activity_id)
+                    .unwrap();
+            }
+            store.arm_redrive(id, respend.clone()).unwrap();
+            // The respend lands: the scan sees its actions spend the notes.
+            for nullifier in [N1, N2] {
+                store
+                    .resolve_redrives_spending(id, &nullifier, Some(&action_cmx(0x4F, &nullifier)))
+                    .unwrap();
+                assert!(store.mark_spent(id, &nullifier).unwrap());
+            }
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((first.activity_id, pruned))
+            );
+            assert_eq!(
+                disposition_of(&store, id, &respend),
+                Some((respend.activity_id, Executed))
+            );
+            drop(store);
+
+            let store = open(&path, true);
+            let dispositions = store.dispositions(id.wallet_id).unwrap();
+            assert_eq!(dispositions.len(), 2);
+            assert_eq!(
+                disposition_of(&store, id, &first),
+                Some((first.activity_id, pruned)),
+                "the first artifact's disposition is unchanged by the respend executing"
+            );
+            assert!(!dispositions
+                .iter()
+                .any(|record| record.activity_id == first.activity_id
+                    && record.disposition == Executed));
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn unsent_flag_survives_reopen_and_is_cleared_durably() {
+            let path = temp_tree_path("release_unsent");
+            let id = SubwalletId::new([0xEB; 32], 0);
+            let first = spend(0x50, &[N1]);
+            let refusal = |result: Result<(), FileShieldedStoreError>| match result {
+                Err(FileShieldedStoreError::Disposition(refusal)) => refusal,
+                other => panic!("expected a refusal, got {other:?}"),
+            };
+            let mut store = open(&path, false);
+            assert_eq!(
+                refusal(store.arm_unsent_redrive(id, first.clone())),
+                ShieldedDispositionRefusal::NotRecording
+            );
+            store.set_records_spend_dispositions(true);
+            assert!(matches!(
+                refusal(store.arm_unsent_redrive(id, spend(0x51, &[]))),
+                ShieldedDispositionRefusal::IdentityDebit { .. }
+            ));
+            store.arm_unsent_redrive(id, first.clone()).unwrap();
+            assert_eq!(store.redrive_row_unsent(id, &first.activity_id), Some(true));
+            drop(store);
+
+            let mut store = open(&path, true);
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first.clone()]);
+            assert!(store.mark_redrive_sent(id, &first.activity_id).unwrap());
+            assert_eq!(
+                store.redrive_row_unsent(id, &first.activity_id),
+                Some(false)
+            );
+            assert!(
+                store.mark_redrive_sent(id, &first.activity_id).unwrap(),
+                "a record already marked sent is still armed"
+            );
+            assert!(
+                !store.mark_redrive_sent(id, &[0x59; 32]).unwrap(),
+                "a record that is not armed must not be sent"
+            );
+            assert_eq!(
+                refusal(store.arm_unsent_redrive(id, first.clone())),
+                ShieldedDispositionRefusal::RedriveArmed {
+                    activity_id: first.activity_id
+                },
+                "re-arming cannot make a possibly sent record look unsent"
+            );
+            drop(store);
+            let mut store = open(&path, true);
+            assert!(matches!(
+                store.abandon_unsent_redrive(id, &first.activity_id),
+                Err(FileShieldedStoreError::Disposition(
+                    ShieldedDispositionRefusal::MayHaveBeenBroadcast { .. }
+                ))
+            ));
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn should_upgrade_an_earlier_schema_without_trusting_old_rows() {
+            let path = temp_tree_path("release_schema_upgrade");
+            let id = SubwalletId::new([0xED; 32], 1);
+            let armed = spend(0x55, &[N1]);
+            {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE shielded_pending_spends (
+                        wallet_id BLOB NOT NULL, account_index INTEGER NOT NULL,
+                        activity_id BLOB NOT NULL, anchor BLOB NOT NULL, nullifiers BLOB NOT NULL,
+                        st_bytes BLOB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                        identity_nonce_finalized INTEGER NOT NULL DEFAULT 0,
+                        identity_user_abandoned INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(wallet_id, account_index, activity_id));",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO shielded_pending_spends \
+                     (wallet_id, account_index, activity_id, anchor, nullifiers, st_bytes) \
+                     VALUES (?1, 1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id.wallet_id.as_slice(),
+                        armed.activity_id.as_slice(),
+                        armed.anchor.as_slice(),
+                        armed.nullifiers.as_flattened(),
+                        armed.st_bytes,
+                    ],
+                )
+                .unwrap();
+            }
+            let mut store = open(&path, true);
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![armed.clone()]);
+            restore_unspent(&mut store, id, &[N1, N2]);
+            assert_eq!(
+                unspent(&store, id),
+                BTreeSet::from([N2]),
+                "the armed record keeps its note"
+            );
+            assert!(
+                matches!(
+                    store.abandon_unsent_redrive(id, &armed.activity_id),
+                    Err(FileShieldedStoreError::Disposition(
+                        ShieldedDispositionRefusal::MayHaveBeenBroadcast { .. }
+                    ))
+                ),
+                "a record from before the flag existed may have been broadcast"
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        #[test]
+        fn switch_off_store_paths_write_no_disposition_and_stay_memory_first() {
+            let path = temp_tree_path("release_switch_off_store");
+            let id = SubwalletId::new([0xEC; 32], 0);
+            let marked = spend(0x52, &[N1]);
+            let cleared = spend(0x53, &[N2]);
+            let purged = spend(0x54, &[[0x96; 32]]);
+            let mut store = open(&path, false);
+            assert!(!store.records_spend_dispositions());
+            for redrive in [&marked, &cleared, &purged] {
+                arm_reserved(&mut store, id, redrive);
+            }
+            // Memory first: a failed row delete only warns.
+            store.fail_redrive_row_deletes(true);
+            assert!(store.mark_spent(id, &N1).unwrap());
+            assert!(store.clear_pending(id, &N2).unwrap());
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![purged.clone()]);
+            store.fail_redrive_row_deletes(false);
+            assert!(store
+                .resolve_redrives_spending(id, &[0x96; 32], Some(&[0x96; 32]))
+                .is_ok());
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![purged.clone()]);
+            store.purge_subwallet(id).unwrap();
+            assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+            drop(store);
+
+            let store = open(&path, false);
+            assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+            assert!(store.pending_redrives(id).unwrap().is_empty());
             drop(store);
             remove_store_files(&path);
         }

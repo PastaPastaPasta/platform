@@ -1226,3 +1226,325 @@ async fn a_pass_leaves_an_ordinary_hold_on_the_same_subwallet() {
     drop(reopened);
     remove_store_files(&path);
 }
+
+/// What the coordinator lists and holds for the dispositions the release
+/// paths write, across a wallet removal, a dropped account and a Clear, and
+/// what an ack frees.
+mod release_holds {
+    use super::*;
+    use crate::wallet::shielded::store::disposition_contract::{
+        action_cmx, assert_holds_by_value, spend_with_actions,
+    };
+    use crate::wallet::shielded::store::PendingRedrive;
+
+    /// An input whose spend was cancelled after a send that may have gone out.
+    const CANCELLED_NULLIFIER: [u8; 32] = [0x51; 32];
+
+    /// The only place these tests drive the lift a removal's holds wait for:
+    /// a completed pass whose changeset `host` commits inline.
+    async fn qualifying_pass(
+        coordinator: &NetworkShieldedCoordinator,
+        host: &Arc<Host>,
+        id: SubwalletId,
+    ) {
+        assert!(host.inline && !host.refuse.load(Ordering::SeqCst));
+        pass(coordinator).await;
+        assert!(
+            host.took_any_for(id),
+            "the host commits the pass's changeset"
+        );
+    }
+
+    async fn pass(coordinator: &NetworkShieldedCoordinator) {
+        let outcome = coordinator.sync(true).await;
+        assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    }
+
+    async fn register_accounts(
+        coordinator: &NetworkShieldedCoordinator,
+        host: &Arc<Host>,
+        accounts: &[u32],
+    ) {
+        let views = accounts
+            .iter()
+            .map(|account| {
+                let keys =
+                    OrchardKeySet::from_seed(&[42; 64], dashcore::Network::Testnet, *account)
+                        .expect("test viewing key")
+                        .viewing_keys();
+                (*account, keys)
+            })
+            .collect();
+        coordinator
+            .register_wallet(WALLET, views, WalletPersister::new(WALLET, host.clone()))
+            .await
+            .expect("register test wallet");
+        coordinator.mark_hydrated(WALLET, true).await;
+    }
+
+    /// A recording coordinator on the pool, with [`WALLET`]'s `accounts`
+    /// bound to an inline host.
+    async fn recording_coordinator(
+        path: &std::path::Path,
+        accounts: &[u32],
+    ) -> Arc<NetworkShieldedCoordinator> {
+        let coordinator = coordinator_on(pool_sdk().await, path);
+        coordinator.set_records_spend_dispositions(true).await;
+        register_accounts(&coordinator, &Host::inline(), accounts).await;
+        coordinator
+    }
+
+    /// A scan resolves `id`'s spend of [`SPENT_NULLIFIER`] `Executed` on its
+    /// own action's proof. Returns the record.
+    async fn executed(coordinator: &NetworkShieldedCoordinator, id: SubwalletId) -> PendingRedrive {
+        let redrive = spend_with_actions(0x72, &[SPENT_NULLIFIER]);
+        let mut store = coordinator.store().write().await;
+        arm_reserved(&mut *store, id, &redrive);
+        store
+            .resolve_redrives_spending(
+                id,
+                &SPENT_NULLIFIER,
+                Some(&action_cmx(0x72, &SPENT_NULLIFIER)),
+            )
+            .unwrap();
+        redrive
+    }
+
+    /// `id`'s spend of [`NEVER_SPENT_NULLIFIER`], left armed for a purge.
+    async fn armed(coordinator: &NetworkShieldedCoordinator, id: SubwalletId) -> PendingRedrive {
+        let redrive = spend(0x73, &[NEVER_SPENT_NULLIFIER]);
+        arm_reserved(&mut *coordinator.store().write().await, id, &redrive);
+        redrive
+    }
+
+    async fn assert_listed(
+        coordinator: &NetworkShieldedCoordinator,
+        expected: &[(&PendingRedrive, ShieldedSpendDisposition)],
+    ) {
+        let records = coordinator.spend_dispositions(WALLET).await.unwrap();
+        assert_eq!(records.len(), expected.len());
+        for (redrive, disposition) in expected {
+            assert!(records
+                .iter()
+                .any(|record| record.st_hash == redrive.st_hash()
+                    && record.disposition == *disposition));
+        }
+        let redrives: Vec<_> = expected.iter().map(|(redrive, _)| *redrive).collect();
+        assert_holds_by_value(&records, &redrives);
+    }
+
+    async fn ack(
+        coordinator: &NetworkShieldedCoordinator,
+        id: SubwalletId,
+        redrive: &PendingRedrive,
+    ) {
+        assert!(coordinator
+            .ack_spend_disposition(WALLET, id.account_index, &redrive.st_hash())
+            .await
+            .unwrap());
+    }
+
+    fn inputs_unspent(id: SubwalletId, watermark: u64) -> ShieldedSyncStartState {
+        snapshot_at(
+            id,
+            &[
+                note(SPENT_NULLIFIER),
+                note(NEVER_SPENT_NULLIFIER),
+                note(CANCELLED_NULLIFIER),
+                note(UNSPENT_NULLIFIER),
+            ],
+            watermark,
+        )
+    }
+
+    /// Removed with an `Executed`, a `Cancelled` and an armed record, which the
+    /// removal writes `Purged`, then added again under the same id from an
+    /// older snapshot: before a pass every row is listed and holds its input,
+    /// only the healthy note is selectable or counted, and a row can be
+    /// acknowledged. A qualifying pass decides the rest: the executed input
+    /// is spent, the purged one selectable, and no listed row holds anything.
+    #[tokio::test]
+    async fn a_removed_wallets_rows_hold_until_a_qualifying_pass_decides() {
+        let path = tree_path();
+        let id = SubwalletId::new(WALLET, 0);
+        let coordinator = recording_coordinator(&path, &[0]).await;
+        let executed = executed(&coordinator, id).await;
+        let purged = armed(&coordinator, id).await;
+        let cancelled = spend(0x74, &[CANCELLED_NULLIFIER]);
+        {
+            let mut store = coordinator.store().write().await;
+            arm_reserved(&mut *store, id, &cancelled);
+            store
+                .resolve_redrive(
+                    id,
+                    &cancelled.activity_id,
+                    ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+                )
+                .unwrap();
+        }
+        coordinator.unregister_wallet(WALLET).await;
+        let rows = [
+            (&executed, ShieldedSpendDisposition::Executed),
+            (
+                &purged,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
+            ),
+            (
+                &cancelled,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+            ),
+        ];
+        assert_listed(&coordinator, &rows).await;
+
+        let host = Host::inline();
+        re_add(&coordinator, &host, &inputs_unspent(id, SNAPSHOT_WATERMARK)).await;
+        assert_listed(&coordinator, &rows).await;
+        assert_inputs_held(&coordinator, id, "held inputs before any pass").await;
+        ack(&coordinator, id, &cancelled).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([CANCELLED_NULLIFIER, UNSPENT_NULLIFIER]),
+            "an ack frees a removed wallet's row before any pass"
+        );
+
+        qualifying_pass(&coordinator, &host, id).await;
+        assert!(host.took_spent(id, SPENT_NULLIFIER));
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([
+                NEVER_SPENT_NULLIFIER,
+                CANCELLED_NULLIFIER,
+                UNSPENT_NULLIFIER
+            ]),
+            "the scan decides: spent stays spent, unspent becomes selectable"
+        );
+        let records = coordinator.spend_dispositions(WALLET).await.unwrap();
+        assert_eq!(records.len(), 2, "the rows stay listed");
+        assert!(records
+            .iter()
+            .all(|record| record.held_nullifiers.is_empty()));
+        drop(coordinator);
+        remove_store_files(&path);
+    }
+
+    /// The same removal with a host that only buffers the pass's changeset:
+    /// the rows keep holding their inputs across the pass, until acknowledged.
+    #[tokio::test]
+    async fn a_removed_wallets_rows_hold_until_ack_on_a_buffering_host() {
+        let path = tree_path();
+        let id = SubwalletId::new(WALLET, 0);
+        let coordinator = recording_coordinator(&path, &[0]).await;
+        let executed = executed(&coordinator, id).await;
+        let purged = armed(&coordinator, id).await;
+        coordinator.unregister_wallet(WALLET).await;
+
+        let host = Host::buffering();
+        re_add(&coordinator, &host, &inputs_unspent(id, SNAPSHOT_WATERMARK)).await;
+        pass(&coordinator).await;
+        assert!(host.took_spent(id, SPENT_NULLIFIER));
+        let rows = [
+            (&executed, ShieldedSpendDisposition::Executed),
+            (
+                &purged,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
+            ),
+        ];
+        assert_listed(&coordinator, &rows).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([CANCELLED_NULLIFIER, UNSPENT_NULLIFIER]),
+            "a buffered save lifts nothing"
+        );
+        ack(&coordinator, id, &executed).await;
+        ack(&coordinator, id, &purged).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([
+                NEVER_SPENT_NULLIFIER,
+                CANCELLED_NULLIFIER,
+                UNSPENT_NULLIFIER
+            ])
+        );
+        assert!(coordinator
+            .spend_dispositions(WALLET)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(coordinator);
+        remove_store_files(&path);
+    }
+
+    enum Purge {
+        DroppedAccount,
+        Clear,
+    }
+
+    /// An account purged with an `Executed` and an armed record, which the
+    /// purge writes `Purged`, by a re-bind that drops it or by a Clear, then
+    /// bound again: the rows are listed and hold their inputs across a
+    /// qualifying pass, and only an ack frees them.
+    async fn a_purged_accounts_rows_hold_until_ack(purge: Purge) {
+        let path = tree_path();
+        let (id, watermark) = match purge {
+            Purge::DroppedAccount => (SubwalletId::new(WALLET, 1), SNAPSHOT_WATERMARK),
+            Purge::Clear => (SubwalletId::new(WALLET, 0), 0),
+        };
+        let coordinator = recording_coordinator(&path, &[0, 1]).await;
+        let executed = executed(&coordinator, id).await;
+        let purged = armed(&coordinator, id).await;
+        match purge {
+            Purge::DroppedAccount => register_accounts(&coordinator, &Host::inline(), &[0]).await,
+            Purge::Clear => coordinator.clear().await.unwrap(),
+        }
+        let rows = [
+            (&executed, ShieldedSpendDisposition::Executed),
+            (
+                &purged,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
+            ),
+        ];
+        assert_listed(&coordinator, &rows).await;
+
+        let host = Host::inline();
+        register_accounts(&coordinator, &host, &[0, 1]).await;
+        coordinator
+            .restore_for_wallet(WALLET, &inputs_unspent(id, watermark))
+            .await
+            .unwrap();
+        assert_listed(&coordinator, &rows).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([CANCELLED_NULLIFIER, UNSPENT_NULLIFIER])
+        );
+        qualifying_pass(&coordinator, &host, id).await;
+        assert_listed(&coordinator, &rows).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([CANCELLED_NULLIFIER, UNSPENT_NULLIFIER]),
+            "a purge's holds stay across a pass"
+        );
+        ack(&coordinator, id, &executed).await;
+        ack(&coordinator, id, &purged).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
+            BTreeSet::from([
+                NEVER_SPENT_NULLIFIER,
+                CANCELLED_NULLIFIER,
+                UNSPENT_NULLIFIER
+            ]),
+            "an ack frees them"
+        );
+        drop(coordinator);
+        remove_store_files(&path);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_accounts_rows_hold_until_ack() {
+        a_purged_accounts_rows_hold_until_ack(Purge::DroppedAccount).await;
+    }
+
+    #[tokio::test]
+    async fn a_cleared_accounts_rows_hold_until_ack() {
+        a_purged_accounts_rows_hold_until_ack(Purge::Clear).await;
+    }
+}

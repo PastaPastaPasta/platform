@@ -183,6 +183,20 @@ impl PendingRedrive {
     pub fn st_hash(&self) -> [u8; 32] {
         dpp::util::hash::hash_single(&self.st_bytes)
     }
+
+    /// Whether the signed transition contains an action spending
+    /// `nullifier` whose output commitment is `cmx`. Such an action can only
+    /// appear on chain as part of this exact transition. Bytes that do not
+    /// decode contain no action.
+    pub fn contains_action(&self, nullifier: &[u8; 32], cmx: &[u8; 32]) -> bool {
+        use dpp::serialization::PlatformDeserializableTrusted;
+        dpp::state_transition::StateTransition::deserialize_from_bytes_trusted(&self.st_bytes)
+            .is_ok_and(|transition| {
+                super::operations::shielded_actions(&transition)
+                    .iter()
+                    .any(|action| action.nullifier == *nullifier && action.cmx == *cmx)
+            })
+    }
 }
 
 /// Why a durable note-spend record was resolved, as evidence about whether its
@@ -409,6 +423,18 @@ pub enum ShieldedDispositionRefusal {
         hex::encode(activity_id)
     )]
     RedriveArmed { activity_id: [u8; 32] },
+    /// The store does not record spend dispositions (see
+    /// [`ShieldedStore::records_spend_dispositions`]), so the request would
+    /// leave no evidence behind.
+    #[error("this shielded store is not recording spend dispositions")]
+    NotRecording,
+    /// The record may have been broadcast, so it may have executed or may
+    /// still execute and cannot be abandoned.
+    #[error(
+        "shielded redrive for activity {} may have been broadcast; it cannot be abandoned",
+        hex::encode(activity_id)
+    )]
+    MayHaveBeenBroadcast { activity_id: [u8; 32] },
     /// An unacknowledged disposition for `st_hash` in the same wallet
     /// already holds different evidence (another value, activity or account).
     #[error(
@@ -763,6 +789,74 @@ pub trait ShieldedStore: Send + Sync {
         st_hashes: &[[u8; 32]],
     ) -> Result<(), Self::Error>;
 
+    /// Whether every path that resolves or deletes a note-spend redrive
+    /// records a disposition first. Off by default; the owner turns it on
+    /// when the host installs a dispatch hook that consumes dispositions.
+    ///
+    /// While it is on, [`Self::mark_spent`] and [`Self::clear_pending`] are
+    /// persist-first: `mark_spent` resolves the records its nullifier
+    /// belongs to (as [`Self::resolve_redrives_spending`] does) before it
+    /// changes memory, and `clear_pending` refuses with
+    /// [`ShieldedDispositionRefusal::RedriveArmed`] while an armed record
+    /// carries the nullifier. While it is off they keep their memory-first
+    /// behaviour.
+    fn records_spend_dispositions(&self) -> bool;
+
+    /// Before `id`'s note with `nullifier` is marked spent, resolve every
+    /// armed note-spend redrive that carries it, as [`Self::resolve_redrive`]
+    /// does, so each record's notes are held until its disposition is
+    /// acknowledged. `spending_action_cmx` is the output commitment of the
+    /// on-chain action that revealed `nullifier`, when the caller observed
+    /// it.
+    ///
+    /// A record is resolved [`Executed`](ShieldedSpendDisposition::Executed)
+    /// only if its own signed transition contains that exact action (the
+    /// nullifier with that output commitment), and it alone still reserves
+    /// all of its notes and none of them is already spent. Otherwise, since
+    /// another transition may have spent the note, it is
+    /// [`Unresolved(Unattributable)`](UnresolvedReason::Unattributable).
+    /// The note's spent flag is left to [`Self::mark_spent`], so the spend is
+    /// still reported as newly detected.
+    ///
+    /// A no-op while [`Self::records_spend_dispositions`] is off, or when
+    /// the note is unknown. All records the nullifier resolves commit
+    /// together; on error nothing changed.
+    fn resolve_redrives_spending(
+        &mut self,
+        id: SubwalletId,
+        nullifier: &[u8; 32],
+        spending_action_cmx: Option<&[u8; 32]>,
+    ) -> Result<(), Self::Error>;
+
+    /// Arm a note-spend redrive before its transition is first broadcast,
+    /// so a later [`abandon`](super::NetworkShieldedCoordinator::abandon_shielded_spend)
+    /// can prove nothing was sent. Call [`Self::mark_redrive_sent`] before
+    /// the first broadcast. Otherwise like [`Self::arm_redrive`], which
+    /// always arms a record as possibly sent.
+    ///
+    /// Refused with [`ShieldedDispositionRefusal::NotRecording`] while
+    /// [`Self::records_spend_dispositions`] is off, with
+    /// [`ShieldedDispositionRefusal::IdentityDebit`] for a record without
+    /// nullifiers, and with [`ShieldedDispositionRefusal::RedriveArmed`]
+    /// while a record for the same activity is armed, which may have been
+    /// broadcast.
+    fn arm_unsent_redrive(
+        &mut self,
+        id: SubwalletId,
+        redrive: PendingRedrive,
+    ) -> Result<(), Self::Error>;
+
+    /// Claim `id`'s redrive for `activity_id` for a broadcast: if it was
+    /// armed as never broadcast, record first, durably, that it may now have
+    /// been. Returns whether the record is still armed; a caller must not
+    /// broadcast a record that is not, since it may have been resolved (for
+    /// example abandoned) since the caller read it.
+    fn mark_redrive_sent(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<bool, Self::Error>;
+
     // ── Outgoing history (per-subwallet) ───────────────────────────────
 
     /// Record an outgoing (sent) note recovered via OVK for `id`.
@@ -1023,6 +1117,11 @@ pub(super) struct SubwalletState {
     /// (mark_spent / clear_pending) drops the whole record — a
     /// transition lands or dies atomically for all its nullifiers.
     pub redrives: BTreeMap<[u8; 32], PendingRedrive>,
+    /// Activity ids of armed redrives this library has never broadcast
+    /// (armed by `arm_unsent_redrive` and not yet marked sent). Any other
+    /// armed redrive may have been broadcast. An id here counts only while
+    /// `redrives` holds it; every arm and removal keeps the two in step.
+    pub unsent_redrives: BTreeSet<[u8; 32]>,
     /// Notes this subwallet SENT, recovered via OVK during the scan.
     /// Append-only send history in recording order.
     pub outgoing_notes: Vec<ShieldedOutgoingNote>,
@@ -1119,6 +1218,7 @@ impl SubwalletState {
             .collect();
         for id in &dropped {
             self.redrives.remove(id);
+            self.unsent_redrives.remove(id);
         }
         dropped
     }
@@ -1187,9 +1287,102 @@ impl SubwalletState {
         removed
     }
 
-    /// Arm (or overwrite by activity id) a re-drivable record.
+    /// Arm (or overwrite by activity id) a re-drivable record, as possibly
+    /// broadcast.
     pub(super) fn arm_redrive(&mut self, redrive: PendingRedrive) {
+        self.unsent_redrives.remove(&redrive.activity_id);
         self.redrives.insert(redrive.activity_id, redrive);
+    }
+
+    /// Arm a note-spend record that has never been broadcast.
+    pub(super) fn arm_unsent_redrive(&mut self, redrive: PendingRedrive) {
+        self.unsent_redrives.insert(redrive.activity_id);
+        self.redrives.insert(redrive.activity_id, redrive);
+    }
+
+    /// Whether `activity_id`'s redrive is armed and was never broadcast.
+    pub(super) fn redrive_is_unsent(&self, activity_id: &[u8; 32]) -> bool {
+        self.redrives.contains_key(activity_id) && self.unsent_redrives.contains(activity_id)
+    }
+
+    /// Whether `nullifier` belongs to a known note of this subwallet.
+    pub(super) fn knows_nullifier(&self, nullifier: &[u8; 32]) -> bool {
+        self.nullifier_index.contains_key(nullifier)
+    }
+
+    /// Activity ids of the armed redrives that carry `nullifier`.
+    pub(super) fn redrives_carrying(&self, nullifier: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.redrives
+            .values()
+            .filter(|redrive| redrive.nullifiers.contains(nullifier))
+            .map(|redrive| redrive.activity_id)
+            .collect()
+    }
+
+    /// Whether evidence that `activity_id`'s note-spend redrive executed is
+    /// attributable to it alone: it still reserves every one of its notes,
+    /// none of them is already marked spent, and no other armed redrive
+    /// reserves any of them.
+    pub(super) fn execution_attributable(&self, activity_id: &[u8; 32]) -> bool {
+        let Ok(redrive) = self.redrive_to_resolve(activity_id, ShieldedSpendDisposition::Executed)
+        else {
+            return false;
+        };
+        redrive.nullifiers.iter().all(|nullifier| {
+            self.pending_nullifiers.contains_key(nullifier)
+                && !self
+                    .nullifier_index
+                    .get(nullifier)
+                    .is_some_and(|&index| self.notes[index].is_spent)
+        })
+    }
+
+    /// The disposition a spent `nullifier` supports for `activity_id`'s
+    /// redrive: `Executed` only when the on-chain action that spent it, with
+    /// output commitment `spending_action_cmx`, is one of this redrive's own
+    /// actions and the execution is attributable to it; otherwise
+    /// `Unresolved(Unattributable)`.
+    pub(super) fn spent_note_disposition(
+        &self,
+        activity_id: &[u8; 32],
+        nullifier: &[u8; 32],
+        spending_action_cmx: Option<&[u8; 32]>,
+    ) -> ShieldedSpendDisposition {
+        let proven = spending_action_cmx.is_some_and(|cmx| {
+            self.redrives
+                .get(activity_id)
+                .is_some_and(|redrive| redrive.contains_action(nullifier, cmx))
+        });
+        if proven {
+            self.observed_execution_disposition(activity_id)
+        } else {
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable)
+        }
+    }
+
+    /// Whether any note `activity_id`'s redrive spends is already marked
+    /// spent, so the transition may have executed.
+    pub(super) fn redrive_spends_a_spent_note(&self, activity_id: &[u8; 32]) -> bool {
+        self.redrives.get(activity_id).is_some_and(|redrive| {
+            redrive.nullifiers.iter().any(|nullifier| {
+                self.nullifier_index
+                    .get(nullifier)
+                    .is_some_and(|&index| self.notes[index].is_spent)
+            })
+        })
+    }
+
+    /// The disposition that observed outputs of `activity_id`'s transition
+    /// support for its redrive.
+    pub(super) fn observed_execution_disposition(
+        &self,
+        activity_id: &[u8; 32],
+    ) -> ShieldedSpendDisposition {
+        if self.execution_attributable(activity_id) {
+            ShieldedSpendDisposition::Executed
+        } else {
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable)
+        }
     }
 
     pub(super) fn pending_redrives(&self) -> Vec<PendingRedrive> {
@@ -1222,6 +1415,7 @@ impl SubwalletState {
 
     pub(super) fn clear_redrive(&mut self, activity_id: &[u8; 32]) {
         self.redrives.remove(activity_id);
+        self.unsent_redrives.remove(activity_id);
     }
 
     /// The armed note-spend redrive `resolve_redrive` may resolve as
@@ -1289,6 +1483,7 @@ impl SubwalletState {
         activity_id: &[u8; 32],
     ) -> Option<PendingRedrive> {
         let redrive = self.redrives.remove(activity_id)?;
+        self.unsent_redrives.remove(activity_id);
         for nullifier in &redrive.nullifiers {
             match self
                 .redrives
@@ -1702,6 +1897,39 @@ impl ShieldedStore for InMemoryShieldedStore {
         Ok(())
     }
 
+    fn records_spend_dispositions(&self) -> bool {
+        false
+    }
+
+    fn resolve_redrives_spending(
+        &mut self,
+        _id: SubwalletId,
+        _nullifier: &[u8; 32],
+        _spending_action_cmx: Option<&[u8; 32]>,
+    ) -> Result<(), Self::Error> {
+        // This store never records spend dispositions.
+        Ok(())
+    }
+
+    fn arm_unsent_redrive(
+        &mut self,
+        _id: SubwalletId,
+        _redrive: PendingRedrive,
+    ) -> Result<(), Self::Error> {
+        Err(ShieldedDispositionRefusal::NotRecording.into())
+    }
+
+    fn mark_redrive_sent(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        Ok(self.subwallets.get_mut(&id).is_some_and(|sw| {
+            sw.unsent_redrives.remove(activity_id);
+            sw.redrives.contains_key(activity_id)
+        }))
+    }
+
     fn record_outgoing_note(
         &mut self,
         id: SubwalletId,
@@ -1894,6 +2122,45 @@ pub(super) mod disposition_contract {
         }
     }
 
+    /// The output commitment [`spend_with_actions`] gives the action of
+    /// record `tag` that spends `nullifier`.
+    pub(crate) fn action_cmx(tag: u8, nullifier: &[u8; 32]) -> [u8; 32] {
+        let mut cmx = [tag; 32];
+        cmx[16..].copy_from_slice(&nullifier[16..]);
+        cmx
+    }
+
+    /// A note-spend record whose bytes are a real shielded transfer with one
+    /// action per nullifier, so a spent nullifier with the action's output
+    /// commitment ([`action_cmx`]) proves it executed.
+    pub(crate) fn spend_with_actions(tag: u8, nullifiers: &[[u8; 32]]) -> PendingRedrive {
+        use dpp::serialization::PlatformSerializable;
+        use dpp::state_transition::shielded_transfer_transition::v0::ShieldedTransferTransitionV0;
+
+        let transition: dpp::state_transition::StateTransition = ShieldedTransferTransitionV0 {
+            actions: nullifiers
+                .iter()
+                .map(|nullifier| dpp::shielded::SerializedAction {
+                    nullifier: *nullifier,
+                    rk: [tag; 32],
+                    cmx: action_cmx(tag, nullifier),
+                    encrypted_note: vec![tag; 216],
+                    cv_net: [tag; 32],
+                    spend_auth_sig: [tag; 64],
+                })
+                .collect(),
+            value_balance: 1_000,
+            anchor: [0x5A; 32],
+            proof: vec![tag; 40],
+            binding_signature: [tag; 64],
+        }
+        .into();
+        PendingRedrive {
+            st_bytes: transition.serialize_to_bytes().expect("serialize"),
+            ..spend(tag, nullifiers)
+        }
+    }
+
     /// Reserve the record's notes the way a spend does, then arm it.
     pub(crate) fn arm_reserved<S: ShieldedStore>(
         store: &mut S,
@@ -1917,6 +2184,34 @@ pub(super) mod disposition_contract {
             .into_iter()
             .map(|note| note.nullifier)
             .collect()
+    }
+
+    /// Each redrive's disposition among `records` holds what its value says:
+    /// every input of a spend that executed or may have, none of one that
+    /// never can.
+    pub(crate) fn assert_holds_by_value(
+        records: &[ShieldedSpendDispositionRecord],
+        redrives: &[&PendingRedrive],
+    ) {
+        for redrive in redrives {
+            let record = records
+                .iter()
+                .find(|record| record.st_hash == redrive.st_hash())
+                .unwrap_or_else(|| panic!("no disposition for {:?}", redrive.activity_id));
+            let expected: BTreeSet<[u8; 32]> = match record.disposition {
+                ShieldedSpendDisposition::NotExecuted(_) => BTreeSet::new(),
+                ShieldedSpendDisposition::Executed | ShieldedSpendDisposition::Unresolved(_) => {
+                    redrive.nullifiers.iter().copied().collect()
+                }
+            };
+            let held: BTreeSet<[u8; 32]> = record.held_nullifiers.iter().copied().collect();
+            assert_eq!(
+                held, expected,
+                "{:?} must hold what it may have spent",
+                record.disposition
+            );
+            assert_eq!(held.len(), record.held_nullifiers.len());
+        }
     }
 
     /// The typed refusal, read through [`AsDispositionRefusal`] as generic
