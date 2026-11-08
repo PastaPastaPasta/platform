@@ -721,6 +721,54 @@ async fn a_re_key_before_the_pass_guard_writes_nothing_for_the_old_key() {
     remove_store_files(&path);
 }
 
+/// A Clear after a pass took its subwallet list but before the pass took the
+/// store guard: the pass writes nothing into the reset store, so the wallet
+/// bound again after it still starts from index 0. A restore never rewinds a
+/// watermark, and the pass's changeset found no persister, so a watermark it
+/// wrote would leave the host without the notes below it.
+#[tokio::test]
+async fn a_clear_before_the_pass_guard_leaves_the_store_reset() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+
+    let pause = pass_pause::arm_at(
+        pass_pause::key(coordinator.store()),
+        Point::AfterListSnapshot,
+    );
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    tokio::time::timeout(Duration::from_secs(60), coordinator.clear())
+        .await
+        .expect("a Clear does not wait for a pass that holds no lock")
+        .unwrap();
+    pause.resume.add_permits(1);
+    pass.await.unwrap();
+
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator
+        .restore_for_wallet(WALLET, &ShieldedSyncStartState::default())
+        .await
+        .unwrap();
+    {
+        let store = coordinator.store().read().await;
+        assert_eq!(
+            store.last_synced_note_index(id).unwrap(),
+            0,
+            "the wallet bound again after the Clear starts from index 0"
+        );
+        assert_eq!(store.tree_size().unwrap(), 0, "the tree stays reset");
+    }
+    assert!(unspent(&coordinator, id).await.is_empty(), "no stale note");
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
 /// A wallet removed and added again from an older host snapshot keeps its
 /// inputs held until its first pass: before it, neither the executed input
 /// nor the never-executed one is selectable or counted, even beside a

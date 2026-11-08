@@ -270,8 +270,9 @@ pub struct NetworkShieldedCoordinator {
 
 /// Per-wallet count of removals, so a sync pass can skip a wallet removed
 /// after it took its subwallet list. A removal is an
-/// [`unregister_wallet`](NetworkShieldedCoordinator::unregister_wallet), or a
-/// re-bind that drops or re-keys one of the wallet's accounts.
+/// [`unregister_wallet`](NetworkShieldedCoordinator::unregister_wallet), a
+/// re-bind that drops or re-keys one of the wallet's accounts, or a
+/// [`clear`](NetworkShieldedCoordinator::clear).
 ///
 /// [`sync`](NetworkShieldedCoordinator::sync) lists the registered
 /// subwallets under `accounts.read` and takes the store write guard only
@@ -1273,6 +1274,18 @@ impl NetworkShieldedCoordinator {
         // Taken before the store lock to keep the `lifecycle` → `store`
         // order.
         let _lifecycle = self.lifecycle.lock().await;
+        // Every wallet counts as removed (`WalletRemovals`). A pass that
+        // listed before this Clear would otherwise write its notes and its
+        // watermarks into the reset store; a restore never rewinds a
+        // watermark, so the rebound wallet's cold rebuild from index 0
+        // would never run. `accounts` stays write-locked until the
+        // registries are cleared, so no pass lists a wallet after its bump.
+        let mut accounts = self.accounts.write().await;
+        let wallet_ids: std::collections::BTreeSet<WalletId> =
+            accounts.keys().map(|id| id.wallet_id).collect();
+        for wallet_id in wallet_ids {
+            self.removals.record(wallet_id);
+        }
 
         // Reset the persistent store FIRST and bail before mutating any
         // coordinator registries if it fails. Clearing `accounts` / `persisters`
@@ -1358,7 +1371,7 @@ impl NetworkShieldedCoordinator {
         // clear: dropping them would make the coordinator forget every
         // bound wallet (no syncs until the host rebinds) while the host,
         // told the clear failed, keeps its own state.
-        self.accounts.write().await.clear();
+        accounts.clear();
         self.persisters.write().await.clear();
         if let Ok(mut g) = self.last_caught_up_at.lock() {
             *g = None;
