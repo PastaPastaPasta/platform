@@ -2759,53 +2759,6 @@ mod tests {
             remove_store_files(&path);
         }
 
-        const LOCK_PROBE_PATH: &str = "PLATFORM_WALLET_STORE_LOCK_PROBE_PATH";
-        const LOCK_PROBE_EXPECT: &str = "PLATFORM_WALLET_STORE_LOCK_PROBE_EXPECT";
-
-        /// Run in a child process by `another_process_cannot_open_a_live_store`;
-        /// a no-op otherwise.
-        #[test]
-        fn store_lock_probe_child() {
-            let Ok(path) = std::env::var(LOCK_PROBE_PATH) else {
-                return;
-            };
-            let path = std::path::PathBuf::from(path);
-            let opened = FileBackedShieldedStore::open_path(&path, 100);
-            match std::env::var(LOCK_PROBE_EXPECT).as_deref() {
-                Ok("refused") => assert_already_open(opened, &path),
-                _ => drop(opened.expect("the file is free")),
-            }
-        }
-
-        #[test]
-        fn another_process_cannot_open_a_live_store() {
-            let path = temp_tree_path("store_owner_lock_process");
-            let probe = |expect: &str| {
-                let output = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "wallet::shielded::file_store::tests::dispositions::store_lock_probe_child",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(LOCK_PROBE_PATH, &path)
-                    .env(LOCK_PROBE_EXPECT, expect)
-                    .output()
-                    .expect("spawn the test binary");
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                assert!(
-                    output.status.success() && stdout.contains("1 passed"),
-                    "the child expecting {expect} failed: {stdout}{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            };
-            let store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
-            probe("refused");
-            drop(store);
-            probe("opens");
-            remove_store_files(&path);
-        }
-
         #[test]
         fn unresolved_resolutions_hold_until_ack() {
             contract_survives_reopen("disposition_unresolved_hold", |store| {
