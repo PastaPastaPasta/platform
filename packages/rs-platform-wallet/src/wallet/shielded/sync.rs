@@ -148,6 +148,10 @@ pub struct MultiSyncNotesResult {
     /// subwallet. The caller decides whether to queue it on the
     /// shared `WalletPersister`.
     pub changeset: ShieldedChangeSet,
+    /// Per subwallet, the dispositions whose holds this pass marked as
+    /// scanned ([`ShieldedStore::mark_holds_scanned`]). They stay held until
+    /// the caller lifts them with [`ShieldedStore::lift_scanned_holds`].
+    pub scanned_holds: BTreeMap<SubwalletId, Vec<[u8; 32]>>,
     /// Wallets the pass skipped because they were removed after the caller
     /// took its subwallet list. Nothing was saved for them.
     pub removed_wallets: BTreeSet<crate::wallet::platform_wallet::WalletId>,
@@ -713,10 +717,10 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // Scan-based spend detection. Now that THIS pass's receipts are
     // persisted (above), replay every scanned action's nullifier
     // against each subwallet — see [`apply_scanned_nullifier_spends`]
-    // for the ordering rationale — then lift the holds a wallet removal
-    // left until this scan.
+    // for the ordering rationale — then mark the holds a wallet removal
+    // left for this scan as scanned.
     let subwallet_ids: Vec<SubwalletId> = subwallets.iter().map(|(id, _)| *id).collect();
-    let newly_spent_per_subwallet = commit_scan(
+    let (newly_spent_per_subwallet, scanned_holds) = commit_scan(
         &mut *store,
         &subwallet_ids,
         &scanned_nullifiers,
@@ -760,9 +764,45 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
         per_subwallet_newly_spent: newly_spent_per_subwallet,
         total_scanned: scanned_volume,
         changeset,
+        scanned_holds,
         removed_wallets,
     })
 }
+
+/// What a completed pass commits for its subwallets after saving its
+/// receipts, under its store write guard: the spent nullifiers it scanned
+/// ([`apply_scanned_nullifier_spends`]), then the marking of the holds a
+/// wallet removal left for the subwallet's next completed scan
+/// ([`ShieldedStore::mark_holds_scanned`]).
+///
+/// The marked holds stay held. Returns the per-subwallet count of notes
+/// newly flipped to spent and, per subwallet, the holds it marked; the
+/// caller lifts those only once the host holds this pass's spent state
+/// durably (see `NetworkShieldedCoordinator::sync`).
+pub(super) fn commit_scan<S: ShieldedStore>(
+    store: &mut S,
+    subwallet_ids: &[SubwalletId],
+    scanned_nullifiers: &[[u8; 32]],
+    changeset: &mut ShieldedChangeSet,
+) -> Result<ScanCommit, S::Error> {
+    let newly_spent =
+        apply_scanned_nullifier_spends(store, subwallet_ids, scanned_nullifiers, changeset)?;
+    let mut scanned_holds = BTreeMap::new();
+    for id in subwallet_ids {
+        let scanned = store.mark_holds_scanned(*id)?;
+        if !scanned.is_empty() {
+            scanned_holds.insert(*id, scanned);
+        }
+    }
+    Ok((newly_spent, scanned_holds))
+}
+
+/// Per subwallet, the notes [`commit_scan`] newly marked spent and the holds
+/// it marked as scanned.
+pub(super) type ScanCommit = (
+    BTreeMap<SubwalletId, usize>,
+    BTreeMap<SubwalletId, Vec<[u8; 32]>>,
+);
 
 /// Scan-based spend detection: replay the set of nullifiers seen on
 /// scanned actions against each subwallet's note store, marking any
@@ -798,26 +838,6 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
 /// Returns the per-subwallet count of notes newly flipped to spent and
 /// records each match on `changeset` via
 /// [`ShieldedChangeSet::record_nullifier_spent`].
-/// What a completed pass commits for its subwallets after saving its
-/// receipts, under its store write guard: the spent nullifiers it scanned
-/// ([`apply_scanned_nullifier_spends`]), then the lifting of the holds a
-/// wallet removal left until the subwallet's next completed scan. A held
-/// note therefore becomes selectable only together with its scanned spent
-/// state.
-pub(super) fn commit_scan<S: ShieldedStore>(
-    store: &mut S,
-    subwallet_ids: &[SubwalletId],
-    scanned_nullifiers: &[[u8; 32]],
-    changeset: &mut ShieldedChangeSet,
-) -> Result<BTreeMap<SubwalletId, usize>, S::Error> {
-    let newly_spent =
-        apply_scanned_nullifier_spends(store, subwallet_ids, scanned_nullifiers, changeset)?;
-    for id in subwallet_ids {
-        store.lift_holds_awaiting_scan(*id)?;
-    }
-    Ok(newly_spent)
-}
-
 fn apply_scanned_nullifier_spends<S: ShieldedStore>(
     store: &mut S,
     subwallet_ids: &[SubwalletId],
@@ -1126,6 +1146,12 @@ pub(super) mod pass_pause {
         AfterListSnapshot,
         /// The pass holds the store guard and read its watermarks.
         AfterWatermarkRead,
+        /// The pass is done; `sync()` has not handed its changeset to the
+        /// host yet.
+        BeforeHostSave,
+        /// The host save returned; `sync()` has not taken the store guard
+        /// to lift the scanned holds yet.
+        BeforeScanLift,
     }
 
     type Armed = Mutex<HashMap<(usize, Point), Arc<Pause>>>;

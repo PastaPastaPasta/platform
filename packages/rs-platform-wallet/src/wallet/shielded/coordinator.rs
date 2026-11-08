@@ -275,9 +275,10 @@ pub struct NetworkShieldedCoordinator {
 /// [`sync`](NetworkShieldedCoordinator::sync) lists the registered
 /// subwallets under `accounts.read` and takes the store write guard only
 /// later, so a removal can complete in between. The pass records each listed
-/// wallet's count with the list and compares it under the store write guard.
-/// A changed count means the wallet was removed, and maybe added again under
-/// the same id, after the list was taken: the pass then saves no note,
+/// wallet's count with the list and compares it under the store write guard,
+/// both in the pass and again before it lifts scanned holds after the host
+/// save. A changed count means the wallet was removed, and maybe added again
+/// under the same id, after the list was taken: the pass then saves no note,
 /// advances no watermark and lifts no hold for it. Checking that the wallet
 /// is still registered could not tell a same-id re-add from no removal.
 ///
@@ -1560,6 +1561,13 @@ impl NetworkShieldedCoordinator {
         // WalletId directly — each per-wallet `WalletPersister.store`
         // only sees its own wallet's deltas.
         let consolidated = notes.changeset.clone();
+        // Wallets whose changeset of this pass the host committed inline: the
+        // only ones whose scanned holds may be lifted (`lift_scanned_holds`).
+        let mut saved_inline: std::collections::BTreeSet<WalletId> =
+            std::collections::BTreeSet::new();
+        #[cfg(test)]
+        super::sync::pass_pause::reached(pass_key, super::sync::pass_pause::Point::BeforeHostSave)
+            .await;
         if !crate::changeset::merge::Merge::is_empty(&consolidated) {
             let per_wallet = consolidated.split_by_wallet_id();
             let persisters = self.persisters.read().await;
@@ -1575,15 +1583,27 @@ impl NetworkShieldedCoordinator {
                     shielded: Some(cs),
                     ..Default::default()
                 };
-                if let Err(e) = persister.store(full) {
-                    tracing::warn!(
+                match persister.store(full) {
+                    Ok(()) if persister.store_commits_inline() => {
+                        saved_inline.insert(wallet_id);
+                    }
+                    Ok(()) => {}
+                    Err(e) => tracing::warn!(
                         wallet_id = %hex::encode(wallet_id),
                         error = %e,
                         "Failed to queue shielded changeset from coordinator"
-                    );
+                    ),
                 }
             }
         }
+        self.lift_scanned_holds(
+            &notes.scanned_holds,
+            &saved_inline,
+            &removal_marks,
+            #[cfg(test)]
+            pass_key,
+        )
+        .await;
 
         // Cooldown decision based on aggregate activity across
         // every subwallet — any new commitment scanned or
@@ -1606,6 +1626,56 @@ impl NetworkShieldedCoordinator {
             build_per_wallet_summary(&subwallets, &notes, &newly_spent_per_sub, &balances_per_sub);
         summary.sync_unix_seconds = Self::now_unix();
         summary
+    }
+
+    /// Lift the holds a pass marked as scanned, for each wallet whose
+    /// changeset of that same pass the host committed inline.
+    ///
+    /// The host learns a pass's spent state only from that pass's changeset;
+    /// a later pass's changeset never carries it again. So a scanned hold is
+    /// lifted only when the persister attests
+    /// [`store_commits_inline`](crate::changeset::PlatformWalletPersistence::store_commits_inline)
+    /// and `store` of the marking pass's changeset returned Ok. In every other
+    /// case (a buffering persister, no persister, a failed `store`, a crash
+    /// before this point) the holds stay held until their dispositions are
+    /// acknowledged. A `flush` proves nothing here: another caller's failing
+    /// flush can drop the buffered changeset and leave a later flush an Ok on
+    /// an empty buffer.
+    ///
+    /// Under the store write guard it re-checks each wallet's removal count
+    /// ([`WalletRemovals`]). A wallet removed since the pass took its list is
+    /// skipped, and its holds stay marked for its next scan.
+    async fn lift_scanned_holds(
+        &self,
+        scanned_holds: &BTreeMap<SubwalletId, Vec<[u8; 32]>>,
+        saved_inline: &std::collections::BTreeSet<WalletId>,
+        removal_marks: &RemovalMarks,
+        #[cfg(test)] pass_key: usize,
+    ) {
+        let liftable: Vec<_> = scanned_holds
+            .iter()
+            .filter(|(id, _)| saved_inline.contains(&id.wallet_id))
+            .collect();
+        if liftable.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        super::sync::pass_pause::reached(pass_key, super::sync::pass_pause::Point::BeforeScanLift)
+            .await;
+        let mut store = self.store.write().await;
+        for (id, st_hashes) in liftable {
+            if self.removals.removed_since(removal_marks, id.wallet_id) {
+                continue;
+            }
+            if let Err(e) = store.lift_scanned_holds(*id, st_hashes) {
+                tracing::warn!(
+                    wallet_id = %hex::encode(id.wallet_id),
+                    account = id.account_index,
+                    error = %e,
+                    "Failed to lift scanned spend holds; they stay until acknowledged"
+                );
+            }
+        }
     }
 
     /// Build a `ShieldedSyncPassSummary` where every registered

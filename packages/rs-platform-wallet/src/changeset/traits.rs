@@ -236,6 +236,14 @@ pub trait PlatformWalletPersistence: Send + Sync {
     /// The default is conservative for buffered backends. Inline-committing
     /// implementations override this so callers do not roll back live state
     /// after a later, post-commit flush-notification failure.
+    ///
+    /// A shielded sync pass relies on it too. A wallet removal leaves the
+    /// wallet's spend holds for its next scan, and the pass lifts them only
+    /// when this returns `true` and `store` of that same pass's changeset
+    /// returned Ok, because only then does the host durably hold the spent
+    /// state the scan found. Otherwise the holds stay until their
+    /// dispositions are acknowledged. Attest `true` only if a successful
+    /// `store` has committed exactly the changeset it was handed.
     fn store_commits_inline(&self) -> bool {
         false
     }

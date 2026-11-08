@@ -1368,27 +1368,87 @@ impl ShieldedStore for FileBackedShieldedStore {
         Ok(deleted == 1)
     }
 
-    fn lift_holds_awaiting_scan(&mut self, id: SubwalletId) -> Result<(), Self::Error> {
-        let lifted: Vec<_> = self
+    fn mark_holds_scanned(&mut self, id: SubwalletId) -> Result<Vec<[u8; 32]>, Self::Error> {
+        if self
             .holds_awaiting_scan
             .range((id, [0u8; 32])..=(id, [0xFF; 32]))
-            .copied()
-            .collect();
-        if lifted.is_empty() {
+            .next()
+            .is_none()
+        {
+            return Ok(Vec::new());
+        }
+        // The rows the marker selects are the ones returned, so the caller
+        // can never lift a hold that was not waiting for this scan.
+        let scanned = {
+            let conn = self.pending_conn.lock().expect("pending_conn mutex");
+            let mut marked = conn
+                .prepare(
+                    "UPDATE shielded_spend_dispositions SET released_by_scan = 0 \
+                     WHERE wallet_id = ?1 AND account_index = ?2 AND released_by_scan = 1 \
+                     RETURNING st_hash",
+                )
+                .map_err(|e| FileShieldedStoreError::Storage(format!("mark scanned holds: {e}")))?;
+            let rows = marked
+                .query_map(
+                    rusqlite::params![id.wallet_id.as_slice(), id.account_index],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .map_err(|e| FileShieldedStoreError::Storage(format!("mark scanned holds: {e}")))?;
+            let mut scanned = Vec::new();
+            for st_hash in rows {
+                let st_hash = st_hash.map_err(|e| {
+                    FileShieldedStoreError::Storage(format!("read a scanned hold: {e}"))
+                })?;
+                let st_hash = <[u8; 32]>::try_from(st_hash.as_slice()).map_err(|_| {
+                    FileShieldedStoreError::Storage("a scanned hold's key is malformed".into())
+                })?;
+                scanned.push(st_hash);
+            }
+            scanned
+        };
+        for st_hash in &scanned {
+            self.holds_awaiting_scan.remove(&(id, *st_hash));
+        }
+        Ok(scanned)
+    }
+
+    fn lift_scanned_holds(
+        &mut self,
+        id: SubwalletId,
+        st_hashes: &[[u8; 32]],
+    ) -> Result<(), Self::Error> {
+        if st_hashes.is_empty() {
             return Ok(());
         }
         {
-            let conn = self.pending_conn.lock().expect("pending_conn mutex");
-            conn.execute(
-                "UPDATE shielded_spend_dispositions SET nullifiers = x'', released_by_scan = 0 \
-                 WHERE wallet_id = ?1 AND account_index = ?2 AND released_by_scan = 1",
-                rusqlite::params![id.wallet_id.as_slice(), id.account_index],
-            )
-            .map_err(|e| FileShieldedStoreError::Storage(format!("lift holds after scan: {e}")))?;
+            let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
+            let tx = conn.transaction().map_err(|e| {
+                FileShieldedStoreError::Storage(format!("begin lifting scanned holds: {e}"))
+            })?;
+            for st_hash in st_hashes {
+                tx.execute(
+                    "UPDATE shielded_spend_dispositions SET nullifiers = x'' \
+                     WHERE wallet_id = ?1 AND account_index = ?2 AND st_hash = ?3 \
+                     AND released_by_scan = 0",
+                    rusqlite::params![
+                        id.wallet_id.as_slice(),
+                        id.account_index,
+                        st_hash.as_slice()
+                    ],
+                )
+                .map_err(|e| {
+                    FileShieldedStoreError::Storage(format!("lift a scanned hold: {e}"))
+                })?;
+            }
+            tx.commit().map_err(|e| {
+                FileShieldedStoreError::Storage(format!("commit lifting scanned holds: {e}"))
+            })?;
         }
-        for key in lifted {
-            self.holds_awaiting_scan.remove(&key);
-            self.disposition_holds.remove(&key);
+        for st_hash in st_hashes {
+            let key = (id, *st_hash);
+            if !self.holds_awaiting_scan.contains(&key) {
+                self.disposition_holds.remove(&key);
+            }
         }
         Ok(())
     }
@@ -1555,9 +1615,8 @@ impl ShieldedStore for FileBackedShieldedStore {
         // wallet_id — SQL before memory, so an Err return means neither
         // store was touched (fail-atomic) rather than a memory purge
         // the caller can't distinguish from a no-op.
-        // The wallet's dispositions stay and keep holding their notes until
-        // the next completed scan or an ack; the marker is in the same
-        // transaction.
+        // The wallet's dispositions stay and keep holding their notes; the
+        // marker for the next completed scan is in the same transaction.
         {
             let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
             let tx = conn
@@ -2806,9 +2865,9 @@ mod tests {
 
         /// A removed wallet's holds wait for its next completed scan, across
         /// a reopen too. Re-added, the never-executed input stays out of
-        /// selection until the subwallet's first pass, which finds it unspent
-        /// and lifts the hold. After another reopen the hold stays gone and
-        /// the disposition is still listed, with an empty held list.
+        /// selection until the subwallet's first pass finds it unspent and
+        /// its lift runs. After another reopen the hold stays gone and the
+        /// disposition is still listed, with an empty held list.
         #[test]
         fn a_purged_wallets_holds_stay_gone_after_reopen() {
             let path = temp_tree_path("disposition_purge_wallet_reopen");
@@ -2834,8 +2893,11 @@ mod tests {
                 restore_snapshot(&mut store, id, &[input]);
                 assert!(unspent(&store, id).is_empty(), "held until a scan");
                 let mut changeset = crate::changeset::ShieldedChangeSet::default();
-                super::super::super::sync::commit_scan(&mut store, &[id], &[], &mut changeset)
-                    .unwrap();
+                let (_, scanned) =
+                    super::super::super::sync::commit_scan(&mut store, &[id], &[], &mut changeset)
+                        .unwrap();
+                assert_eq!(scanned[&id], vec![redrive.st_hash()]);
+                store.lift_scanned_holds(id, &scanned[&id]).unwrap();
                 assert_eq!(unspent(&store, id), BTreeSet::from([input]));
                 assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
             }
@@ -2848,6 +2910,112 @@ mod tests {
             assert_eq!(dispositions.len(), 1);
             assert_eq!(dispositions[0].st_hash, redrive.st_hash());
             assert!(dispositions[0].held_nullifiers.is_empty());
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// A pass that marked a removed wallet's hold as scanned but never
+        /// lifted it, because the host did not take that pass's changeset or
+        /// the process ended first, leaves an ordinary hold: it stays across
+        /// a reopen, no later pass marks it again, and only an ack lifts it.
+        #[test]
+        fn a_scanned_hold_without_its_lift_stays_until_ack() {
+            let path = temp_tree_path("disposition_scanned_hold_unlifted");
+            let id = SubwalletId::new([0xDF; 32], 0);
+            let input = [0xF4; 32];
+            let redrive = spend(0x74, &[input]);
+            let key = (id, redrive.st_hash());
+            {
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                arm_reserved(&mut store, id, &redrive);
+                store
+                    .resolve_redrive(
+                        id,
+                        &redrive.activity_id,
+                        ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+                    )
+                    .unwrap();
+                store.purge_wallet(id.wallet_id).unwrap();
+                restore_snapshot(&mut store, id, &[input]);
+                let mut changeset = crate::changeset::ShieldedChangeSet::default();
+                let (_, scanned) =
+                    super::super::super::sync::commit_scan(&mut store, &[id], &[], &mut changeset)
+                        .unwrap();
+                assert_eq!(scanned[&id], vec![redrive.st_hash()]);
+                assert!(unspent(&store, id).is_empty(), "held until lifted");
+            }
+            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+            assert_eq!(store.disposition_holds.get(&key), Some(&vec![input]));
+            assert!(store.holds_awaiting_scan.is_empty());
+            restore_snapshot(&mut store, id, &[input]);
+            let mut changeset = crate::changeset::ShieldedChangeSet::default();
+            let (_, scanned) =
+                super::super::super::sync::commit_scan(&mut store, &[id], &[], &mut changeset)
+                    .unwrap();
+            assert!(scanned.is_empty(), "a later pass marks nothing again");
+            assert!(unspent(&store, id).is_empty(), "still held after a reopen");
+            assert!(store.ack_disposition(id, &redrive.st_hash()).unwrap());
+            assert_eq!(unspent(&store, id), BTreeSet::from([input]));
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// A pass over a subwallet with a hold a wallet removal left for its
+        /// scan and an ordinary hold placed after the re-add lifts only the
+        /// first; the ordinary one stays, also after a reopen.
+        #[test]
+        fn a_scan_leaves_an_ordinary_hold_on_the_same_subwallet() {
+            let path = temp_tree_path("disposition_scan_keeps_ordinary_hold");
+            let id = SubwalletId::new([0xE0; 32], 0);
+            let left = [0xF7; 32];
+            let ordinary = [0xF8; 32];
+            let left_spend = spend(0x77, &[left]);
+            let ordinary_spend = spend(0x78, &[ordinary]);
+            {
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                arm_reserved(&mut store, id, &left_spend);
+                store
+                    .resolve_redrive(
+                        id,
+                        &left_spend.activity_id,
+                        ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+                    )
+                    .unwrap();
+                store.purge_wallet(id.wallet_id).unwrap();
+                restore_snapshot(&mut store, id, &[left]);
+                arm_reserved(&mut store, id, &ordinary_spend);
+                store
+                    .resolve_redrive(
+                        id,
+                        &ordinary_spend.activity_id,
+                        ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+                    )
+                    .unwrap();
+                assert!(unspent(&store, id).is_empty());
+
+                let mut changeset = crate::changeset::ShieldedChangeSet::default();
+                let (_, scanned) =
+                    super::super::super::sync::commit_scan(&mut store, &[id], &[], &mut changeset)
+                        .unwrap();
+                assert_eq!(scanned[&id], vec![left_spend.st_hash()]);
+                store.lift_scanned_holds(id, &scanned[&id]).unwrap();
+                assert_eq!(
+                    unspent(&store, id),
+                    BTreeSet::from([left]),
+                    "the ordinary hold stays"
+                );
+            }
+            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+            restore_snapshot(&mut store, id, &[left, ordinary]);
+            assert_eq!(
+                unspent(&store, id),
+                BTreeSet::from([left]),
+                "the ordinary hold stays after a reopen"
+            );
+            assert_eq!(
+                store.disposition_holds.get(&(id, ordinary_spend.st_hash())),
+                Some(&vec![ordinary])
+            );
             drop(store);
             remove_store_files(&path);
         }

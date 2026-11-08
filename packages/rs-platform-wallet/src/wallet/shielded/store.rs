@@ -346,9 +346,10 @@ pub struct ShieldedSpendDispositionRecord {
     /// selection until this disposition is acknowledged, across restarts too,
     /// so a host restoring an older snapshot in which they are unspent cannot
     /// offer them again. Acknowledge only once the host's spent state for
-    /// them is durable. After [`ShieldedStore::purge_wallet`] they are also
-    /// lifted by the subwallet's next completed scan, and the list is then
-    /// empty. Empty for a
+    /// them is durable. After [`ShieldedStore::purge_wallet`] they can also
+    /// be lifted by the subwallet's next completed scan, once the host holds
+    /// that scan's spent state durably, and the list is then empty. Empty for
+    /// a
     /// [`NotExecuted`](ShieldedSpendDisposition::NotExecuted) disposition and
     /// for one written by [`ShieldedStore::record_disposition`].
     pub held_nullifiers: Vec<[u8; 32]>,
@@ -733,15 +734,34 @@ pub trait ShieldedStore: Send + Sync {
     fn ack_disposition(&mut self, id: SubwalletId, st_hash: &[u8; 32])
         -> Result<bool, Self::Error>;
 
-    /// Lift the holds [`purge_wallet`](Self::purge_wallet) left on `id`'s
-    /// dispositions until its next completed scan, durably. Their
-    /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
-    /// become empty and the dispositions stay. Other holds are untouched.
+    /// Mark the holds [`purge_wallet`](Self::purge_wallet) left on `id`'s
+    /// dispositions for its next completed scan as scanned, durably, and
+    /// return their keys (`st_hash`). They stay held. Other holds are
+    /// untouched.
     ///
     /// A sync pass that covered `id` calls this after applying the spent
-    /// nullifiers it scanned, under the same store write guard, so the notes
-    /// become selectable only together with their scanned spent state.
-    fn lift_holds_awaiting_scan(&mut self, id: SubwalletId) -> Result<(), Self::Error>;
+    /// nullifiers it scanned, under the same store write guard. A marked hold
+    /// is from then on held like any other: no later pass marks it again, and
+    /// only [`lift_scanned_holds`](Self::lift_scanned_holds) with the keys
+    /// returned here, or [`ack_disposition`](Self::ack_disposition), lifts
+    /// it.
+    fn mark_holds_scanned(&mut self, id: SubwalletId) -> Result<Vec<[u8; 32]>, Self::Error>;
+
+    /// Lift the holds of `id` that [`mark_holds_scanned`](Self::mark_holds_scanned)
+    /// returned as `st_hashes`, durably. Their
+    /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
+    /// become empty and the dispositions stay. A key that a later
+    /// [`purge_wallet`](Self::purge_wallet) marked for the next scan again is
+    /// skipped.
+    ///
+    /// Call it only once the host holds the spent state of the pass that
+    /// marked them durably. The host may otherwise restore an older snapshot
+    /// in which the held notes are unspent, and nothing would hold them.
+    fn lift_scanned_holds(
+        &mut self,
+        id: SubwalletId,
+        st_hashes: &[[u8; 32]],
+    ) -> Result<(), Self::Error>;
 
     // ── Outgoing history (per-subwallet) ───────────────────────────────
 
@@ -898,14 +918,16 @@ pub trait ShieldedStore: Send + Sync {
     /// rather than resuming behind the stale watermark.
     ///
     /// The wallet's unacknowledged dispositions are kept and keep holding
-    /// their notes, but each hold is marked, durably in the same step, to be
-    /// lifted by the subwallet's next completed scan
-    /// ([`lift_holds_awaiting_scan`](Self::lift_holds_awaiting_scan)). A
-    /// wallet added again under the same id can restore an older snapshot in
-    /// which the held notes are unspent; the hold keeps them out of selection
-    /// until a scan has applied Platform's spent nullifiers to them. Nothing
-    /// may acknowledge a removed wallet's dispositions, and acknowledging
-    /// still lifts a hold.
+    /// their notes, but each hold is marked, durably in the same step, for
+    /// the subwallet's next completed scan
+    /// ([`mark_holds_scanned`](Self::mark_holds_scanned)), which may lift it
+    /// once the host holds that scan's spent state
+    /// ([`lift_scanned_holds`](Self::lift_scanned_holds)). A wallet added
+    /// again under the same id can restore an older snapshot in which the
+    /// held notes are unspent; the hold keeps them out of selection until a
+    /// scan has applied Platform's spent nullifiers to them. Nothing may
+    /// acknowledge a removed wallet's dispositions, and acknowledging still
+    /// lifts a hold.
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error>;
 
     /// Drop the account-scoped state and nullifier-backed redrives for exactly
@@ -1651,14 +1673,28 @@ impl ShieldedStore for InMemoryShieldedStore {
         Ok(self.dispositions.remove(&(id, *st_hash)).is_some())
     }
 
-    fn lift_holds_awaiting_scan(&mut self, id: SubwalletId) -> Result<(), Self::Error> {
-        let lifted: Vec<_> = self
+    fn mark_holds_scanned(&mut self, id: SubwalletId) -> Result<Vec<[u8; 32]>, Self::Error> {
+        let scanned: Vec<_> = self
             .holds_awaiting_scan
             .range((id, [0u8; 32])..=(id, [0xFF; 32]))
             .copied()
             .collect();
-        for key in lifted {
-            self.holds_awaiting_scan.remove(&key);
+        for key in &scanned {
+            self.holds_awaiting_scan.remove(key);
+        }
+        Ok(scanned.into_iter().map(|(_, st_hash)| st_hash).collect())
+    }
+
+    fn lift_scanned_holds(
+        &mut self,
+        id: SubwalletId,
+        st_hashes: &[[u8; 32]],
+    ) -> Result<(), Self::Error> {
+        for st_hash in st_hashes {
+            let key = (id, *st_hash);
+            if self.holds_awaiting_scan.contains(&key) {
+                continue;
+            }
             if let Some(record) = self.dispositions.get_mut(&key) {
                 record.held_nullifiers.clear();
             }
@@ -2385,9 +2421,11 @@ pub(super) mod disposition_contract {
     /// the same id from an older snapshot in which the held inputs are
     /// unspent, they stay out of selection and balance, also beside a healthy
     /// note. The re-added subwallet's first pass applies the spent nullifiers
-    /// it scanned and lifts its holds, so an input becomes selectable only if
-    /// the scan found it unspent. The same wallet's other account and another
-    /// wallet keep their holds until their own scan.
+    /// it scanned and marks its holds as scanned, which lifts nothing: no
+    /// later pass marks them again, and only lifting the keys that pass
+    /// returned makes an input selectable, and only if the scan found it
+    /// unspent. The same wallet's other account and another wallet keep their
+    /// holds until their own scan.
     pub(crate) fn purge_wallet_releases_its_holds<S: ShieldedStore>(
         store: &mut S,
     ) -> Vec<WalletId> {
@@ -2438,10 +2476,28 @@ pub(super) mod disposition_contract {
         );
         assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
 
-        // Its first pass scans the executed input spent.
+        // Its first pass scans the executed input spent and marks the holds.
         let mut changeset = crate::changeset::ShieldedChangeSet::default();
-        crate::wallet::shielded::sync::commit_scan(store, &[id], &[[0x96; 32]], &mut changeset)
-            .unwrap();
+        let (_, scanned) =
+            crate::wallet::shielded::sync::commit_scan(store, &[id], &[[0x96; 32]], &mut changeset)
+                .unwrap();
+        let mut marked = scanned[&id].clone();
+        marked.sort_unstable();
+        let mut expected = vec![executed.st_hash(), purged.st_hash()];
+        expected.sort_unstable();
+        assert_eq!(marked, expected, "the scan marks exactly the purged holds");
+        assert_eq!(scanned.len(), 1, "only the scanned subwallet's holds");
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([healthy]),
+            "a scan alone lifts no hold"
+        );
+        let (_, again) =
+            crate::wallet::shielded::sync::commit_scan(store, &[id], &[], &mut changeset).unwrap();
+        assert!(again.is_empty(), "a later pass marks nothing again");
+        assert_eq!(unspent(store, id), BTreeSet::from([healthy]));
+
+        store.lift_scanned_holds(id, &scanned[&id]).unwrap();
         assert_eq!(
             unspent(store, id),
             BTreeSet::from([[0x97; 32], [0x98; 32], healthy]),

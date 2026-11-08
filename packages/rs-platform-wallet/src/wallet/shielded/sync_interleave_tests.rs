@@ -1,6 +1,7 @@
 //! A sync pass against a wallet that is removed and re-added around it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,8 +16,9 @@ use super::sync::pass_pause::{self, Point};
 use super::SubwalletId;
 use super::{FileBackedShieldedStore, NetworkShieldedCoordinator, OrchardKeySet, ShieldedStore};
 use crate::changeset::{
-    ClientStartState, PersistenceError, PlatformWalletChangeSet, PlatformWalletPersistence,
-    ShieldedChangeSet, ShieldedSubwalletStartState, ShieldedSyncStartState,
+    ClientStartState, PersistenceError, PersistenceErrorKind, PlatformWalletChangeSet,
+    PlatformWalletPersistence, ShieldedChangeSet, ShieldedSubwalletStartState,
+    ShieldedSyncStartState,
 };
 use crate::wallet::persister::WalletPersister;
 
@@ -29,6 +31,10 @@ const SPENT_AT: u64 = 1500;
 const LIVE_WATERMARK: u64 = 2100;
 /// The older snapshot's watermark: before the spend.
 const SNAPSHOT_WATERMARK: u64 = 1000;
+/// A snapshot watermark on a chunk boundary, so a pass from it starts there.
+const CHUNK_WATERMARK: u64 = 2048;
+/// A spend above [`CHUNK_WATERMARK`].
+const SPENT_ABOVE_CHUNK: u64 = 2060;
 
 const WALLET: [u8; 32] = [0x5A; 32];
 /// An input whose transition executed: Platform has its nullifier.
@@ -38,8 +44,8 @@ const UNSPENT_NULLIFIER: [u8; 32] = [0x4F; 32];
 /// An input whose transition never executed.
 const NEVER_SPENT_NULLIFIER: [u8; 32] = [0x50; 32];
 
-fn pool_nullifier(position: u64) -> [u8; 32] {
-    if position == SPENT_AT {
+fn pool_nullifier(position: u64, spent_at: u64) -> [u8; 32] {
+    if position == spent_at {
         return SPENT_NULLIFIER;
     }
     let mut nullifier = [0xC0; 32];
@@ -47,19 +53,26 @@ fn pool_nullifier(position: u64) -> [u8; 32] {
     nullifier
 }
 
-fn pool_note(position: u64) -> ShieldedEncryptedNote {
+fn pool_note(position: u64, spent_at: u64) -> ShieldedEncryptedNote {
     let mut cmx = [0u8; 32];
     cmx[..8].copy_from_slice(&(position + 1).to_le_bytes());
     ShieldedEncryptedNote {
         cmx: cmx.to_vec(),
-        nullifier: pool_nullifier(position).to_vec(),
+        nullifier: pool_nullifier(position, spent_at).to_vec(),
         cv_net: vec![0; 32],
         encrypted_note: Vec::new(),
     }
 }
 
-/// A mock network serving the pool to a pass starting at any chunk.
+/// A mock network serving the pool, with the spend at [`SPENT_AT`], to a pass
+/// starting at any chunk.
 async fn pool_sdk() -> dash_sdk::Sdk {
+    pool_sdk_from(SPENT_AT, 0).await
+}
+
+/// A mock network serving the pool, with the spend at `spent_at`, only to a
+/// pass starting at a chunk at or after `first_start`.
+async fn pool_sdk_from(spent_at: u64, first_start: u64) -> dash_sdk::Sdk {
     let mut sdk = dash_sdk::Sdk::new_mock();
     let count = 2048
         * u32::from(
@@ -69,9 +82,11 @@ async fn pool_sdk() -> dash_sdk::Sdk {
                 .shielded_queries
                 .max_query_chunks,
         );
-    let notes: Vec<_> = (0..POOL_SIZE).map(pool_note).collect();
+    let notes: Vec<_> = (0..POOL_SIZE)
+        .map(|position| pool_note(position, spent_at))
+        .collect();
     let mut starts = BTreeSet::new();
-    for first in (0..POOL_SIZE).step_by(2048) {
+    for first in (first_start..POOL_SIZE).step_by(2048) {
         for window in 0..20 {
             starts.insert(first + u64::from(count) * window);
         }
@@ -118,13 +133,22 @@ fn spent(nullifier: [u8; 32]) -> super::ShieldedNote {
 
 /// The host's older snapshot of `notes`, scanned up to [`SNAPSHOT_WATERMARK`].
 fn older_snapshot(id: SubwalletId, notes: &[super::ShieldedNote]) -> ShieldedSyncStartState {
+    snapshot_at(id, notes, SNAPSHOT_WATERMARK)
+}
+
+/// The host's snapshot of `notes`, scanned up to `watermark`.
+fn snapshot_at(
+    id: SubwalletId,
+    notes: &[super::ShieldedNote],
+    watermark: u64,
+) -> ShieldedSyncStartState {
     ShieldedSyncStartState {
         per_subwallet: BTreeMap::from([(
             id,
             ShieldedSubwalletStartState {
                 notes: notes.to_vec(),
                 has_sync_state: true,
-                last_synced_index: SNAPSHOT_WATERMARK,
+                last_synced_index: watermark,
                 ..Default::default()
             },
         )]),
@@ -232,17 +256,33 @@ async fn a_removal_during_a_pass_leaves_the_restored_spend_scannable() {
     remove_store_files(&path);
 }
 
-/// The host's persister for the wallet: commits each `store` inline and
-/// records what it took.
+/// The host's persister for the wallet: commits each `store` inline or only
+/// buffers it, and can refuse it.
 struct Host {
+    inline: bool,
+    refuse: AtomicBool,
     saved: Mutex<Vec<ShieldedChangeSet>>,
 }
 
 impl Host {
     fn inline() -> Arc<Self> {
+        Self::new(true)
+    }
+
+    fn buffering() -> Arc<Self> {
+        Self::new(false)
+    }
+
+    fn new(inline: bool) -> Arc<Self> {
         Arc::new(Self {
+            inline,
+            refuse: AtomicBool::new(false),
             saved: Mutex::new(Vec::new()),
         })
+    }
+
+    fn refuse(&self, refuse: bool) {
+        self.refuse.store(refuse, Ordering::SeqCst);
     }
 
     /// Whether any changeset the host took touches `id`.
@@ -253,11 +293,21 @@ impl Host {
                 || changeset.synced_indices.contains_key(&id)
         })
     }
+
+    /// Whether the host took `nullifier` as spent for `id`.
+    fn took_spent(&self, id: SubwalletId, nullifier: [u8; 32]) -> bool {
+        self.saved.lock().unwrap().iter().any(|changeset| {
+            changeset
+                .nullifiers_spent
+                .get(&id)
+                .is_some_and(|spent| spent.contains(&nullifier))
+        })
+    }
 }
 
 impl PlatformWalletPersistence for Host {
     fn store_commits_inline(&self) -> bool {
-        true
+        self.inline
     }
 
     fn store(
@@ -265,6 +315,12 @@ impl PlatformWalletPersistence for Host {
         _wallet_id: [u8; 32],
         changeset: PlatformWalletChangeSet,
     ) -> Result<(), PersistenceError> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(PersistenceError::backend_with_kind(
+                PersistenceErrorKind::Fatal,
+                "the host refused the changeset",
+            ));
+        }
         if let Some(shielded) = changeset.shielded {
             self.saved.lock().unwrap().push(shielded);
         }
@@ -330,6 +386,20 @@ fn snapshot_with_inputs_unspent(id: SubwalletId) -> ShieldedSyncStartState {
             note(UNSPENT_NULLIFIER),
         ],
     )
+}
+
+/// Add the wallet again with `host` and restore `snapshot`.
+async fn re_add(
+    coordinator: &NetworkShieldedCoordinator,
+    host: &Arc<Host>,
+    snapshot: &ShieldedSyncStartState,
+) {
+    register_with(coordinator, host).await;
+    coordinator
+        .restore_for_wallet(WALLET, snapshot)
+        .await
+        .unwrap();
+    coordinator.mark_hydrated(WALLET, true).await;
 }
 
 /// Neither held input is selectable or counted; the healthy note is.
@@ -443,62 +513,85 @@ async fn a_same_key_re_add_before_the_pass_guard_leaves_the_wallet_unscanned() {
     removal_before_the_pass_guard(true).await;
 }
 
+/// A wallet removed and added again under the same keys after a pass marked
+/// its holds as scanned and the host took the changeset, but before the
+/// lift: the lift skips it, and the holds the removal marked again wait for
+/// the re-added wallet's own scan.
+#[tokio::test]
+async fn a_removal_before_the_scan_lift_keeps_the_holds() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    re_add(
+        &coordinator,
+        &Host::inline(),
+        &snapshot_with_inputs_unspent(id),
+    )
+    .await;
+
+    let pause = pass_pause::arm_at(pass_pause::key(coordinator.store()), Point::BeforeScanLift);
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    register_with(&coordinator, &host).await;
+    pause.resume.add_permits(1);
+    pass.await.unwrap();
+
+    coordinator
+        .restore_for_wallet(WALLET, &snapshot_with_inputs_unspent(id))
+        .await
+        .unwrap();
+    coordinator.mark_hydrated(WALLET, true).await;
+    assert_inputs_held(
+        &coordinator,
+        id,
+        "the lift skips a wallet removed since its list",
+    )
+    .await;
+    assert_holds_wait_for_a_scan(&coordinator, id).await;
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
 /// A wallet removed and added again from an older host snapshot keeps its
 /// inputs held until its first pass: before it, neither the executed input
 /// nor the never-executed one is selectable or counted, even beside a
-/// healthy note. The pass marks the executed input spent and lifts both
-/// holds, so the never-executed input becomes selectable, and it stays so
-/// after a reopen.
+/// healthy note. The pass marks the executed input spent, and once its host
+/// has committed that pass's changeset inline, both holds are lifted, so the
+/// never-executed input becomes selectable, and it stays so after a reopen.
 #[tokio::test]
 async fn a_re_added_wallet_keeps_its_holds_until_its_first_pass() {
     let path = tree_path();
     let coordinator = coordinator_on(pool_sdk().await, &path);
     let id = SubwalletId::new(WALLET, 0);
-    register(&coordinator, WALLET, &[0]).await;
+    register_with(&coordinator, &Host::inline()).await;
     coordinator.mark_hydrated(WALLET, true).await;
-    {
-        let mut store = coordinator.store().write().await;
-        for (redrive, disposition) in [
-            (
-                spend(0x62, &[SPENT_NULLIFIER]),
-                ShieldedSpendDisposition::Executed,
-            ),
-            (
-                spend(0x63, &[NEVER_SPENT_NULLIFIER]),
-                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
-            ),
-        ] {
-            arm_reserved(&mut *store, id, &redrive);
-            store
-                .resolve_redrive(id, &redrive.activity_id, disposition)
-                .unwrap();
-        }
-    }
+    hold_inputs(&coordinator, id).await;
     coordinator.unregister_wallet(WALLET).await;
 
-    register(&coordinator, WALLET, &[0]).await;
-    let snapshot = older_snapshot(
+    let host = Host::inline();
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+    assert_inputs_held(
+        &coordinator,
         id,
-        &[
-            note(SPENT_NULLIFIER),
-            note(NEVER_SPENT_NULLIFIER),
-            note(UNSPENT_NULLIFIER),
-        ],
-    );
-    coordinator
-        .restore_for_wallet(WALLET, &snapshot)
-        .await
-        .unwrap();
-    coordinator.mark_hydrated(WALLET, true).await;
-    assert_eq!(
-        unspent(&coordinator, id).await,
-        BTreeSet::from([UNSPENT_NULLIFIER]),
-        "held inputs are not selectable before the first pass"
-    );
-    assert_eq!(spendable(&coordinator, id).await, 1_000);
+        "held inputs are not selectable before the first pass",
+    )
+    .await;
 
     let outcome = coordinator.sync(true).await;
     assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert!(
+        host.took_spent(id, SPENT_NULLIFIER),
+        "the host has the executed input's spent state"
+    );
     assert_eq!(
         unspent(&coordinator, id).await,
         BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
@@ -518,7 +611,7 @@ async fn a_re_added_wallet_keeps_its_holds_until_its_first_pass() {
     drop(coordinator);
 
     let reopened = coordinator_on(dash_sdk::Sdk::new_mock(), &path);
-    register(&reopened, WALLET, &[0]).await;
+    register_with(&reopened, &Host::inline()).await;
     let host_rows = older_snapshot(
         id,
         &[
@@ -535,6 +628,291 @@ async fn a_re_added_wallet_keeps_its_holds_until_its_first_pass() {
         unspent(&reopened, id).await,
         BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
         "the lifted hold stays lifted after a reopen"
+    );
+    drop(reopened);
+    remove_store_files(&path);
+}
+
+/// After the reopen the host restores the older snapshot again, since it
+/// never took the pass's spent state: both inputs are still held.
+async fn assert_held_after_a_reopen(path: &std::path::Path, id: SubwalletId) {
+    let reopened = coordinator_on(dash_sdk::Sdk::new_mock(), path);
+    re_add(
+        &reopened,
+        &Host::inline(),
+        &snapshot_with_inputs_unspent(id),
+    )
+    .await;
+    assert_inputs_held(
+        &reopened,
+        id,
+        "the holds survive a reopen and the old snapshot",
+    )
+    .await;
+    drop(reopened);
+}
+
+/// A re-added wallet's first pass scans the executed input spent, but its
+/// host refuses the changeset: the holds stay, in session and after a reopen
+/// in which the host restores the older snapshot.
+#[tokio::test]
+async fn a_refused_host_save_keeps_the_scanned_holds() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    host.refuse(true);
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert!(!host.took_any_for(id));
+    assert_inputs_held(&coordinator, id, "a refused save lifts nothing").await;
+    drop(coordinator);
+
+    assert_held_after_a_reopen(&path, id).await;
+    remove_store_files(&path);
+}
+
+/// A re-added wallet's first pass scans the executed input spent, and the
+/// process ends before the host gets the changeset: after a reopen in which
+/// the host restores the older snapshot, both inputs are still held.
+#[tokio::test]
+async fn a_crash_before_the_host_save_keeps_the_scanned_holds() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+
+    let pause = pass_pause::arm_at(pass_pause::key(coordinator.store()), Point::BeforeHostSave);
+    let pass = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.sync(true).await }
+    });
+    wait_for(&pause).await;
+    pass.abort();
+    assert!(pass.await.unwrap_err().is_cancelled());
+    assert!(!host.took_any_for(id));
+    drop(coordinator);
+
+    assert_held_after_a_reopen(&path, id).await;
+    remove_store_files(&path);
+}
+
+/// A first pass whose save the host refuses, then a second pass whose save
+/// it commits inline: the second pass's changeset does not carry the first
+/// pass's spent state, so the holds stay until their dispositions are
+/// acknowledged.
+#[tokio::test]
+async fn a_later_passs_save_leaves_an_earlier_passs_holds() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    let keys = hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    host.refuse(true);
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    host.refuse(false);
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert!(
+        host.took_any_for(id),
+        "the host takes the second pass's changeset"
+    );
+    assert!(!host.took_spent(id, SPENT_NULLIFIER));
+    assert_inputs_held(&coordinator, id, "a later pass's save lifts nothing").await;
+
+    {
+        let mut store = coordinator.store().write().await;
+        for key in &keys {
+            assert!(store.ack_disposition(id, key).unwrap());
+        }
+    }
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "an ack lifts the holds"
+    );
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
+/// A host that only buffers the pass's changeset: the scanned holds stay, in
+/// session and after a reopen, until their dispositions are acknowledged.
+#[tokio::test]
+async fn a_buffered_host_save_keeps_the_scanned_holds_until_ack() {
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    let keys = hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::buffering();
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert!(host.took_spent(id, SPENT_NULLIFIER));
+    assert_inputs_held(&coordinator, id, "a buffered save lifts nothing").await;
+    drop(coordinator);
+
+    let reopened = coordinator_on(dash_sdk::Sdk::new_mock(), &path);
+    let host_rows = older_snapshot(
+        id,
+        &[
+            spent(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+        ],
+    );
+    re_add(&reopened, &Host::buffering(), &host_rows).await;
+    assert_inputs_held(&reopened, id, "the holds survive a reopen").await;
+    {
+        let mut store = reopened.store().write().await;
+        for key in &keys {
+            assert!(store.ack_disposition(id, key).unwrap());
+        }
+    }
+    assert_eq!(
+        unspent(&reopened, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "an ack lifts the holds"
+    );
+    drop(reopened);
+    remove_store_files(&path);
+}
+
+/// A wallet re-added from a snapshot whose watermark sits on a chunk
+/// boundary, after the live wallet had scanned the whole pool: its first
+/// pass starts at that boundary (the network serves no earlier chunk), scans
+/// the executed input's spend above it, and lifts the holds, although the
+/// restored inputs were received below it.
+#[tokio::test]
+async fn a_pass_from_a_restored_chunk_watermark_scans_the_spend_above_it() {
+    let path = tree_path();
+    let id = SubwalletId::new(WALLET, 0);
+    {
+        let live = coordinator_on(pool_sdk_from(SPENT_ABOVE_CHUNK, 0).await, &path);
+        register_with(&live, &Host::inline()).await;
+        live.mark_hydrated(WALLET, true).await;
+        let outcome = live.sync(true).await;
+        assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+        assert_eq!(
+            live.store().read().await.tree_size().unwrap(),
+            POOL_SIZE,
+            "the live wallet scanned the whole pool"
+        );
+        hold_inputs(&live, id).await;
+        live.unregister_wallet(WALLET).await;
+    }
+
+    let coordinator = coordinator_on(
+        pool_sdk_from(SPENT_ABOVE_CHUNK, CHUNK_WATERMARK).await,
+        &path,
+    );
+    let snapshot = snapshot_at(
+        id,
+        &[
+            note(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+        ],
+        CHUNK_WATERMARK,
+    );
+    assert!(snapshot.per_subwallet[&id]
+        .notes
+        .iter()
+        .all(|restored| restored.position < CHUNK_WATERMARK));
+    let host = Host::inline();
+    re_add(&coordinator, &host, &snapshot).await;
+    assert_inputs_held(
+        &coordinator,
+        id,
+        "held inputs are not selectable before the pass",
+    )
+    .await;
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert!(host.took_spent(id, SPENT_NULLIFIER));
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the spend above the watermark is scanned and the holds lift"
+    );
+    drop(coordinator);
+    remove_store_files(&path);
+}
+
+/// A pass over a re-added wallet that holds both the inputs its removal left
+/// for the scan and an ordinary input held after the re-add: the pass lifts
+/// only the first two, and the ordinary hold stays, also after a reopen.
+#[tokio::test]
+async fn a_pass_leaves_an_ordinary_hold_on_the_same_subwallet() {
+    const ORDINARY_NULLIFIER: [u8; 32] = [0x51; 32];
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let id = SubwalletId::new(WALLET, 0);
+    register_with(&coordinator, &Host::inline()).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    hold_inputs(&coordinator, id).await;
+    coordinator.unregister_wallet(WALLET).await;
+    let host = Host::inline();
+    re_add(&coordinator, &host, &snapshot_with_inputs_unspent(id)).await;
+    {
+        let mut store = coordinator.store().write().await;
+        let ordinary = spend(0x64, &[ORDINARY_NULLIFIER]);
+        arm_reserved(&mut *store, id, &ordinary);
+        store
+            .resolve_redrive(
+                id,
+                &ordinary.activity_id,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+            )
+            .unwrap();
+    }
+    assert_inputs_held(&coordinator, id, "every input is held before the pass").await;
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert_eq!(
+        unspent(&coordinator, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the pass lifts the removal's holds and leaves the ordinary one"
+    );
+    drop(coordinator);
+
+    let reopened = coordinator_on(dash_sdk::Sdk::new_mock(), &path);
+    let host_rows = older_snapshot(
+        id,
+        &[
+            spent(SPENT_NULLIFIER),
+            note(NEVER_SPENT_NULLIFIER),
+            note(UNSPENT_NULLIFIER),
+            note(ORDINARY_NULLIFIER),
+        ],
+    );
+    re_add(&reopened, &Host::inline(), &host_rows).await;
+    assert_eq!(
+        unspent(&reopened, id).await,
+        BTreeSet::from([NEVER_SPENT_NULLIFIER, UNSPENT_NULLIFIER]),
+        "the ordinary hold stays after a reopen"
     );
     drop(reopened);
     remove_store_files(&path);
