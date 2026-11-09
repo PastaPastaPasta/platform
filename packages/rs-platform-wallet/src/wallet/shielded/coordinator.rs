@@ -554,6 +554,17 @@ impl NetworkShieldedCoordinator {
     /// second call is refused with
     /// [`PlatformWalletError::InvalidParameter`] and changes nothing.
     ///
+    /// While recording is on, a disposition the note scan cannot record
+    /// fails that pass for its own wallet only: that wallet's watermarks
+    /// don't advance, the pass's later steps (redrive, prune, balances,
+    /// activity, identity redrive, host hand-off and hold lift) skip it, its
+    /// outcome is an error, and the next pass retries it. Every other
+    /// wallet's pass goes on as usual, so a failure that persists repeats
+    /// for its wallet on every pass until its cause is fixed. A failure in
+    /// the later redrive, prune and activity steps is also reported only for
+    /// its own wallet, though a failed activity step skips that step for the
+    /// wallets after it until the next pass.
+    ///
     /// Neither the hook nor recording is stored: a reopened store starts
     /// without both. Set it after every open, before the first spend or
     /// sync. A sync pass without it never sends a spend armed under it, nor
@@ -745,21 +756,9 @@ impl NetworkShieldedCoordinator {
     }
 
     /// Turn spend-disposition recording on or off for this network's store
-    /// (see [`ShieldedStore::records_spend_dispositions`]). Off by default:
-    /// every release path then behaves as it always has. A host that
-    /// consumes dispositions turns it on before its first spend, sync or
-    /// restore, and keeps it on.
-    ///
-    /// While it is on, a disposition the note scan cannot record fails that
-    /// pass for its own wallet only: that wallet's watermarks don't advance,
-    /// the pass's later steps (redrive, prune, balances, activity, identity
-    /// redrive, host hand-off and hold lift) skip it, its outcome is an
-    /// error, and the next pass retries it. Every other wallet's pass goes
-    /// on as usual, so a failure that persists repeats for its wallet on
-    /// every pass until its cause is fixed. A failure in the later redrive,
-    /// prune and activity steps is also reported only for its own wallet,
-    /// though a failed activity step skips that step for the wallets after
-    /// it until the next pass.
+    /// without setting a dispatch hook (see
+    /// [`ShieldedStore::records_spend_dispositions`]).
+    #[cfg(test)]
     pub(crate) async fn set_records_spend_dispositions(&self, on: bool) {
         self.store.write().await.set_records_spend_dispositions(on);
     }
