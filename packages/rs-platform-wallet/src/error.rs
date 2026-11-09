@@ -929,6 +929,13 @@ pub enum PlatformWalletError {
         reason: String,
     },
 
+    /// A shielded spend was never broadcast: the host's dispatch hook refused
+    /// it, or it was resolved (for example abandoned) before its first
+    /// broadcast. Its notes are free again and its disposition is recorded
+    /// as not executed, so the spend may be built again.
+    #[error("Shielded spend was not sent: {reason}")]
+    ShieldedDispatchRefused { reason: String },
+
     /// A masternode (evonode) identity credit withdrawal was **broadcast and
     /// accepted**, but its execution result could not be confirmed (the
     /// result-proof fetch/verify failed — transient DAPI/proof error or

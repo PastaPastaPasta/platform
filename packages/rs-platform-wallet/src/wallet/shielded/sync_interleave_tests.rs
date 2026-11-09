@@ -1361,8 +1361,9 @@ mod release_holds {
     /// removal writes `Purged`, then added again under the same id from an
     /// older snapshot: before a pass every row is listed and holds its input,
     /// only the healthy note is selectable or counted, and a row can be
-    /// acknowledged. A qualifying pass decides the rest: the executed input
-    /// is spent, the purged one selectable, and no listed row holds anything.
+    /// acknowledged. A qualifying pass decides the executed input: it is
+    /// spent and its row holds nothing. The purged spend may still land, so
+    /// its input stays held across the pass until its row is acknowledged.
     #[tokio::test]
     async fn a_removed_wallets_rows_hold_until_a_qualifying_pass_decides() {
         let path = tree_path();
@@ -1411,18 +1412,29 @@ mod release_holds {
         assert!(host.took_spent(id, SPENT_NULLIFIER));
         assert_eq!(
             unspent(&coordinator, id).await,
+            BTreeSet::from([CANCELLED_NULLIFIER, UNSPENT_NULLIFIER]),
+            "the scan decides the executed input; the purged one stays held"
+        );
+        let records = coordinator.spend_dispositions(WALLET).await.unwrap();
+        assert_eq!(records.len(), 2, "the rows stay listed");
+        for record in &records {
+            assert_eq!(
+                record.held_nullifiers.is_empty(),
+                record.st_hash == executed.st_hash(),
+                "{:?}",
+                record.disposition
+            );
+        }
+        ack(&coordinator, id, &purged).await;
+        assert_eq!(
+            unspent(&coordinator, id).await,
             BTreeSet::from([
                 NEVER_SPENT_NULLIFIER,
                 CANCELLED_NULLIFIER,
                 UNSPENT_NULLIFIER
             ]),
-            "the scan decides: spent stays spent, unspent becomes selectable"
+            "only the ack frees the purged input"
         );
-        let records = coordinator.spend_dispositions(WALLET).await.unwrap();
-        assert_eq!(records.len(), 2, "the rows stay listed");
-        assert!(records
-            .iter()
-            .all(|record| record.held_nullifiers.is_empty()));
         drop(coordinator);
         remove_store_files(&path);
     }
@@ -1547,4 +1559,99 @@ mod release_holds {
     async fn a_cleared_accounts_rows_hold_until_ack() {
         a_purged_accounts_rows_hold_until_ack(Purge::Clear).await;
     }
+}
+
+/// A pass over two wallets in which one wallet's disposition write keeps
+/// failing: the other wallet's pass completes (its spend is applied, its
+/// watermark advances and its host takes the changeset), while the failing
+/// wallet is reported as failed, keeps its watermark and its armed record,
+/// and its host takes nothing from the pass. Once the failure clears, its
+/// next pass catches up.
+#[tokio::test]
+async fn a_persistent_disposition_failure_fails_only_its_wallets_pass() {
+    const FAILING: [u8; 32] = [0x5B; 32];
+    let path = tree_path();
+    let coordinator = coordinator_on(pool_sdk().await, &path);
+    coordinator.set_records_spend_dispositions(true).await;
+    let healthy_id = SubwalletId::new(WALLET, 0);
+    let failing_id = SubwalletId::new(FAILING, 0);
+    let healthy_host = Host::inline();
+    let failing_host = Host::inline();
+    for (wallet_id, host) in [(WALLET, &healthy_host), (FAILING, &failing_host)] {
+        let views = BTreeMap::from([(
+            0,
+            OrchardKeySet::from_seed(&[42; 64], dashcore::Network::Testnet, 0)
+                .expect("test viewing key")
+                .viewing_keys(),
+        )]);
+        coordinator
+            .register_wallet(
+                wallet_id,
+                views,
+                WalletPersister::new(wallet_id, host.clone()),
+            )
+            .await
+            .expect("register test wallet");
+        coordinator.mark_hydrated(wallet_id, true).await;
+    }
+    let healthy_spend = spend(0x91, &[SPENT_NULLIFIER]);
+    let failing_spend = spend(0x92, &[SPENT_NULLIFIER]);
+    {
+        let mut store = coordinator.store().write().await;
+        arm_reserved(&mut *store, healthy_id, &healthy_spend);
+        arm_reserved(&mut *store, failing_id, &failing_spend);
+        store.fail_disposition_write_for(&failing_spend.activity_id, true);
+    }
+
+    for _ in 0..2 {
+        let outcome = coordinator.sync(true).await;
+        assert!(
+            matches!(
+                outcome.wallet_results.get(&WALLET),
+                Some(crate::manager::shielded_sync::WalletShieldedOutcome::Ok(_))
+            ),
+            "{outcome:?}"
+        );
+        assert!(
+            matches!(
+                outcome.wallet_results.get(&FAILING),
+                Some(crate::manager::shielded_sync::WalletShieldedOutcome::Err(_))
+            ),
+            "{outcome:?}"
+        );
+        let store = coordinator.store().read().await;
+        assert_eq!(store.last_synced_note_index(healthy_id).unwrap(), POOL_SIZE);
+        assert!(store.pending_redrives(healthy_id).unwrap().is_empty());
+        assert_eq!(store.last_synced_note_index(failing_id).unwrap(), 0);
+        assert_eq!(
+            store.pending_redrives(failing_id).unwrap(),
+            vec![failing_spend.clone()]
+        );
+        drop(store);
+        assert!(healthy_host.took_spent(healthy_id, SPENT_NULLIFIER));
+        assert!(
+            !failing_host.took_any_for(failing_id),
+            "the failing wallet's host takes nothing of the pass"
+        );
+    }
+
+    coordinator
+        .store()
+        .read()
+        .await
+        .fail_disposition_write_for(&failing_spend.activity_id, false);
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 2, "{outcome:?}");
+    assert!(failing_host.took_spent(failing_id, SPENT_NULLIFIER));
+    assert_eq!(
+        coordinator
+            .store()
+            .read()
+            .await
+            .last_synced_note_index(failing_id)
+            .unwrap(),
+        POOL_SIZE
+    );
+    drop(coordinator);
+    remove_store_files(&path);
 }

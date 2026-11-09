@@ -83,6 +83,7 @@ use super::activity_recorder::{identity_redrive_output_cmxs, IdentityRecoveryErr
 use super::balance::{
     ShieldedBalanceSource, ShieldedLocalBalanceSnapshot, ShieldedLocalBalanceState,
 };
+use super::dispatch::{DispatchContext, ShieldedDispatch};
 use super::file_store::{FileBackedShieldedStore, FileShieldedStoreError};
 use super::keys::AccountViewingKeys;
 use super::store::{
@@ -267,6 +268,11 @@ pub struct NetworkShieldedCoordinator {
 
     /// Per-wallet removal counts; see [`WalletRemovals`].
     removals: WalletRemovals,
+
+    /// The host's dispatch hook, set once by
+    /// [`set_shielded_dispatch`](Self::set_shielded_dispatch), with the
+    /// transitions in flight under it.
+    dispatch: std::sync::OnceLock<DispatchContext>,
 }
 
 /// Per-wallet count of removals, so a sync pass can skip a wallet removed
@@ -470,6 +476,7 @@ impl NetworkShieldedCoordinator {
             hydrated: RwLock::new(std::collections::BTreeSet::new()),
             clear_generation: std::sync::atomic::AtomicU64::new(0),
             removals: WalletRemovals::default(),
+            dispatch: std::sync::OnceLock::new(),
         }
     }
 
@@ -533,6 +540,43 @@ impl NetworkShieldedCoordinator {
     /// subsequent calls pass the same path.
     pub fn db_path(&self) -> &std::path::Path {
         &self.db_path
+    }
+
+    /// Set the host's dispatch hook for this network's shielded note
+    /// spends (see [`ShieldedDispatch`]). From then on every note spend
+    /// through a wallet of this network is armed durably before the hook is
+    /// awaited, and broadcast only once it returns `Ok`; every rebroadcast by
+    /// a sync pass first awaits [`ShieldedDispatch::admit`].
+    ///
+    /// Setting it also turns on spend-disposition recording
+    /// ([`Self::spend_dispositions`]) for good. The hook can't be replaced
+    /// or removed, since armed spends and their dispositions depend on it: a
+    /// second call is refused with
+    /// [`PlatformWalletError::InvalidParameter`] and changes nothing. Set it
+    /// before the first spend or sync.
+    pub async fn set_shielded_dispatch(
+        &self,
+        hook: Arc<dyn ShieldedDispatch>,
+    ) -> Result<(), PlatformWalletError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.dispatch.get().is_some() {
+            return Err(PlatformWalletError::InvalidParameter(
+                "a shielded dispatch hook is already set; it can't be replaced".to_owned(),
+            ));
+        }
+        // Recording first: a spend that already sees the hook must find the
+        // store recording.
+        self.set_records_spend_dispositions(true).await;
+        self.dispatch.set(DispatchContext::new(hook)).map_err(|_| {
+            PlatformWalletError::InvalidParameter(
+                "a shielded dispatch hook is already set; it can't be replaced".to_owned(),
+            )
+        })
+    }
+
+    /// The dispatch hook and its in-flight set, once set.
+    pub(crate) fn dispatch_context(&self) -> Option<&DispatchContext> {
+        self.dispatch.get()
     }
 
     /// Reference to the shared store. The full sync / spend
@@ -689,15 +733,16 @@ impl NetworkShieldedCoordinator {
     /// consumes dispositions turns it on before its first spend, sync or
     /// restore, and keeps it on.
     ///
-    /// While it is on, a disposition the note scan cannot record, for any
-    /// wallet, fails that pass for every wallet of this network: no
-    /// watermark advances, nothing is released, and the next pass retries,
-    /// so a failure that persists repeats on every pass until its cause is
-    /// fixed. A failure in the later redrive, prune and activity steps is
-    /// reported only for its own wallet, though a failed activity step also
-    /// skips that step for the wallets after it until the next pass.
-    // Nothing in the library turns it on yet; only tests do.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// While it is on, a disposition the note scan cannot record fails that
+    /// pass for its own wallet only: that wallet's watermarks don't advance,
+    /// the pass's later steps (redrive, prune, balances, activity, identity
+    /// redrive, host hand-off and hold lift) skip it, its outcome is an
+    /// error, and the next pass retries it. Every other wallet's pass goes
+    /// on as usual, so a failure that persists repeats for its wallet on
+    /// every pass until its cause is fixed. A failure in the later redrive,
+    /// prune and activity steps is also reported only for its own wallet,
+    /// though a failed activity step skips that step for the wallets after
+    /// it until the next pass.
     pub(crate) async fn set_records_spend_dispositions(&self, on: bool) {
         self.store.write().await.set_records_spend_dispositions(on);
     }
@@ -728,13 +773,15 @@ impl NetworkShieldedCoordinator {
     /// keep dispositions. Every `Executed` or `Unresolved` row holds its
     /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
     /// out of selection until it is acknowledged, with one exception:
-    /// removing the wallet marks its holds for the re-added wallet's first
-    /// completed sync pass, and that pass lifts them, leaving the rows listed
-    /// with empty held lists, once it has applied the spends it scanned and
-    /// the wallet's host has committed the pass's changeset inline. A wallet
-    /// removed again before the lift waits for its next pass.
+    /// removing the wallet marks its holds, except those of `Purged` rows,
+    /// for the re-added wallet's first completed sync pass, and that pass
+    /// lifts them, leaving the rows listed with empty held lists, once it
+    /// has applied the spends it scanned and the wallet's host has committed
+    /// the pass's changeset inline. A wallet removed again before the lift
+    /// waits for its next pass.
     ///
     /// Only an acknowledgement releases the holds in every other case:
+    /// - a `Purged` row, whose spend may still land after any pass;
     /// - a purge of an account or of every account (a re-bind that drops or
     ///   re-keys it, or [`Self::clear`]);
     /// - a removal without a coordinator, or whose purge failed;
@@ -1655,11 +1702,24 @@ impl NetworkShieldedCoordinator {
             Ok(r) => r,
             Err(e) => return self.fail_all_wallets(&subwallets, &e),
         };
-        // The rest of the pass leaves a wallet the scan skipped as removed.
+        // The rest of the pass leaves a wallet the scan skipped as removed,
+        // and one whose scan commit failed: its spends were not applied, so
+        // neither the prune below nor its host may act on this pass for it.
+        let skipped = |wallet_id: &WalletId| {
+            notes.removed_wallets.contains(wallet_id)
+                || notes.failed_wallets.contains_key(wallet_id)
+        };
         let subwallets: Vec<(SubwalletId, AccountViewingKeys)> = subwallets
             .into_iter()
-            .filter(|(id, _)| !notes.removed_wallets.contains(&id.wallet_id))
+            .filter(|(id, _)| !skipped(&id.wallet_id))
             .collect();
+        let stranded_release = stranded_release.map(|(snapshot, recorded)| {
+            let snapshot = snapshot
+                .into_iter()
+                .filter(|(id, _)| !notes.failed_wallets.contains_key(&id.wallet_id))
+                .collect::<Vec<_>>();
+            (snapshot, recorded)
+        });
         // Scan-based spend detection now happens INSIDE
         // `sync_notes_across`: every scanned action's nullifier is
         // replayed against each subwallet's store as part of the note
@@ -1671,7 +1731,7 @@ impl NetworkShieldedCoordinator {
         // outcome is an error, so the host sees the failure and the next
         // pass retries; it is only ever populated while dispositions are
         // being recorded.
-        let mut disposition_failures: BTreeMap<WalletId, String> = BTreeMap::new();
+        let mut disposition_failures: BTreeMap<WalletId, String> = notes.failed_wallets.clone();
 
         // Residual-spend resolution: `sync_notes_across` above marked every
         // landed spend (clearing its reservation and dropping its redrive
@@ -1703,13 +1763,14 @@ impl NetworkShieldedCoordinator {
                     .collect()
             };
             for (id, persister) in &subwallet_persisters {
-                if let Err(e) = super::operations::redrive_pending_spends(
+                if let Err(e) = super::operations::redrive_pending_spends_dispatched(
                     &self.sdk,
                     &self.store,
                     persister.as_ref(),
                     id.wallet_id,
                     *id,
                     &recorded,
+                    self.dispatch_context(),
                 )
                 .await
                 {
@@ -1786,8 +1847,11 @@ impl NetworkShieldedCoordinator {
                     continue;
                 };
                 // A wallet removed since the list: this may be its new
-                // registration's persister (see `WalletRemovals`).
-                if self.removals.removed_since(&removal_marks, wallet_id) {
+                // registration's persister (see `WalletRemovals`). A wallet
+                // whose scan commit failed gets nothing of this pass.
+                if self.removals.removed_since(&removal_marks, wallet_id)
+                    || notes.failed_wallets.contains_key(&wallet_id)
+                {
                     continue;
                 }
                 let full = crate::changeset::PlatformWalletChangeSet {
@@ -4363,6 +4427,57 @@ mod tests {
                 !coordinator.store.read().await.records_spend_dispositions(),
                 "a reopened store starts with the switch off"
             );
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        struct AcceptingHook;
+
+        #[async_trait::async_trait]
+        impl ShieldedDispatch for AcceptingHook {
+            async fn dispatch(
+                &self,
+                _payload: crate::wallet::shielded::dispatch::ShieldedDispatchPayload,
+            ) -> Result<(), crate::wallet::shielded::dispatch::DispatchRefused> {
+                Ok(())
+            }
+
+            async fn admit(
+                &self,
+                _wallet_id: WalletId,
+                _account_index: u32,
+                _activity_id: [u8; 32],
+                _st_hash: [u8; 32],
+            ) -> Result<(), crate::wallet::shielded::dispatch::DispatchRefused> {
+                Ok(())
+            }
+        }
+
+        /// Setting the hook turns recording on and hands the hook to every
+        /// spend; it can be set once and never replaced.
+        #[tokio::test]
+        async fn setting_the_hook_turns_recording_on_once() {
+            let dir = temp_dir("release_hook");
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            assert!(coordinator.dispatch_context().is_none());
+            let hook: Arc<dyn ShieldedDispatch> = Arc::new(AcceptingHook);
+            coordinator
+                .set_shielded_dispatch(Arc::clone(&hook))
+                .await
+                .unwrap();
+            assert!(coordinator.store.read().await.records_spend_dispositions());
+            let set = coordinator.dispatch_context().expect("the hook is set");
+            assert!(Arc::ptr_eq(&set.hook, &hook));
+            assert!(matches!(
+                coordinator
+                    .set_shielded_dispatch(Arc::new(AcceptingHook))
+                    .await,
+                Err(PlatformWalletError::InvalidParameter(_))
+            ));
+            assert!(Arc::ptr_eq(
+                &coordinator.dispatch_context().unwrap().hook,
+                &hook
+            ));
             drop(coordinator);
             let _ = std::fs::remove_dir_all(&dir);
         }

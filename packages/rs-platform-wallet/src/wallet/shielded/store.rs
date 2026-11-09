@@ -256,7 +256,8 @@ pub enum UnresolvedReason {
     /// dropped without a rebroadcast. The bytes may still have executed.
     DeserializeDropped,
     /// A wallet or account purge removed the record without proof of either
-    /// outcome.
+    /// outcome. Its notes stay held until the disposition is acknowledged,
+    /// whatever later scans find.
     Purged,
     /// Platform reported one of the record's notes spent, or showed its
     /// outputs, but the record did not hold that evidence alone: another
@@ -440,6 +441,17 @@ pub enum ShieldedDispositionRefusal {
         hex::encode(activity_id)
     )]
     MayHaveBeenBroadcast { activity_id: [u8; 32] },
+    /// The wallet holds an unacknowledged disposition for transition
+    /// `st_hash`, so a record for it can't be armed again: its resolution
+    /// would contradict that evidence. Acknowledge the disposition first.
+    #[error(
+        "transition {} already has disposition {existing:?}; refusing to arm it again",
+        hex::encode(st_hash)
+    )]
+    DispositionRecorded {
+        st_hash: [u8; 32],
+        existing: ShieldedSpendDisposition,
+    },
     /// An unacknowledged disposition for `st_hash` in the same wallet
     /// already holds different evidence (another value, activity or account).
     #[error(
@@ -652,6 +664,12 @@ pub trait ShieldedStore: Send + Sync {
     /// and its note reservations are rehydrated, so the re-drive — and
     /// the linked activity row's eventual Confirmed/Failed flip —
     /// continue across relaunches.
+    ///
+    /// While [`Self::records_spend_dispositions`] is on, overwriting an armed
+    /// note-spend record is refused with
+    /// [`ShieldedDispositionRefusal::RedriveArmed`]: it leaves only by a
+    /// resolution, which records its disposition. Identity-debit guards (no
+    /// nullifiers) may still be overwritten.
     fn arm_redrive(&mut self, id: SubwalletId, redrive: PendingRedrive) -> Result<(), Self::Error>;
 
     /// Every armed redrive record for `id`.
@@ -680,6 +698,11 @@ pub trait ShieldedStore: Send + Sync {
     /// implicitly when [`Self::mark_spent`] or [`Self::clear_pending`]
     /// resolves one of its nullifiers, since a transition lands or dies
     /// atomically for all of its nullifiers.
+    ///
+    /// While [`Self::records_spend_dispositions`] is on, an armed note-spend
+    /// record is refused with [`ShieldedDispositionRefusal::RedriveArmed`];
+    /// resolve it with [`Self::resolve_redrive`] instead. Identity-debit
+    /// guards are still cleared.
     fn clear_redrive(&mut self, id: SubwalletId, activity_id: &[u8; 32])
         -> Result<(), Self::Error>;
 
@@ -783,7 +806,9 @@ pub trait ShieldedStore: Send + Sync {
     /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
     /// become empty and the dispositions stay. A key that a later
     /// [`purge_wallet`](Self::purge_wallet) marked for the next scan again is
-    /// skipped.
+    /// skipped, and so is an
+    /// [`Unresolved(Purged)`](UnresolvedReason::Purged) disposition, which
+    /// only [`ack_disposition`](Self::ack_disposition) lifts.
     ///
     /// Call it only once the host holds the spent state of the pass that
     /// marked them durably. The host may otherwise restore an older snapshot
@@ -843,14 +868,32 @@ pub trait ShieldedStore: Send + Sync {
     /// Refused with [`ShieldedDispositionRefusal::NotRecording`] while
     /// [`Self::records_spend_dispositions`] is off, with
     /// [`ShieldedDispositionRefusal::IdentityDebit`] for a record without
-    /// nullifiers, and with [`ShieldedDispositionRefusal::RedriveArmed`]
+    /// nullifiers, with [`ShieldedDispositionRefusal::RedriveArmed`]
     /// while a record for the same activity is armed, which may have been
-    /// broadcast.
+    /// broadcast, and with
+    /// [`ShieldedDispositionRefusal::DispositionRecorded`] while the wallet
+    /// holds an unacknowledged disposition for the same transition: the
+    /// re-armed record could never be resolved without contradicting it.
     fn arm_unsent_redrive(
         &mut self,
         id: SubwalletId,
         redrive: PendingRedrive,
     ) -> Result<(), Self::Error>;
+
+    /// Resolve `id`'s redrive for `activity_id` as
+    /// [`NotExecuted`](ShieldedSpendDisposition::NotExecuted)`(reason)` and
+    /// release its notes, only while the store shows, durably, that it was
+    /// never broadcast (armed by [`Self::arm_unsent_redrive`] and not yet
+    /// claimed by [`Self::mark_redrive_sent`]). Refused with
+    /// [`ShieldedDispositionRefusal::MayHaveBeenBroadcast`] once it may have
+    /// gone out, and with [`ShieldedDispositionRefusal::NotRecording`] while
+    /// dispositions are not recorded. Nothing changes on any error.
+    fn resolve_unsent_redrive(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+        reason: NotExecutedReason,
+    ) -> Result<PendingRedrive, Self::Error>;
 
     /// Claim `id`'s redrive for `activity_id` for a broadcast: if it was
     /// armed as never broadcast, record first, durably, that it may now have
@@ -1028,6 +1071,11 @@ pub trait ShieldedStore: Send + Sync {
     /// scan has applied Platform's spent nullifiers to them. Nothing may
     /// acknowledge a removed wallet's dispositions, and acknowledging still
     /// lifts a hold.
+    ///
+    /// A [`Purged`](UnresolvedReason::Purged) disposition's hold is never
+    /// marked: its spend may still land after any scan while its anchor is
+    /// recorded, and the anchor is gone with the record, so only
+    /// [`ack_disposition`](Self::ack_disposition) lifts it.
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error>;
 
     /// Drop the account-scoped state and nullifier-backed redrives for exactly
@@ -1892,6 +1940,11 @@ impl ShieldedStore for InMemoryShieldedStore {
                 continue;
             }
             if let Some(record) = self.dispositions.get_mut(&key) {
+                if record.disposition
+                    == ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged)
+                {
+                    continue;
+                }
                 record.held_nullifiers.clear();
             }
         }
@@ -1917,6 +1970,15 @@ impl ShieldedStore for InMemoryShieldedStore {
         _id: SubwalletId,
         _redrive: PendingRedrive,
     ) -> Result<(), Self::Error> {
+        Err(ShieldedDispositionRefusal::NotRecording.into())
+    }
+
+    fn resolve_unsent_redrive(
+        &mut self,
+        _id: SubwalletId,
+        _activity_id: &[u8; 32],
+        _reason: NotExecutedReason,
+    ) -> Result<PendingRedrive, Self::Error> {
         Err(ShieldedDispositionRefusal::NotRecording.into())
     }
 
@@ -2050,7 +2112,10 @@ impl ShieldedStore for InMemoryShieldedStore {
             self.dispositions
                 .iter()
                 .filter(|(key, record)| {
-                    key.0.wallet_id == wallet_id && !record.held_nullifiers.is_empty()
+                    key.0.wallet_id == wallet_id
+                        && !record.held_nullifiers.is_empty()
+                        && record.disposition
+                            != ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged)
                 })
                 .map(|(key, _)| *key),
         );
@@ -2720,8 +2785,9 @@ pub(super) mod disposition_contract {
     /// it scanned and marks its holds as scanned, which lifts nothing: no
     /// later pass marks them again, and only lifting the keys that pass
     /// returned makes an input selectable, and only if the scan found it
-    /// unspent. The same wallet's other account and another wallet keep their
-    /// holds until their own scan.
+    /// unspent. A `Purged` row is never marked, so it holds its input until
+    /// acknowledged. The same wallet's other account and another wallet keep
+    /// their holds until their own scan.
     pub(crate) fn purge_wallet_releases_its_holds<S: ShieldedStore>(
         store: &mut S,
     ) -> Vec<WalletId> {
@@ -2729,11 +2795,14 @@ pub(super) mod disposition_contract {
         let sibling = SubwalletId::new([0xC0; 32], 2);
         let other = SubwalletId::new([0xBC; 32], 0);
         let executed = spend(0x26, &[[0x96; 32]]);
-        let purged = spend(0x27, &[[0x97; 32], [0x98; 32]]);
+        let cancelled = spend(0x27, &[[0x97; 32], [0x98; 32]]);
+        let purged = spend(0x2B, &[[0x9D; 32]]);
         let kept = spend(0x28, &[[0x99; 32]]);
         let sibling_spend = spend(0x2A, &[[0x9B; 32]]);
         let healthy = [0x9C; 32];
+        let purged_disposition = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
         arm_reserved(store, id, &executed);
+        arm_reserved(store, id, &cancelled);
         arm_reserved(store, id, &purged);
         arm_reserved(store, other, &kept);
         arm_reserved(store, sibling, &sibling_spend);
@@ -2741,9 +2810,10 @@ pub(super) mod disposition_contract {
             (id, &executed, ShieldedSpendDisposition::Executed),
             (
                 id,
-                &purged,
-                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged),
+                &cancelled,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
             ),
+            (id, &purged, purged_disposition),
             (other, &kept, ShieldedSpendDisposition::Executed),
             (sibling, &sibling_spend, ShieldedSpendDisposition::Executed),
         ] {
@@ -2761,7 +2831,7 @@ pub(super) mod disposition_contract {
         );
         // Added again: the host restores an older snapshot in which every
         // input is unspent.
-        for nullifier in [[0x96; 32], [0x97; 32], [0x98; 32], healthy] {
+        for nullifier in [[0x96; 32], [0x97; 32], [0x98; 32], [0x9D; 32], healthy] {
             store.save_note(id, &note(nullifier)).unwrap();
         }
         store.save_note(sibling, &note([0x9B; 32])).unwrap();
@@ -2779,9 +2849,12 @@ pub(super) mod disposition_contract {
                 .unwrap();
         let mut marked = scanned[&id].clone();
         marked.sort_unstable();
-        let mut expected = vec![executed.st_hash(), purged.st_hash()];
+        let mut expected = vec![executed.st_hash(), cancelled.st_hash()];
         expected.sort_unstable();
-        assert_eq!(marked, expected, "the scan marks exactly the purged holds");
+        assert_eq!(
+            marked, expected,
+            "the scan marks exactly the removal's holds, a Purged one excepted"
+        );
         assert_eq!(scanned.len(), 1, "only the scanned subwallet's holds");
         assert_eq!(
             unspent(store, id),
@@ -2794,10 +2867,12 @@ pub(super) mod disposition_contract {
         assert_eq!(unspent(store, id), BTreeSet::from([healthy]));
 
         store.lift_scanned_holds(id, &scanned[&id]).unwrap();
+        store.lift_scanned_holds(id, &[purged.st_hash()]).unwrap();
         assert_eq!(
             unspent(store, id),
             BTreeSet::from([[0x97; 32], [0x98; 32], healthy]),
-            "the scan settles the held inputs"
+            "the scan settles the held inputs, but not the Purged one, not even \
+             when its key is lifted"
         );
         assert_eq!(store.spendable_balance(id).unwrap(), 3_000);
         let after = store.dispositions(id.wallet_id).unwrap();
@@ -2807,9 +2882,18 @@ pub(super) mod disposition_contract {
                 (after.st_hash, after.activity_id, after.disposition),
                 (before.st_hash, before.activity_id, before.disposition)
             );
-            assert_eq!(after.held_nullifiers.is_empty(), after.subwallet == id);
+            assert_eq!(
+                after.held_nullifiers.is_empty(),
+                after.subwallet == id && after.disposition != purged_disposition
+            );
         }
 
+        assert!(store.ack_disposition(id, &purged.st_hash()).unwrap());
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0x97; 32], [0x98; 32], [0x9D; 32], healthy]),
+            "only an acknowledgement lifts a Purged hold"
+        );
         assert!(
             unspent(store, sibling).is_empty(),
             "the same wallet's unscanned account keeps its hold"

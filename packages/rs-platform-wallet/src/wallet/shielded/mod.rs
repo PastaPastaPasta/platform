@@ -37,6 +37,7 @@ pub mod balance;
 #[cfg(test)]
 mod balance_tests;
 pub mod coordinator;
+pub mod dispatch;
 pub mod file_store;
 pub mod fund_from_asset_lock;
 pub mod keys;
@@ -61,6 +62,10 @@ pub use balance::{
     ShieldedLocalBalanceState,
 };
 pub use coordinator::NetworkShieldedCoordinator;
+pub use dispatch::{
+    DispatchRefused, DispatchedNote, ShieldedDispatch, ShieldedDispatchKind,
+    ShieldedDispatchPayload,
+};
 pub use file_store::{FileBackedShieldedStore, FileShieldedStoreError};
 pub use keys::{AccountViewingKeys, OrchardKeySet};
 pub use prover::CachedOrchardProver;
