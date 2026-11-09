@@ -1322,12 +1322,12 @@ impl FileBackedShieldedStore {
         );
     }
 
-    /// Make every redrive row update fail until turned off again.
-    pub(super) fn fail_redrive_row_updates(&self, fail: bool) {
+    /// Make every disposition update fail until turned off again.
+    pub(super) fn fail_disposition_updates(&self, fail: bool) {
         self.set_failure_trigger(
-            "fail_redrive_row_updates",
+            "fail_disposition_updates",
             "UPDATE",
-            "shielded_pending_spends",
+            "shielded_spend_dispositions",
             "",
             fail,
         );
@@ -4828,13 +4828,26 @@ mod tests {
             remove_store_files(&path);
         }
 
-        /// With the switch off, a failed purge reports what it always did.
+        /// With the switch off, a failed purge reports what it did before
+        /// dispositions existed, and changes nothing.
         #[test]
         fn switch_off_purges_keep_their_errors() {
             let path = temp_tree_path("release_purge_errors_off");
             let id = SubwalletId::new([0xEA; 32], 0);
-            let first = spend(0x5C, &[N1]);
+            let mut store = open(&path, true);
+            let held = spend(0x5D, &[N2]);
+            arm_reserved(&mut store, id, &held);
+            store
+                .resolve_redrive(
+                    id,
+                    &held.activity_id,
+                    Unresolved(UnresolvedReason::Cancelled),
+                )
+                .unwrap();
+            drop(store);
+
             let mut store = open(&path, false);
+            let first = spend(0x5C, &[N1]);
             arm_reserved(&mut store, id, &first);
             store.fail_redrive_row_deletes(true);
             let results = [
@@ -4848,11 +4861,24 @@ mod tests {
                     "purge pending spends for wallet: ",
                 ),
             ];
-            for (result, message) in results {
-                let error = result.expect_err("the delete fails").to_string();
+            store.fail_redrive_row_deletes(false);
+            store.fail_disposition_updates(true);
+            let marker = store.purge_wallet(id.wallet_id);
+            for (result, message) in results
+                .into_iter()
+                .chain([(marker, "mark holds for the next scan: ")])
+            {
+                let error = result.expect_err("the purge fails").to_string();
                 assert!(error.contains(message), "{error}");
             }
             assert_eq!(store.pending_redrives(id).unwrap(), vec![first]);
+            drop(store);
+            let store = open(&path, false);
+            assert_eq!(
+                store.pending_redrives(id).unwrap().len(),
+                1,
+                "nothing was purged"
+            );
             drop(store);
             remove_store_files(&path);
         }

@@ -28,8 +28,8 @@ use super::note_selection::{
     select_notes_for_denomination, select_notes_with_fee, ShieldedFeeKind,
 };
 use super::store::{
-    AsDispositionRefusal, NotExecutedReason, PendingRedrive, ShieldedDispositionRefusal,
-    ShieldedNote, ShieldedSpendDisposition, ShieldedStore, SubwalletId, UnresolvedReason,
+    AsDispositionRefusal, PendingRedrive, ShieldedDispositionRefusal, ShieldedNote,
+    ShieldedSpendDisposition, ShieldedStore, SubwalletId, UnresolvedReason,
 };
 use crate::broadcast_outcome::{broadcast_definitely_failed, carries_consensus_rejection};
 use crate::changeset::{PlatformWalletChangeSet, ShieldedChangeSet};
@@ -3120,74 +3120,17 @@ enum RedriveBroadcastOutcome {
     AlreadyExecuted,
     /// Any other consensus verdict: the transition can never execute.
     DefinitiveRejection,
-    /// While dispositions are recorded, a consensus verdict that depends on
-    /// chain state: it says this attempt failed, not that an earlier
-    /// broadcast of the same bytes never executed, so it is inconclusive.
-    StateDependentRejection,
     /// Transport noise / `AlreadyExists` / anything non-definitive.
     Inconclusive,
 }
 
-fn classify_redrive_broadcast(
-    result: &Result<(), dash_sdk::Error>,
-    recording: bool,
-) -> RedriveBroadcastOutcome {
+fn classify_redrive_broadcast(result: &Result<(), dash_sdk::Error>) -> RedriveBroadcastOutcome {
     match result {
         Ok(()) => RedriveBroadcastOutcome::Accepted,
         Err(e) if is_nullifier_already_spent(e) => RedriveBroadcastOutcome::AlreadyExecuted,
-        Err(e)
-            if recording
-                && carries_consensus_rejection(e)
-                && !rejection_is_state_independent(e) =>
-        {
-            RedriveBroadcastOutcome::StateDependentRejection
-        }
         Err(e) if carries_consensus_rejection(e) => RedriveBroadcastOutcome::DefinitiveRejection,
         Err(_) => RedriveBroadcastOutcome::Inconclusive,
     }
-}
-
-/// The consensus verdict an SDK error carries, if any.
-fn consensus_verdict(e: &dash_sdk::Error) -> Option<&dpp::consensus::ConsensusError> {
-    match e {
-        dash_sdk::Error::Protocol(dpp::ProtocolError::ConsensusError(c)) => Some(c),
-        dash_sdk::Error::StateTransitionBroadcastError(b) => b.cause.as_ref(),
-        dash_sdk::Error::NoAvailableAddressesToRetry(inner) => consensus_verdict(inner),
-        _ => None,
-    }
-}
-
-/// Whether a consensus rejection proves the transition never executed:
-/// Platform reaches it from the transition's bytes and the protocol version
-/// alone, so any earlier broadcast of the same bytes drew it too. Verdicts
-/// that read chain state (anchor, pool balance or notes, nullifiers,
-/// identity, fee) do not, and neither does `InvalidShieldedProofError`,
-/// which Platform also returns for an insufficient pool balance.
-fn rejection_is_state_independent(e: &dash_sdk::Error) -> bool {
-    use dpp::consensus::basic::BasicError;
-    use dpp::consensus::ConsensusError;
-
-    matches!(
-        consensus_verdict(e),
-        Some(ConsensusError::BasicError(
-            BasicError::SerializedObjectParsingError(_)
-                | BasicError::ProtocolVersionParsingError(_)
-                | BasicError::StateTransitionMaxSizeExceededError(_)
-                | BasicError::StateTransitionNotActiveError(_)
-                | BasicError::UnsupportedVersionError(_)
-                | BasicError::ShieldedNoActionsError(_)
-                | BasicError::ShieldedTooManyActionsError(_)
-                | BasicError::ShieldedEmptyProofError(_)
-                | BasicError::ShieldedZeroAnchorError(_)
-                | BasicError::ShieldedEncryptedNoteSizeMismatchError(_)
-                | BasicError::ShieldedInvalidValueBalanceError(_)
-                | BasicError::NotImplementedCreditWithdrawalTransitionPoolingError(_)
-                | BasicError::InvalidCreditWithdrawalTransitionCoreFeeError(_)
-                | BasicError::InvalidCreditWithdrawalTransitionOutputScriptError(_)
-                | BasicError::WithdrawalBelowMinAmountError(_)
-                | BasicError::InvalidIdentityCreditWithdrawalTransitionAmountError(_)
-        ))
-    )
 }
 
 /// Bump a redrive attempt counter, logging (rather than discarding) a
@@ -3314,8 +3257,8 @@ pub(super) async fn redrive_pending_identity_shields<S: ShieldedStore>(
 ///   confirms — touch nothing;
 /// - any other consensus verdict → provably dead NOW: release the
 ///   reservation and flip the activity row to Failed, hours before the
-///   prune backstop would. While dispositions are recorded, only a verdict
-///   independent of chain state counts; any other is inconclusive;
+///   prune backstop would. While dispositions are recorded, a verdict is
+///   inconclusive too;
 /// - pruned anchor / exhausted attempts → leave it to the
 ///   prune-backstop release pass.
 ///
@@ -3349,7 +3292,7 @@ pub(super) async fn redrive_pending_spends<S: ShieldedStore>(
 }
 
 /// [`redrive_pending_spends`] with each re-broadcast made by `broadcast`.
-async fn redrive_pending_spends_with<S: ShieldedStore, F>(
+pub(super) async fn redrive_pending_spends_with<S: ShieldedStore, F>(
     store: &Arc<RwLock<S>>,
     persister: Option<&WalletPersister>,
     wallet_id: WalletId,
@@ -3435,7 +3378,7 @@ where
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        match classify_redrive_broadcast(&broadcast_result, recording) {
+        match classify_redrive_broadcast(&broadcast_result) {
             RedriveBroadcastOutcome::Accepted => {
                 let attempts = bump_redrive_attempts_logged(store, id, &redrive.activity_id).await;
                 info!(
@@ -3458,24 +3401,42 @@ where
                      the notes spent"
                 );
             }
-            RedriveBroadcastOutcome::DefinitiveRejection => {
+            RedriveBroadcastOutcome::DefinitiveRejection if !recording => {
                 warn!(
                     error = %err_display,
                     "redrive: definitive consensus rejection; the spend can never execute — \
                      releasing the reservation"
                 );
-                if let Err(e) =
-                    release_rejected_redrive(store, persister, wallet_id, id, &redrive).await
                 {
-                    failure = Some(e);
+                    let mut guard = store.write().await;
+                    for n in &redrive.nullifiers {
+                        // Also drops the redrive record via the
+                        // clear_pending hook.
+                        if let Err(e) = guard.clear_pending(id, n) {
+                            warn!(error = %e, "redrive: clear_pending failed");
+                        }
+                    }
                 }
+                record_activity_status_by_id(
+                    store,
+                    persister,
+                    wallet_id,
+                    id,
+                    &redrive.activity_id,
+                    ShieldedActivityStatus::Failed,
+                )
+                .await;
             }
-            RedriveBroadcastOutcome::StateDependentRejection
+            RedriveBroadcastOutcome::DefinitiveRejection
             | RedriveBroadcastOutcome::Inconclusive => {
                 // `AlreadyExists` (still in a mempool after a lost-ACK
-                // retry), transport noise, or a verdict on current chain
-                // state: inconclusive; counts toward the cap. The record
-                // stays armed for the scan or the prune pass to settle.
+                // retry) or transport noise: inconclusive; counts toward
+                // the cap. While dispositions are recorded a rejection is
+                // too: Platform judges a re-broadcast under the protocol
+                // version of the one node that answered, unauthenticated,
+                // so its verdict cannot show that an earlier broadcast of the
+                // same bytes never executed. The scan or the prune pass
+                // settles the record.
                 let attempts = bump_redrive_attempts_logged(store, id, &redrive.activity_id).await;
                 debug!(
                     attempts,
@@ -3516,60 +3477,6 @@ async fn drop_undeserializable_redrive<S: ShieldedStore>(
         warn!(error = %e, "redrive: recording the dropped record failed");
         PlatformWalletError::ShieldedStoreError(e.to_string())
     })
-}
-
-/// Release `redrive` after a re-broadcast drew a definitive consensus
-/// rejection and flip its activity to Failed. While the store records spend
-/// dispositions it is resolved `NotExecuted(Rejected)` first; the activity
-/// flips only if that committed, a record something else already resolved is
-/// left alone, and a failed write is returned. A record with a note the
-/// store does not know as unspent may have executed: it is resolved
-/// `Unresolved(Unattributable)` instead, which holds its notes, and its
-/// activity stays Pending.
-async fn release_rejected_redrive<S: ShieldedStore>(
-    store: &Arc<RwLock<S>>,
-    persister: Option<&WalletPersister>,
-    wallet_id: WalletId,
-    id: SubwalletId,
-    redrive: &PendingRedrive,
-) -> Result<(), PlatformWalletError> {
-    {
-        let mut guard = store.write().await;
-        if guard.records_spend_dispositions() {
-            let proven = guard.redrive_inputs_known_unspent(id, &redrive.activity_id);
-            let disposition = if proven {
-                ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected)
-            } else {
-                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable)
-            };
-            match resolve_if_armed(&mut *guard, id, &redrive.activity_id, disposition) {
-                Ok(true) if proven => {}
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    warn!(error = %e, "redrive: recording the rejection failed");
-                    return Err(PlatformWalletError::ShieldedStoreError(e.to_string()));
-                }
-            }
-        } else {
-            for n in &redrive.nullifiers {
-                // Also drops the redrive record via the
-                // clear_pending hook.
-                if let Err(e) = guard.clear_pending(id, n) {
-                    warn!(error = %e, "redrive: clear_pending failed");
-                }
-            }
-        }
-    }
-    record_activity_status_by_id(
-        store,
-        persister,
-        wallet_id,
-        id,
-        &redrive.activity_id,
-        ShieldedActivityStatus::Failed,
-    )
-    .await;
-    Ok(())
 }
 
 /// Broadcast a built shielded spend transition (unshield / transfer /
@@ -4067,12 +3974,10 @@ mod redrive_tests {
     /// `AlreadyExecuted` arm must win over `DefinitiveRejection`.
     #[test]
     fn redrive_broadcast_classification_matrix() {
-        for recording in [false, true] {
-            assert_eq!(
-                classify_redrive_broadcast(&Ok(()), recording),
-                RedriveBroadcastOutcome::Accepted
-            );
-        }
+        assert_eq!(
+            classify_redrive_broadcast(&Ok(())),
+            RedriveBroadcastOutcome::Accepted
+        );
 
         let already_spent = ConsensusError::StateError(StateError::NullifierAlreadySpentError(
             NullifierAlreadySpentError::new([1u8; 32]),
@@ -4083,13 +3988,11 @@ mod redrive_tests {
                 message: "state error".to_string(),
                 cause: Some(already_spent),
             });
-        for recording in [false, true] {
-            assert_eq!(
-                classify_redrive_broadcast(&Err(clone_error(&already_spent_err)), recording),
-                RedriveBroadcastOutcome::AlreadyExecuted,
-                "already-spent must classify as success BEFORE the generic rejection arm"
-            );
-        }
+        assert_eq!(
+            classify_redrive_broadcast(&Err(already_spent_err)),
+            RedriveBroadcastOutcome::AlreadyExecuted,
+            "already-spent must classify as success BEFORE the generic rejection arm"
+        );
 
         let other_rejection = ConsensusError::BasicError(
             dpp::consensus::basic::BasicError::ProtocolVersionParsingError(
@@ -4104,58 +4007,19 @@ mod redrive_tests {
                 message: "state error".to_string(),
                 cause: Some(other_rejection),
             });
-        for recording in [false, true] {
-            assert_eq!(
-                classify_redrive_broadcast(&Err(clone_error(&rejection_err)), recording),
-                RedriveBroadcastOutcome::DefinitiveRejection
-            );
-        }
-
-        // A verdict on chain state proves nothing about an earlier broadcast
-        // while dispositions are recorded.
-        for state_error in [
-            StateError::InvalidAnchorError(
-                dpp::consensus::state::shielded::invalid_anchor_error::InvalidAnchorError::new(
-                    [2; 32],
-                ),
-            ),
-            pool_balance_error(),
-        ] {
-            let err = consensus_rejection(ConsensusError::StateError(state_error));
-            assert_eq!(
-                classify_redrive_broadcast(&Err(clone_error(&err)), false),
-                RedriveBroadcastOutcome::DefinitiveRejection
-            );
-            assert_eq!(
-                classify_redrive_broadcast(&Err(err), true),
-                RedriveBroadcastOutcome::StateDependentRejection
-            );
-        }
+        assert_eq!(
+            classify_redrive_broadcast(&Err(rejection_err)),
+            RedriveBroadcastOutcome::DefinitiveRejection
+        );
 
         let timeout = dash_sdk::Error::TimeoutReached(
             std::time::Duration::from_secs(1),
             "waiting".to_string(),
         );
-        for recording in [false, true] {
-            assert_eq!(
-                classify_redrive_broadcast(&Err(clone_error(&timeout)), recording),
-                RedriveBroadcastOutcome::Inconclusive
-            );
-        }
-    }
-
-    fn clone_error(e: &dash_sdk::Error) -> dash_sdk::Error {
-        match e {
-            dash_sdk::Error::StateTransitionBroadcastError(b) => {
-                dash_sdk::Error::StateTransitionBroadcastError(StateTransitionBroadcastError {
-                    code: b.code,
-                    message: b.message.clone(),
-                    cause: b.cause.clone(),
-                })
-            }
-            dash_sdk::Error::TimeoutReached(d, m) => dash_sdk::Error::TimeoutReached(*d, m.clone()),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert_eq!(
+            classify_redrive_broadcast(&Err(timeout)),
+            RedriveBroadcastOutcome::Inconclusive
+        );
     }
 
     pub(super) fn consensus_rejection(cause: ConsensusError) -> dash_sdk::Error {
@@ -5207,71 +5071,22 @@ mod release_tests {
     }
 
     #[tokio::test]
-    async fn definitive_rejection_records_not_executed_first() {
-        let test = TestStore::open("rejection", true);
-        let id = SubwalletId::new([0xD1; 32], 0);
-        let first = spend(0x71, &[N1, N2]);
-        arm_reserved(&mut *test.store.write().await, id, &first);
-        test.save_pending_entry(id, first.activity_id).await;
-
-        // A failed write releases nothing and leaves the activity alone.
-        test.store.read().await.fail_disposition_writes(true);
-        assert!(
-            release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            test.store.read().await.pending_redrives(id).unwrap(),
-            vec![first.clone()]
-        );
-        assert!(unspent(&*test.store.read().await, id).is_empty());
-        assert_eq!(
-            test.status(id, &first.activity_id).await,
-            ShieldedActivityStatus::Pending
-        );
-        test.store.read().await.fail_disposition_writes(false);
-
-        release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
-            .await
-            .unwrap();
-        let rejected = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
-        assert_eq!(test.disposition_of(id, &first).await, Some(rejected));
-        assert_eq!(
-            unspent(&*test.store.read().await, id),
-            BTreeSet::from([N1, N2])
-        );
-        assert_eq!(
-            test.status(id, &first.activity_id).await,
-            ShieldedActivityStatus::Failed
-        );
-        // A record something else already resolved is left alone.
-        release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
-            .await
-            .unwrap();
-
-        let test = test.reopen();
-        assert_eq!(test.disposition_of(id, &first).await, Some(rejected));
-        test.assert_holds(id, &[&first]).await;
-        assert!(test
-            .store
-            .read()
-            .await
-            .pending_redrives(id)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
     async fn switch_off_definitive_rejection_writes_no_disposition() {
         let test = TestStore::open("rejection_off", false);
         let id = SubwalletId::new([0xD2; 32], 0);
-        let first = spend(0x72, &[N1, N2]);
+        let first = spend_with_actions(0x72, &[N1, N2]);
         arm_reserved(&mut *test.store.write().await, id, &first);
         test.save_pending_entry(id, first.activity_id).await;
-        release_rejected_redrive(&test.store, None, id.wallet_id, id, &first)
-            .await
-            .unwrap();
+        let recorded = [first.anchor].into_iter().collect();
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |_| async {
+            Err(super::redrive_tests::consensus_rejection(
+                dpp::consensus::ConsensusError::StateError(
+                    super::redrive_tests::pool_balance_error(),
+                ),
+            ))
+        })
+        .await
+        .unwrap();
         assert!(test.dispositions(id).await.is_empty());
         assert_eq!(
             unspent(&*test.store.read().await, id),
@@ -5559,10 +5374,6 @@ mod release_tests {
         test.assert_holds(id, &[&first, &second]).await;
     }
 
-    fn rejection(cause: dpp::consensus::ConsensusError) -> dash_sdk::Error {
-        super::redrive_tests::consensus_rejection(cause)
-    }
-
     /// A re-broadcast rejected on chain state, which the original's own
     /// execution may have left behind, records nothing: the record stays
     /// armed and its notes held until the scan proves how it ended.
@@ -5591,9 +5402,9 @@ mod release_tests {
                 id,
                 &recorded,
                 |_| async move {
-                    Err(rejection(dpp::consensus::ConsensusError::StateError(
-                        verdict(),
-                    )))
+                    Err(super::redrive_tests::consensus_rejection(
+                        dpp::consensus::ConsensusError::StateError(verdict()),
+                    ))
                 },
             )
             .await
@@ -5630,76 +5441,9 @@ mod release_tests {
         }
     }
 
-    /// A rejection Platform reaches from the transition's bytes alone proves
-    /// it never executed, unless one of its notes is already spent.
-    #[tokio::test]
-    async fn a_state_independent_redrive_rejection_records_not_executed() {
-        use dpp::consensus::basic::state_transition::ShieldedEmptyProofError;
-        use dpp::consensus::basic::BasicError;
-
-        let test = TestStore::open("state_independent_rejection", true);
-        let id = SubwalletId::new([0xDB; 32], 0);
-        let rejected = spend_with_actions(0x83, &[N1]);
-        let spent_input = spend_with_actions(0x84, &[N2]);
-        {
-            let mut store = test.store.write().await;
-            arm_reserved(&mut *store, id, &rejected);
-            let mut spent = note(N2);
-            spent.is_spent = true;
-            store.save_note(id, &spent).unwrap();
-            store.mark_pending(id, &N2).unwrap();
-            store
-                .set_pending_spend(id, &N2, spent_input.anchor, spent_input.activity_id)
-                .unwrap();
-            store.arm_redrive(id, spent_input.clone()).unwrap();
-        }
-        test.save_pending_entry(id, rejected.activity_id).await;
-        test.save_pending_entry(id, spent_input.activity_id).await;
-        let recorded = [rejected.anchor].into_iter().collect();
-
-        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |_| async {
-            Err(rejection(dpp::consensus::ConsensusError::BasicError(
-                BasicError::ShieldedEmptyProofError(ShieldedEmptyProofError::new()),
-            )))
-        })
-        .await
-        .unwrap();
-        let not_executed = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
-        let unattributable = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable);
-        assert_eq!(test.disposition_of(id, &rejected).await, Some(not_executed));
-        assert_eq!(
-            test.disposition_of(id, &spent_input).await,
-            Some(unattributable)
-        );
-        assert_eq!(unspent(&*test.store.read().await, id), BTreeSet::from([N1]));
-        assert_eq!(
-            test.status(id, &rejected.activity_id).await,
-            ShieldedActivityStatus::Failed
-        );
-        assert_eq!(
-            test.status(id, &spent_input.activity_id).await,
-            ShieldedActivityStatus::Pending,
-            "a spend that may have executed is not reported failed"
-        );
-        let test = test.reopen();
-        assert_eq!(test.disposition_of(id, &rejected).await, Some(not_executed));
-        assert_eq!(
-            test.disposition_of(id, &spent_input).await,
-            Some(unattributable)
-        );
-        test.assert_holds(id, &[&rejected, &spent_input]).await;
-        assert!(test
-            .store
-            .read()
-            .await
-            .pending_redrives(id)
-            .unwrap()
-            .is_empty());
-    }
-
-    /// One redrive pass whose broadcast reads the record's durable
-    /// never-broadcast flag into `seen` as the send starts, then fails
-    /// inconclusively.
+    /// One redrive pass whose broadcast checks it sends the stored bytes and
+    /// reads the record's durable never-broadcast flag into `seen` as the
+    /// send starts, then fails inconclusively.
     async fn observed_pass(
         test: &TestStore,
         id: SubwalletId,
@@ -5707,7 +5451,11 @@ mod release_tests {
         seen: &mut Vec<Option<bool>>,
     ) -> Result<(), PlatformWalletError> {
         let recorded = [redrive.anchor].into_iter().collect();
-        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |_| {
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            assert_eq!(
+                dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap(),
+                redrive.st_bytes
+            );
             seen.push(
                 test.store
                     .try_read()
@@ -5779,25 +5527,48 @@ mod release_tests {
         );
     }
 
-    /// With the switch off, the redrive pass broadcasts every ordinary record
-    /// even when its row cannot be updated: such a record was never armed
-    /// as unsent, so claiming it touches no row.
+    /// With the switch off, a record left unsent by an earlier recording
+    /// session is not sent while its flag cannot be cleared, and the pass
+    /// does not fail for it. An ordinary record is sent as before: claiming
+    /// it writes nothing.
     #[tokio::test]
-    async fn switch_off_redrive_sends_without_writing_the_record() {
-        let test = TestStore::open("redrive_off", false);
+    async fn switch_off_redrive_skips_an_unsent_record_without_failing_the_pass() {
+        let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
+        let test = TestStore::open("redrive_off", true);
         let id = SubwalletId::new([0xDC; 32], 0);
-        let first = spend_with_actions(0x85, &[N1]);
-        arm_reserved(&mut *test.store.write().await, id, &first);
-        let recorded = [first.anchor].into_iter().collect();
-        test.store.read().await.fail_redrive_row_updates(true);
-        let mut sends = 0;
-        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |_| {
-            sends += 1;
-            async { Ok(()) }
-        })
-        .await
-        .unwrap();
-        assert_eq!(sends, 1);
-        assert!(test.dispositions(id).await.is_empty());
+        let unsent = spend_with_actions(0x85, &[N1]);
+        let ordinary = spend_with_actions(0x86, &[N2]);
+        {
+            let mut store = test.store.write().await;
+            store.save_note(id, &note(N1)).unwrap();
+            store.mark_pending(id, &N1).unwrap();
+            store.arm_unsent_redrive(id, unsent.clone()).unwrap();
+            arm_reserved(&mut *store, id, &ordinary);
+        }
+        let test = test.reopen();
+        assert!(!test.store.read().await.records_spend_dispositions());
+        test.store.read().await.fail_mark_sent(true);
+        let recorded = [unsent.anchor, ordinary.anchor].into_iter().collect();
+
+        // The mock SDK fails each send inconclusively, which counts an attempt.
+        redrive_pending_spends(&sdk, &test.store, None, id.wallet_id, id, &recorded)
+            .await
+            .expect("the switch-off pass does not fail");
+        let store = test.store.read().await;
+        let armed = store.pending_redrives(id).unwrap();
+        let attempts = |redrive: &PendingRedrive| {
+            armed
+                .iter()
+                .find(|armed| armed.activity_id == redrive.activity_id)
+                .expect("armed")
+                .attempts
+        };
+        assert_eq!(attempts(&unsent), 0, "not sent");
+        assert_eq!(attempts(&ordinary), 1, "sent");
+        assert_eq!(
+            store.redrive_row_unsent(id, &unsent.activity_id),
+            Some(true)
+        );
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
     }
 }

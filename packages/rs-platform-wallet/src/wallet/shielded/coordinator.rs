@@ -804,14 +804,16 @@ impl NetworkShieldedCoordinator {
         let id = SubwalletId::new(wallet_id, account_index);
         let mut store = self.store.write().await;
         store.abandon_unsent_redrive(id, &activity_id)?;
-        let flipped = match store.get_activity_by_entry_id(id, &activity_id) {
-            Ok(Some(mut entry)) if entry.status != ShieldedActivityStatus::Confirmed => {
-                entry.status = ShieldedActivityStatus::Failed;
-                store.save_activity(id, &entry).map(|()| Some(entry))
-            }
-            Ok(_) => Ok(None),
-            Err(e) => Err(e),
-        };
+        let flipped =
+            store
+                .get_activity_by_entry_id(id, &activity_id)
+                .and_then(|found| match found {
+                    Some(mut entry) if entry.status != ShieldedActivityStatus::Confirmed => {
+                        entry.status = ShieldedActivityStatus::Failed;
+                        store.save_activity(id, &entry).map(|()| Some(entry))
+                    }
+                    _ => Ok(None),
+                });
         match flipped {
             Ok(Some(entry)) => super::operations::queue_shielded_changeset(
                 persister.as_ref(),
@@ -4521,6 +4523,176 @@ mod tests {
             let coordinator = coordinator_with_one_wallet(&dir).await;
             assert_eq!(disposition_of(&coordinator, &first).await, unattributable);
             assert_holds(&coordinator, &[&first]).await;
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// While dispositions are recorded, no consensus rejection of a redrive
+        /// proves it never executed, not even one Platform reaches from the
+        /// transition and the protocol version: each leaves the record armed
+        /// and held, across a reopen, until the prune pass releases it with
+        /// every note known unspent.
+        #[tokio::test]
+        async fn every_redrive_rejection_holds_until_prune() {
+            use crate::wallet::shielded::store::disposition_contract::spend_with_actions;
+            use dpp::consensus::basic::decode::{
+                ProtocolVersionParsingError, SerializedObjectParsingError,
+            };
+            use dpp::consensus::basic::identity::{
+                InvalidCreditWithdrawalTransitionCoreFeeError,
+                InvalidCreditWithdrawalTransitionOutputScriptError,
+                InvalidIdentityCreditWithdrawalTransitionAmountError,
+                NotImplementedCreditWithdrawalTransitionPoolingError,
+            };
+            use dpp::consensus::basic::state_transition::{
+                ShieldedEmptyProofError, ShieldedEncryptedNoteSizeMismatchError,
+                ShieldedInvalidValueBalanceError, ShieldedNoActionsError,
+                ShieldedTooManyActionsError, ShieldedZeroAnchorError,
+                StateTransitionMaxSizeExceededError, StateTransitionNotActiveError,
+                WithdrawalBelowMinAmountError,
+            };
+            use dpp::consensus::basic::{BasicError, UnsupportedVersionError};
+            use dpp::consensus::state::shielded::invalid_anchor_error::InvalidAnchorError;
+            use dpp::consensus::state::shielded::invalid_shielded_proof_error::InvalidShieldedProofError;
+            use dpp::consensus::state::state_error::StateError;
+            use dpp::consensus::ConsensusError;
+
+            let basic = [
+                BasicError::SerializedObjectParsingError(SerializedObjectParsingError::new(
+                    "parse".to_owned(),
+                )),
+                BasicError::ProtocolVersionParsingError(ProtocolVersionParsingError::new(
+                    "version".to_owned(),
+                )),
+                BasicError::StateTransitionMaxSizeExceededError(
+                    StateTransitionMaxSizeExceededError::new(2, 1),
+                ),
+                BasicError::StateTransitionNotActiveError(StateTransitionNotActiveError::new(
+                    "ShieldedTransfer",
+                    1,
+                    2,
+                )),
+                BasicError::UnsupportedVersionError(UnsupportedVersionError::new(2, 0, 1)),
+                BasicError::ShieldedNoActionsError(ShieldedNoActionsError::new()),
+                BasicError::ShieldedTooManyActionsError(ShieldedTooManyActionsError::new(2, 1)),
+                BasicError::ShieldedEmptyProofError(ShieldedEmptyProofError::new()),
+                BasicError::ShieldedZeroAnchorError(ShieldedZeroAnchorError::new()),
+                BasicError::ShieldedEncryptedNoteSizeMismatchError(
+                    ShieldedEncryptedNoteSizeMismatchError::new(216, 1),
+                ),
+                BasicError::ShieldedInvalidValueBalanceError(
+                    ShieldedInvalidValueBalanceError::new("balance".to_owned()),
+                ),
+                BasicError::NotImplementedCreditWithdrawalTransitionPoolingError(
+                    NotImplementedCreditWithdrawalTransitionPoolingError::new(1),
+                ),
+                BasicError::InvalidCreditWithdrawalTransitionCoreFeeError(
+                    InvalidCreditWithdrawalTransitionCoreFeeError::new(0, 1),
+                ),
+                BasicError::InvalidCreditWithdrawalTransitionOutputScriptError(
+                    InvalidCreditWithdrawalTransitionOutputScriptError::new(
+                        dpp::identity::core_script::CoreScript::from_bytes(vec![]),
+                    ),
+                ),
+                BasicError::WithdrawalBelowMinAmountError(WithdrawalBelowMinAmountError::new(
+                    0, 1, 2,
+                )),
+                BasicError::InvalidIdentityCreditWithdrawalTransitionAmountError(
+                    InvalidIdentityCreditWithdrawalTransitionAmountError::new(3, 1, 2),
+                ),
+            ]
+            .map(ConsensusError::BasicError);
+            let state = [
+                StateError::InvalidAnchorError(InvalidAnchorError::new([0x5A; 32])),
+                StateError::InvalidShieldedProofError(InvalidShieldedProofError::new(
+                    "proof".to_owned(),
+                )),
+            ]
+            .map(ConsensusError::StateError);
+            let verdicts: Vec<ConsensusError> = basic.into_iter().chain(state).collect();
+            let records: Vec<PendingRedrive> = (0..verdicts.len() as u8)
+                .map(|i| spend_with_actions(0xC0 + i, &[[0xC0 + i; 32]]))
+                .collect();
+
+            let dir = temp_dir("release_every_rejection");
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            coordinator.set_records_spend_dispositions(true).await;
+            for record in &records {
+                arm_with_activity(&coordinator, record).await;
+            }
+            let recorded = records.iter().map(|record| record.anchor).collect();
+            let mut verdicts = verdicts.into_iter();
+            super::super::super::operations::redrive_pending_spends_with(
+                &coordinator.store,
+                None,
+                ID.wallet_id,
+                ID,
+                &recorded,
+                |_| {
+                    let cause = verdicts.next().expect("one verdict per record");
+                    async move {
+                        Err(dash_sdk::Error::StateTransitionBroadcastError(
+                            dash_sdk::error::StateTransitionBroadcastError {
+                                code: 1,
+                                message: "rejected".to_owned(),
+                                cause: Some(cause),
+                            },
+                        ))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert!(verdicts.next().is_none(), "every verdict was drawn");
+            assert!(coordinator
+                .spend_dispositions(ID.wallet_id)
+                .await
+                .unwrap()
+                .is_empty());
+            let armed = coordinator
+                .pending_spend_redrives(ID.wallet_id)
+                .await
+                .unwrap();
+            assert_eq!(armed.len(), records.len());
+            assert!(armed.iter().all(|(_, armed)| armed.attempts == 1));
+            assert!(unspent(&*coordinator.store.read().await, ID).is_empty());
+            for record in &records {
+                assert_eq!(
+                    status(&coordinator, &record.activity_id).await,
+                    ShieldedActivityStatus::Pending
+                );
+            }
+            drop(coordinator);
+
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            coordinator.set_records_spend_dispositions(true).await;
+            {
+                let mut store = coordinator.store.write().await;
+                for record in &records {
+                    store.save_note(ID, &note(record.nullifiers[0])).unwrap();
+                    store
+                        .save_activity(ID, &pending_entry(record.activity_id, vec![]))
+                        .unwrap();
+                }
+                assert!(unspent(&*store, ID).is_empty(), "held across a reopen");
+            }
+            let snapshot = stale_snapshot(&coordinator).await;
+            assert!(coordinator
+                .release_stranded_spends(snapshot, &HashSet::new())
+                .await
+                .is_empty());
+            let pruned = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Pruned);
+            for record in &records {
+                assert_eq!(disposition_of(&coordinator, record).await, Some(pruned));
+                assert_eq!(
+                    status(&coordinator, &record.activity_id).await,
+                    ShieldedActivityStatus::Failed
+                );
+            }
+            assert_eq!(
+                unspent(&*coordinator.store.read().await, ID),
+                records.iter().map(|record| record.nullifiers[0]).collect()
+            );
             drop(coordinator);
             let _ = std::fs::remove_dir_all(&dir);
         }
