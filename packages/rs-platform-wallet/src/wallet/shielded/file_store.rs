@@ -167,6 +167,8 @@ pub struct FileBackedShieldedStore {
     /// [`ShieldedStore::records_spend_dispositions`]. Off at open; only the
     /// owning coordinator turns it on.
     records_dispositions: bool,
+    #[cfg(test)]
+    fail_activity_saves: bool,
     /// Exclusive lock on the sidecar `<path>.lock`, held for the store's
     /// lifetime so only one live store owns the file: the holds above and
     /// the reservations in `subwallets` are per instance. The last field, so
@@ -399,6 +401,8 @@ impl FileBackedShieldedStore {
             disposition_holds: BTreeMap::new(),
             holds_awaiting_scan: BTreeSet::new(),
             records_dispositions: false,
+            #[cfg(test)]
+            fail_activity_saves: false,
             _owner_lock: owner_lock,
         };
         store.rehydrate_pending_spends()?;
@@ -1171,30 +1175,22 @@ impl FileBackedShieldedStore {
         self.resolve_redrive(id, activity_id, abandoned)
     }
 
-    /// Whether any note `id`'s redrive for `activity_id` spends is already
-    /// marked spent.
-    pub(super) fn redrive_spends_a_spent_note(
-        &self,
-        id: SubwalletId,
-        activity_id: &[u8; 32],
-    ) -> bool {
-        self.subwallets
-            .get(&id)
-            .is_some_and(|sw| sw.redrive_spends_a_spent_note(activity_id))
-    }
-
     /// Delete pending-spend rows with `delete` in one transaction, and drop
     /// the in-scope subwallets' state with `drop_memory` after the commit.
     /// While the disposition switch is on, every armed note-spend redrive in
     /// scope is first resolved [`UnresolvedReason::Purged`] in the same
     /// transaction, holding its notes as [`ShieldedStore::resolve_redrive`]
     /// does; a conflicting disposition fails the purge with nothing changed.
+    ///
+    /// `transaction` names a multi-statement `delete`, which always runs in
+    /// a transaction; a single statement with no disposition to write runs
+    /// on its own.
     fn purge_pending(
         &mut self,
         in_scope: impl Fn(&SubwalletId) -> bool,
-        delete: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<()>,
+        delete: impl FnOnce(&rusqlite::Connection) -> Result<(), FileShieldedStoreError>,
         drop_memory: impl FnOnce(&mut Self),
-        what: &str,
+        transaction: Option<&str>,
     ) -> Result<(), FileShieldedStoreError> {
         let purged_disposition = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
         let purged: Vec<(SubwalletId, PendingRedrive)> = if self.records_dispositions {
@@ -1214,28 +1210,32 @@ impl FileBackedShieldedStore {
         let mut written = Vec::with_capacity(purged.len());
         {
             let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
-            let tx = conn
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| FileShieldedStoreError::Storage(format!("begin purge: {e}")))?;
-            for (id, redrive) in &purged {
-                let st_hash = redrive.st_hash();
-                let existing = Self::read_disposition(&tx, id.wallet_id, &st_hash)?;
-                if let Some(record) = disposition_to_write(
-                    existing.as_ref(),
-                    *id,
-                    &st_hash,
-                    &redrive.activity_id,
-                    purged_disposition,
-                    &held_by_resolution(redrive, purged_disposition),
-                )? {
-                    Self::insert_disposition(&tx, &record)?;
-                    written.push(record);
+            if purged.is_empty() && transaction.is_none() {
+                delete(&conn)?;
+            } else {
+                let what = transaction.unwrap_or("purge");
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|e| FileShieldedStoreError::Storage(format!("begin {what}: {e}")))?;
+                for (id, redrive) in &purged {
+                    let st_hash = redrive.st_hash();
+                    let existing = Self::read_disposition(&tx, id.wallet_id, &st_hash)?;
+                    if let Some(record) = disposition_to_write(
+                        existing.as_ref(),
+                        *id,
+                        &st_hash,
+                        &redrive.activity_id,
+                        purged_disposition,
+                        &held_by_resolution(redrive, purged_disposition),
+                    )? {
+                        Self::insert_disposition(&tx, &record)?;
+                        written.push(record);
+                    }
                 }
+                delete(&tx)?;
+                tx.commit()
+                    .map_err(|e| FileShieldedStoreError::Storage(format!("commit {what}: {e}")))?;
             }
-            delete(&tx)
-                .map_err(|e| FileShieldedStoreError::Storage(format!("purge {what}: {e}")))?;
-            tx.commit()
-                .map_err(|e| FileShieldedStoreError::Storage(format!("commit purge: {e}")))?;
         }
         self.cache_holds(written);
         drop_memory(self);
@@ -1308,6 +1308,34 @@ impl FileBackedShieldedStore {
             )
             .expect("corrupt disposition");
         assert_eq!(changed, 1);
+    }
+
+    /// Make every update clearing a redrive's never-broadcast flag fail
+    /// until turned off again.
+    pub(super) fn fail_mark_sent(&self, fail: bool) {
+        self.set_failure_trigger(
+            "fail_mark_sent",
+            "UPDATE",
+            "shielded_pending_spends",
+            "WHEN OLD.unsent = 1 AND NEW.unsent = 0",
+            fail,
+        );
+    }
+
+    /// Make every redrive row update fail until turned off again.
+    pub(super) fn fail_redrive_row_updates(&self, fail: bool) {
+        self.set_failure_trigger(
+            "fail_redrive_row_updates",
+            "UPDATE",
+            "shielded_pending_spends",
+            "",
+            fail,
+        );
+    }
+
+    /// Make every activity save fail until turned off again.
+    pub(super) fn fail_activity_saves(&mut self, fail: bool) {
+        self.fail_activity_saves = fail;
     }
 
     /// The durable never-broadcast flag of `id`'s redrive row, if any.
@@ -1771,9 +1799,6 @@ impl ShieldedStore for FileBackedShieldedStore {
         let Some(sw) = self.subwallets.get(&id) else {
             return Ok(());
         };
-        if !sw.knows_nullifier(nullifier) {
-            return Ok(());
-        }
         let resolutions: Vec<_> = sw
             .redrives_carrying(nullifier)
             .into_iter()
@@ -1878,6 +1903,12 @@ impl ShieldedStore for FileBackedShieldedStore {
         Ok(true)
     }
 
+    fn redrive_inputs_known_unspent(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool {
+        self.subwallets
+            .get(&id)
+            .is_some_and(|sw| sw.redrive_inputs_known_unspent(activity_id))
+    }
+
     fn record_outgoing_note(
         &mut self,
         id: SubwalletId,
@@ -1906,6 +1937,12 @@ impl ShieldedStore for FileBackedShieldedStore {
         id: SubwalletId,
         entry: &super::activity::ShieldedActivityEntry,
     ) -> Result<(), Self::Error> {
+        #[cfg(test)]
+        if self.fail_activity_saves {
+            return Err(FileShieldedStoreError::Storage(
+                "injected activity save failure".to_owned(),
+            ));
+        }
         self.subwallets.entry(id).or_default().save_activity(entry);
         Ok(())
     }
@@ -2053,12 +2090,18 @@ impl ShieldedStore for FileBackedShieldedStore {
                 conn.execute(
                     "DELETE FROM shielded_pending_spends WHERE wallet_id = ?1",
                     rusqlite::params![wallet_id.as_slice()],
-                )?;
+                )
+                .map_err(|e| {
+                    FileShieldedStoreError::Storage(format!("purge pending spends for wallet: {e}"))
+                })?;
                 conn.execute(
                     "UPDATE shielded_spend_dispositions SET released_by_scan = 1 \
                      WHERE wallet_id = ?1 AND length(nullifiers) > 0",
                     rusqlite::params![wallet_id.as_slice()],
-                )?;
+                )
+                .map_err(|e| {
+                    FileShieldedStoreError::Storage(format!("mark holds for the next scan: {e}"))
+                })?;
                 Ok(())
             },
             |store| {
@@ -2070,7 +2113,7 @@ impl ShieldedStore for FileBackedShieldedStore {
                         .filter(|(id, _)| id.wallet_id == wallet_id),
                 );
             },
-            "pending spends for wallet",
+            Some("wallet purge"),
         )
     }
 
@@ -2089,6 +2132,11 @@ impl ShieldedStore for FileBackedShieldedStore {
                     rusqlite::params![id.wallet_id.as_slice(), id.account_index],
                 )
                 .map(drop)
+                .map_err(|e| {
+                    FileShieldedStoreError::Storage(format!(
+                        "purge pending spends for subwallet: {e}"
+                    ))
+                })
             },
             |store| {
                 let identity_redrives = store
@@ -2104,7 +2152,7 @@ impl ShieldedStore for FileBackedShieldedStore {
                     }
                 }
             },
-            "pending spends for subwallet",
+            None,
         )
     }
 
@@ -2117,9 +2165,12 @@ impl ShieldedStore for FileBackedShieldedStore {
             |conn| {
                 conn.execute("DELETE FROM shielded_pending_spends", [])
                     .map(drop)
+                    .map_err(|e| {
+                        FileShieldedStoreError::Storage(format!("purge all pending spends: {e}"))
+                    })
             },
             |store| store.subwallets.clear(),
-            "all pending spends",
+            None,
         )
     }
 
@@ -4728,6 +4779,80 @@ mod tests {
                 &store.dispositions(id.wallet_id).unwrap(),
                 &[&proven, &other_action, &unobserved],
             );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// A spent nullifier resolves the record carrying it even when the
+        /// store does not know its note.
+        #[test]
+        fn a_spent_nullifier_resolves_a_record_whose_note_is_unknown() {
+            let path = temp_tree_path("release_unknown_note");
+            let id = SubwalletId::new([0xE9; 32], 0);
+            let proven = spend_with_actions(0x5A, &[N1]);
+            let unproven = spend_with_actions(0x5B, &[N2]);
+            let mut store = open(&path, true);
+            arm_reserved(&mut store, id, &proven);
+            arm_reserved(&mut store, id, &unproven);
+            drop(store);
+
+            // Reopened without the notes.
+            let mut store = open(&path, true);
+            assert!(store.get_all_notes(id).unwrap().is_empty());
+            store
+                .resolve_redrives_spending(id, &N1, Some(&action_cmx(0x5A, &N1)))
+                .unwrap();
+            store.resolve_redrives_spending(id, &N2, None).unwrap();
+            assert_eq!(
+                disposition_of(&store, id, &proven),
+                Some((proven.activity_id, Executed))
+            );
+            assert_eq!(
+                disposition_of(&store, id, &unproven),
+                Some((
+                    unproven.activity_id,
+                    Unresolved(UnresolvedReason::Unattributable)
+                ))
+            );
+            assert!(store.pending_redrives(id).unwrap().is_empty());
+            drop(store);
+
+            let mut store = open(&path, true);
+            restore_unspent(&mut store, id, &[N1, N2]);
+            assert!(unspent(&store, id).is_empty(), "both stay held");
+            assert_holds_by_value(
+                &store.dispositions(id.wallet_id).unwrap(),
+                &[&proven, &unproven],
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// With the switch off, a failed purge reports what it always did.
+        #[test]
+        fn switch_off_purges_keep_their_errors() {
+            let path = temp_tree_path("release_purge_errors_off");
+            let id = SubwalletId::new([0xEA; 32], 0);
+            let first = spend(0x5C, &[N1]);
+            let mut store = open(&path, false);
+            arm_reserved(&mut store, id, &first);
+            store.fail_redrive_row_deletes(true);
+            let results = [
+                (
+                    store.purge_subwallet(id),
+                    "purge pending spends for subwallet: ",
+                ),
+                (store.purge_all_subwallets(), "purge all pending spends: "),
+                (
+                    store.purge_wallet(id.wallet_id),
+                    "purge pending spends for wallet: ",
+                ),
+            ];
+            for (result, message) in results {
+                let error = result.expect_err("the delete fails").to_string();
+                assert!(error.contains(message), "{error}");
+            }
+            assert_eq!(store.pending_redrives(id).unwrap(), vec![first]);
             drop(store);
             remove_store_files(&path);
         }

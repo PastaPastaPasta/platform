@@ -688,6 +688,14 @@ impl NetworkShieldedCoordinator {
     /// every release path then behaves as it always has. A host that
     /// consumes dispositions turns it on before its first spend, sync or
     /// restore, and keeps it on.
+    ///
+    /// While it is on, a disposition the note scan cannot record, for any
+    /// wallet, fails that pass for every wallet of this network: no
+    /// watermark advances, nothing is released, and the next pass retries,
+    /// so a failure that persists repeats on every pass until its cause is
+    /// fixed. A failure in the later redrive, prune and activity steps is
+    /// reported only for its own wallet, though a failed activity step also
+    /// skips that step for the wallets after it until the next pass.
     // Nothing in the library turns it on yet; only tests do.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn set_records_spend_dispositions(&self, on: bool) {
@@ -781,6 +789,10 @@ impl NetworkShieldedCoordinator {
     /// dispositions are not being recorded with
     /// [`ShieldedDispositionRefusal::NotRecording`]. Nothing changes when it
     /// is refused.
+    ///
+    /// Once the disposition is recorded the call returns `Ok`: the
+    /// disposition is the authoritative outcome, and the activity update and
+    /// its hand-off to the host are best effort, logged if they fail.
     pub async fn abandon_shielded_spend(
         &self,
         wallet_id: WalletId,
@@ -792,16 +804,27 @@ impl NetworkShieldedCoordinator {
         let id = SubwalletId::new(wallet_id, account_index);
         let mut store = self.store.write().await;
         store.abandon_unsent_redrive(id, &activity_id)?;
-        if let Some(mut entry) = store.get_activity_by_entry_id(id, &activity_id)? {
-            if entry.status != ShieldedActivityStatus::Confirmed {
+        let flipped = match store.get_activity_by_entry_id(id, &activity_id) {
+            Ok(Some(mut entry)) if entry.status != ShieldedActivityStatus::Confirmed => {
                 entry.status = ShieldedActivityStatus::Failed;
-                store.save_activity(id, &entry)?;
-                super::operations::queue_shielded_changeset(
-                    persister.as_ref(),
-                    wallet_id,
-                    super::activity_recorder::changeset_for_entry(id, entry),
-                );
+                store.save_activity(id, &entry).map(|()| Some(entry))
             }
+            Ok(_) => Ok(None),
+            Err(e) => Err(e),
+        };
+        match flipped {
+            Ok(Some(entry)) => super::operations::queue_shielded_changeset(
+                persister.as_ref(),
+                wallet_id,
+                super::activity_recorder::changeset_for_entry(id, entry),
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                wallet_id = %hex::encode(wallet_id),
+                account = account_index,
+                error = %e,
+                "abandoned spend recorded, but its activity could not be marked failed"
+            ),
         }
         Ok(())
     }
@@ -2068,7 +2091,7 @@ impl NetworkShieldedCoordinator {
                                 account = id.account_index,
                                 nullifier = %hex::encode(nullifier),
                                 "shielded reservation resolved: its anchor was pruned, but one \
-                                 of its notes is already spent, so it may have executed; the \
+                                 of its notes is spent or unknown, so it may have executed; the \
                                  notes stay held until acknowledged"
                             );
                             continue;
@@ -2134,9 +2157,10 @@ impl NetworkShieldedCoordinator {
     /// Release one pruned reservation while dispositions are recorded, under
     /// the caller's store guard. The armed redrive of the reservation's
     /// activity, carrying this nullifier with the pruned anchor, is resolved
-    /// `NotExecuted(Pruned)`, which releases its notes, or
-    /// `Unresolved(Unattributable)` if one of its notes is already spent,
-    /// which holds them until acknowledged. A reservation without such a
+    /// `NotExecuted(Pruned)`, which releases its notes, only if every one of
+    /// its notes is known and unspent; otherwise it may have executed and is
+    /// resolved `Unresolved(Unattributable)`, which holds them until
+    /// acknowledged. A reservation without such a
     /// redrive is released only if no other armed redrive holds it.
     fn release_pruned_redrive(
         store: &mut FileBackedShieldedStore,
@@ -2156,9 +2180,9 @@ impl NetworkShieldedCoordinator {
         });
         if let Some(activity_id) = armed {
             // A pruned anchor proves the transition cannot execute from now
-            // on, not that it never did: one of its notes already spent says
-            // it may have.
-            if store.redrive_spends_a_spent_note(id, activity_id) {
+            // on, not that it never did: a note already spent, or one this
+            // store does not know, says it may have.
+            if !store.redrive_inputs_known_unspent(id, activity_id) {
                 store.resolve_redrive(
                     id,
                     activity_id,
@@ -4501,6 +4525,60 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A pruned anchor proves nothing for a record whose notes the
+        /// restored snapshot lacks: it is held, across a reopen and a later
+        /// restore of those notes as unspent.
+        #[tokio::test]
+        async fn prune_of_a_record_with_an_unknown_note_records_unattributable() {
+            let dir = temp_dir("release_prune_unknown");
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            let first = spend(0xAD, &[[0xBE; 32], [0xBF; 32]]);
+            arm_with_activity(&coordinator, &first).await;
+            drop(coordinator);
+
+            // Restored from a snapshot that has only one of its notes.
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            coordinator.set_records_spend_dispositions(true).await;
+            {
+                let mut store = coordinator.store.write().await;
+                store.save_note(ID, &note([0xBE; 32])).unwrap();
+                store
+                    .save_activity(ID, &pending_entry(first.activity_id, vec![]))
+                    .unwrap();
+            }
+            let snapshot = stale_snapshot(&coordinator).await;
+            assert_eq!(snapshot.len(), 2);
+            assert!(coordinator
+                .release_stranded_spends(snapshot, &HashSet::new())
+                .await
+                .is_empty());
+            let unattributable = Some(ShieldedSpendDisposition::Unresolved(
+                UnresolvedReason::Unattributable,
+            ));
+            assert_eq!(disposition_of(&coordinator, &first).await, unattributable);
+            assert!(unspent(&*coordinator.store.read().await, ID).is_empty());
+            assert_eq!(
+                status(&coordinator, &first.activity_id).await,
+                ShieldedActivityStatus::Pending
+            );
+            drop(coordinator);
+
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            assert_eq!(disposition_of(&coordinator, &first).await, unattributable);
+            assert_holds(&coordinator, &[&first]).await;
+            {
+                let mut store = coordinator.store.write().await;
+                store.save_note(ID, &note([0xBE; 32])).unwrap();
+                store.save_note(ID, &note([0xBF; 32])).unwrap();
+                assert!(
+                    unspent(&*store, ID).is_empty(),
+                    "notes restored later as unspent stay held"
+                );
+            }
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[test]
         fn a_disposition_failure_reports_only_its_wallet_as_failed() {
             use crate::wallet::shielded::sync::{ShieldedSyncSummary, SyncNotesResult};
@@ -4816,6 +4894,47 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty());
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Once the abandon is recorded it stands, even if the activity
+        /// cannot be updated afterwards.
+        #[tokio::test]
+        async fn abandon_returns_ok_once_recorded_when_the_activity_save_fails() {
+            let dir = temp_dir("release_abandon_activity_fails");
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            coordinator.set_records_spend_dispositions(true).await;
+            let first = spend(0xAC, &[[0xBD; 32]]);
+            {
+                let mut store = coordinator.store.write().await;
+                store.save_note(ID, &note([0xBD; 32])).unwrap();
+                store.mark_pending(ID, &[0xBD; 32]).unwrap();
+                store.arm_unsent_redrive(ID, first.clone()).unwrap();
+                store
+                    .save_activity(ID, &pending_entry(first.activity_id, vec![]))
+                    .unwrap();
+                store.fail_activity_saves(true);
+            }
+            coordinator
+                .abandon_shielded_spend(ID.wallet_id, ID.account_index, first.activity_id)
+                .await
+                .expect("the recorded abandon is the outcome");
+            let abandoned = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Abandoned);
+            assert_eq!(disposition_of(&coordinator, &first).await, Some(abandoned));
+            assert!(coordinator
+                .pending_spend_redrives(ID.wallet_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                unspent(&*coordinator.store.read().await, ID),
+                BTreeSet::from([[0xBD; 32]])
+            );
+            assert_eq!(
+                status(&coordinator, &first.activity_id).await,
+                ShieldedActivityStatus::Pending
+            );
             drop(coordinator);
             let _ = std::fs::remove_dir_all(&dir);
         }

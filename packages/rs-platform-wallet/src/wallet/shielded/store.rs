@@ -818,9 +818,10 @@ pub trait ShieldedStore: Send + Sync {
     /// The note's spent flag is left to [`Self::mark_spent`], so the spend is
     /// still reported as newly detected.
     ///
-    /// A no-op while [`Self::records_spend_dispositions`] is off, or when
-    /// the note is unknown. All records the nullifier resolves commit
-    /// together; on error nothing changed.
+    /// Records are resolved whether or not the note is known: a store that
+    /// lacks the note cannot tell the spend was another transition's. A
+    /// no-op while [`Self::records_spend_dispositions`] is off. All records
+    /// the nullifier resolves commit together; on error nothing changed.
     fn resolve_redrives_spending(
         &mut self,
         id: SubwalletId,
@@ -856,6 +857,13 @@ pub trait ShieldedStore: Send + Sync {
         id: SubwalletId,
         activity_id: &[u8; 32],
     ) -> Result<bool, Self::Error>;
+
+    /// Whether every note `id`'s armed redrive for `activity_id` spends is
+    /// known to this store and not marked spent. Only then can evidence that
+    /// the transition cannot execute from now on, such as a pruned anchor,
+    /// show it never did: an unknown note may have been spent by it unseen.
+    /// `false` when no such redrive is armed.
+    fn redrive_inputs_known_unspent(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool;
 
     // ── Outgoing history (per-subwallet) ───────────────────────────────
 
@@ -1305,11 +1313,6 @@ impl SubwalletState {
         self.redrives.contains_key(activity_id) && self.unsent_redrives.contains(activity_id)
     }
 
-    /// Whether `nullifier` belongs to a known note of this subwallet.
-    pub(super) fn knows_nullifier(&self, nullifier: &[u8; 32]) -> bool {
-        self.nullifier_index.contains_key(nullifier)
-    }
-
     /// Activity ids of the armed redrives that carry `nullifier`.
     pub(super) fn redrives_carrying(&self, nullifier: &[u8; 32]) -> Vec<[u8; 32]> {
         self.redrives
@@ -1360,14 +1363,14 @@ impl SubwalletState {
         }
     }
 
-    /// Whether any note `activity_id`'s redrive spends is already marked
-    /// spent, so the transition may have executed.
-    pub(super) fn redrive_spends_a_spent_note(&self, activity_id: &[u8; 32]) -> bool {
+    /// Whether every note `activity_id`'s armed redrive spends is known and
+    /// not marked spent. See [`ShieldedStore::redrive_inputs_known_unspent`].
+    pub(super) fn redrive_inputs_known_unspent(&self, activity_id: &[u8; 32]) -> bool {
         self.redrives.get(activity_id).is_some_and(|redrive| {
-            redrive.nullifiers.iter().any(|nullifier| {
+            redrive.nullifiers.iter().all(|nullifier| {
                 self.nullifier_index
                     .get(nullifier)
-                    .is_some_and(|&index| self.notes[index].is_spent)
+                    .is_some_and(|&index| !self.notes[index].is_spent)
             })
         })
     }
@@ -1928,6 +1931,12 @@ impl ShieldedStore for InMemoryShieldedStore {
             sw.unsent_redrives.remove(activity_id);
             sw.redrives.contains_key(activity_id)
         }))
+    }
+
+    fn redrive_inputs_known_unspent(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool {
+        self.subwallets
+            .get(&id)
+            .is_some_and(|sw| sw.redrive_inputs_known_unspent(activity_id))
     }
 
     fn record_outgoing_note(
