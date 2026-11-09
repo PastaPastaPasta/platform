@@ -552,26 +552,32 @@ impl NetworkShieldedCoordinator {
     /// ([`Self::spend_dispositions`]) for good. The hook can't be replaced
     /// or removed, since armed spends and their dispositions depend on it: a
     /// second call is refused with
-    /// [`PlatformWalletError::InvalidParameter`] and changes nothing. Set it
-    /// before the first spend or sync.
+    /// [`PlatformWalletError::InvalidParameter`] and changes nothing.
+    ///
+    /// Neither the hook nor recording is stored: a reopened store starts
+    /// without both. Set it after every open, before the first spend or
+    /// sync; a sync pass without it handles the spends armed under it the
+    /// way it handles any spend. A spend already being built when it is set
+    /// is refused before its broadcast.
     pub async fn set_shielded_dispatch(
         &self,
         hook: Arc<dyn ShieldedDispatch>,
     ) -> Result<(), PlatformWalletError> {
+        let already_set = || {
+            PlatformWalletError::InvalidParameter(
+                "a shielded dispatch hook is already set; it can't be replaced".to_owned(),
+            )
+        };
         let _lifecycle = self.lifecycle.lock().await;
         if self.dispatch.get().is_some() {
-            return Err(PlatformWalletError::InvalidParameter(
-                "a shielded dispatch hook is already set; it can't be replaced".to_owned(),
-            ));
+            return Err(already_set());
         }
         // Recording first: a spend that already sees the hook must find the
         // store recording.
         self.set_records_spend_dispositions(true).await;
-        self.dispatch.set(DispatchContext::new(hook)).map_err(|_| {
-            PlatformWalletError::InvalidParameter(
-                "a shielded dispatch hook is already set; it can't be replaced".to_owned(),
-            )
-        })
+        self.dispatch
+            .set(DispatchContext::new(hook))
+            .map_err(|_| already_set())
     }
 
     /// The dispatch hook and its in-flight set, once set.

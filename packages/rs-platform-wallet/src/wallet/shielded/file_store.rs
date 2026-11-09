@@ -1861,7 +1861,7 @@ impl ShieldedStore for FileBackedShieldedStore {
                         FileShieldedStoreError::Storage(format!("read a scanned hold: {e}"))
                     })?;
                 if purged {
-                    kept.insert((id, *st_hash));
+                    kept.insert(*st_hash);
                     continue;
                 }
                 tx.execute(
@@ -1880,7 +1880,7 @@ impl ShieldedStore for FileBackedShieldedStore {
         }
         for st_hash in st_hashes {
             let key = (id, *st_hash);
-            if !self.holds_awaiting_scan.contains(&key) && !kept.contains(&key) {
+            if !self.holds_awaiting_scan.contains(&key) && !kept.contains(st_hash) {
                 self.disposition_holds.remove(&key);
             }
         }

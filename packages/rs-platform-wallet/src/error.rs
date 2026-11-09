@@ -929,10 +929,13 @@ pub enum PlatformWalletError {
         reason: String,
     },
 
-    /// A shielded spend was never broadcast: the host's dispatch hook refused
-    /// it, or it was resolved (for example abandoned) before its first
-    /// broadcast. Its notes are free again and its disposition is recorded
-    /// as not executed, so the spend may be built again.
+    /// A shielded spend was not broadcast by this call: the host's dispatch
+    /// hook refused it, it was resolved (for example abandoned) before its
+    /// first broadcast, or the hook was set while it was being built. A
+    /// refusal is normally recorded as not executed, which frees its notes,
+    /// but check the spend's disposition before building it again: if the
+    /// refusal couldn't be recorded the spend stays armed and may still be
+    /// sent.
     #[error("Shielded spend was not sent: {reason}")]
     ShieldedDispatchRefused { reason: String },
 

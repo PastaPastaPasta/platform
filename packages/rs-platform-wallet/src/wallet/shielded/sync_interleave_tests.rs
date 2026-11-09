@@ -1563,15 +1563,27 @@ mod release_holds {
 
 /// A pass over two wallets in which one wallet's disposition write keeps
 /// failing: the other wallet's pass completes (its spend is applied, its
-/// watermark advances and its host takes the changeset), while the failing
-/// wallet is reported as failed, keeps its watermark and its armed record,
-/// and its host takes nothing from the pass. Once the failure clears, its
-/// next pass catches up.
+/// watermark advances, its stranded spend is released and its host takes
+/// the changeset), while the failing wallet is reported as failed, keeps
+/// its watermark and its armed records, stranded one included, and its host
+/// takes nothing from the pass. Once the failure clears, its next pass
+/// catches up.
 #[tokio::test]
 async fn a_persistent_disposition_failure_fails_only_its_wallets_pass() {
     const FAILING: [u8; 32] = [0x5B; 32];
+    const PRUNED_ANCHOR: [u8; 32] = [0x3C; 32];
     let path = tree_path();
-    let coordinator = coordinator_on(pool_sdk().await, &path);
+    let mut sdk = pool_sdk().await;
+    sdk.mock()
+        .expect_fetch(
+            drive_proof_verifier::types::NoParamQuery {},
+            Some(dash_sdk::query_types::ShieldedAnchors(vec![
+                spend(0, &[]).anchor,
+            ])),
+        )
+        .await
+        .expect("mock recorded anchors");
+    let coordinator = coordinator_on(sdk, &path);
     coordinator.set_records_spend_dispositions(true).await;
     let healthy_id = SubwalletId::new(WALLET, 0);
     let failing_id = SubwalletId::new(FAILING, 0);
@@ -1596,10 +1608,20 @@ async fn a_persistent_disposition_failure_fails_only_its_wallets_pass() {
     }
     let healthy_spend = spend(0x91, &[SPENT_NULLIFIER]);
     let failing_spend = spend(0x92, &[SPENT_NULLIFIER]);
+    let healthy_stranded = super::store::PendingRedrive {
+        anchor: PRUNED_ANCHOR,
+        ..spend(0x93, &[NEVER_SPENT_NULLIFIER])
+    };
+    let failing_stranded = super::store::PendingRedrive {
+        anchor: PRUNED_ANCHOR,
+        ..spend(0x94, &[NEVER_SPENT_NULLIFIER])
+    };
     {
         let mut store = coordinator.store().write().await;
         arm_reserved(&mut *store, healthy_id, &healthy_spend);
         arm_reserved(&mut *store, failing_id, &failing_spend);
+        arm_reserved(&mut *store, healthy_id, &healthy_stranded);
+        arm_reserved(&mut *store, failing_id, &failing_stranded);
         store.fail_disposition_write_for(&failing_spend.activity_id, true);
     }
 
@@ -1622,11 +1644,24 @@ async fn a_persistent_disposition_failure_fails_only_its_wallets_pass() {
         let store = coordinator.store().read().await;
         assert_eq!(store.last_synced_note_index(healthy_id).unwrap(), POOL_SIZE);
         assert!(store.pending_redrives(healthy_id).unwrap().is_empty());
-        assert_eq!(store.last_synced_note_index(failing_id).unwrap(), 0);
-        assert_eq!(
-            store.pending_redrives(failing_id).unwrap(),
-            vec![failing_spend.clone()]
+        assert!(
+            store
+                .dispositions(WALLET)
+                .unwrap()
+                .iter()
+                .any(|record| record.st_hash == healthy_stranded.st_hash()
+                    && matches!(record.disposition, ShieldedSpendDisposition::NotExecuted(_))),
+            "the healthy wallet's stranded spend is released"
         );
+        assert_eq!(store.last_synced_note_index(failing_id).unwrap(), 0);
+        let mut armed = store.pending_redrives(failing_id).unwrap();
+        armed.sort_by_key(|redrive| redrive.activity_id);
+        assert_eq!(
+            armed,
+            vec![failing_spend.clone(), failing_stranded.clone()],
+            "nothing of the failing wallet is pruned"
+        );
+        assert!(store.dispositions(FAILING).unwrap().is_empty());
         drop(store);
         assert!(healthy_host.took_spent(healthy_id, SPENT_NULLIFIER));
         assert!(
@@ -1643,6 +1678,13 @@ async fn a_persistent_disposition_failure_fails_only_its_wallets_pass() {
     let outcome = coordinator.sync(true).await;
     assert_eq!(outcome.success_count(), 2, "{outcome:?}");
     assert!(failing_host.took_spent(failing_id, SPENT_NULLIFIER));
+    assert!(coordinator
+        .store()
+        .read()
+        .await
+        .pending_redrives(failing_id)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         coordinator
             .store()

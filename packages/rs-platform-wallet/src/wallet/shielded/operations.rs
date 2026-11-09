@@ -1769,7 +1769,6 @@ pub(in crate::wallet) async fn unshield_dispatched<S: ShieldedStore, P: OrchardP
         // until then surfacing it as Pending is honest.
         Err(e @ PlatformWalletError::ShieldedSpendUnconfirmed { .. }) => Err(e),
         Err(e) => {
-            // Definitive failure of this send.
             settle_failed_spend(
                 store,
                 persister,
@@ -3034,7 +3033,7 @@ fn resolve_if_armed<S: ShieldedStore>(
 
 /// What [`cancel_pending`] did with a failed spend's reservation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CancelOutcome {
+enum CancelOutcome {
     /// The spend's armed redrive was resolved `Unresolved(Cancelled)`, which
     /// holds its notes until the disposition is acknowledged.
     Committed,
@@ -3179,14 +3178,14 @@ async fn refuse_store_recording_without_hook<S: ShieldedStore>(
 }
 
 /// A built note spend about to be sent for the first time.
-pub(super) struct FirstSend<'a> {
-    pub(super) id: SubwalletId,
-    pub(super) pending_entry: &'a Option<super::activity::ShieldedActivityEntry>,
-    pub(super) anchor: [u8; 32],
+struct FirstSend<'a> {
+    id: SubwalletId,
+    pending_entry: &'a Option<super::activity::ShieldedActivityEntry>,
+    anchor: [u8; 32],
     /// The wallet's notes the spend consumes, padding excluded.
-    pub(super) notes: &'a [ShieldedNote],
-    pub(super) state_transition: &'a StateTransition,
-    pub(super) kind: ShieldedDispatchKind,
+    notes: &'a [ShieldedNote],
+    state_transition: &'a StateTransition,
+    kind: ShieldedDispatchKind,
 }
 
 /// Broadcast a built shielded spend and, on the AMBIGUOUS outcome only
@@ -3294,7 +3293,7 @@ where
 ///    ([`ShieldedStore::mark_redrive_sent`]). A record resolved meanwhile,
 ///    for example abandoned, is not sent;
 /// 4. `send`. The transition stays in flight until `send` returns.
-pub(super) async fn send_first<S, T, F, Fut>(
+async fn send_first<S, T, F, Fut>(
     store: &Arc<RwLock<S>>,
     dispatch: Option<&DispatchContext>,
     spend: &FirstSend<'_>,
@@ -3306,6 +3305,13 @@ where
     Fut: std::future::Future<Output = Result<T, PlatformWalletError>>,
 {
     let Some(dispatch) = dispatch else {
+        // Only a hook turns recording on, so this spend started before the
+        // hook was set and was never registered.
+        if store.read().await.records_spend_dispositions() {
+            return Err(PlatformWalletError::ShieldedDispatchRefused {
+                reason: "a dispatch hook was set while the spend was being built".to_owned(),
+            });
+        }
         return send().await;
     };
     let (payload, _in_flight) = arm_for_dispatch(store, dispatch, spend).await?;
@@ -3324,7 +3330,7 @@ where
                 reason: "the spend was resolved before its first broadcast".to_owned(),
             })
         }
-        Err(e) => return Err(PlatformWalletError::ShieldedStoreError(e.to_string())),
+        Err(e) => return Err(store_refusal(e)),
     }
     send().await
 }
@@ -3747,7 +3753,7 @@ where
 /// from a first send or another rebroadcast, is skipped. Either skip leaves
 /// its attempt count unchanged. A rebroadcast holds its transition in flight
 /// until its outcome is handled.
-pub(super) async fn redrive_pending_spends_gated<S: ShieldedStore, F>(
+async fn redrive_pending_spends_gated<S: ShieldedStore, F>(
     store: &Arc<RwLock<S>>,
     persister: Option<&WalletPersister>,
     wallet_id: WalletId,
@@ -3810,6 +3816,10 @@ where
             }
         };
         if let Some(dispatch) = dispatch {
+            if dispatch.in_flight.contains(&redrive.st_hash()) {
+                debug!("redrive: the record is in flight; skipping it this pass");
+                continue;
+            }
             if let Err(refused) = dispatch
                 .hook
                 .admit(
@@ -5446,12 +5456,12 @@ mod release_tests {
     const N1: [u8; 32] = [0x61; 32];
     const N2: [u8; 32] = [0x62; 32];
 
-    struct TestStore {
-        path: RemoveOnDrop,
-        store: Arc<RwLock<FileBackedShieldedStore>>,
+    pub(super) struct TestStore {
+        pub(super) path: RemoveOnDrop,
+        pub(super) store: Arc<RwLock<FileBackedShieldedStore>>,
     }
 
-    struct RemoveOnDrop(std::path::PathBuf);
+    pub(super) struct RemoveOnDrop(pub(super) std::path::PathBuf);
 
     impl Drop for RemoveOnDrop {
         fn drop(&mut self) {
@@ -5464,7 +5474,7 @@ mod release_tests {
     }
 
     impl TestStore {
-        fn open(tag: &str, recording: bool) -> Self {
+        pub(super) fn open(tag: &str, recording: bool) -> Self {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -5480,7 +5490,7 @@ mod release_tests {
         }
 
         /// Close the store and open it again from disk.
-        fn reopen(self) -> Self {
+        pub(super) fn reopen(self) -> Self {
             let Self { path, store } = self;
             drop(Arc::try_unwrap(store).ok().expect("sole owner"));
             let store = FileBackedShieldedStore::open_path(&path.0, 100).expect("reopen");
@@ -5531,7 +5541,11 @@ mod release_tests {
                 .unwrap();
         }
 
-        async fn status(&self, id: SubwalletId, activity_id: &[u8; 32]) -> ShieldedActivityStatus {
+        pub(super) async fn status(
+            &self,
+            id: SubwalletId,
+            activity_id: &[u8; 32],
+        ) -> ShieldedActivityStatus {
             self.store
                 .read()
                 .await
@@ -5542,7 +5556,7 @@ mod release_tests {
         }
     }
 
-    fn pending_entry(activity_id: [u8; 32]) -> ShieldedActivityEntry {
+    pub(super) fn pending_entry(activity_id: [u8; 32]) -> ShieldedActivityEntry {
         ShieldedActivityEntry {
             id: activity_id,
             kind: ShieldedActivityKind::Sent,
@@ -6379,12 +6393,13 @@ mod release_tests {
 
 #[cfg(test)]
 mod dispatch_tests {
+    use super::release_tests::{pending_entry, TestStore};
     use super::*;
     use crate::wallet::shielded::activity::ShieldedActivityEntry;
     use crate::wallet::shielded::dispatch::{InFlight, ShieldedDispatch};
     use crate::wallet::shielded::file_store::FileBackedShieldedStore;
     use crate::wallet::shielded::store::disposition_contract::{
-        action_cmx, note, spend_with_actions, unspent,
+        actions, note, spend_with_actions, unspent,
     };
     use crate::wallet::shielded::store::NotExecutedReason;
     use dpp::serialization::{PlatformDeserializableTrusted, PlatformSerializable};
@@ -6403,80 +6418,71 @@ mod dispatch_tests {
     const N3: [u8; 32] = [0x83; 32];
     /// A padding action's nullifier: no note of the wallet has it.
     const DUMMY: [u8; 32] = [0x8F; 32];
+    const IDENTITY: [u8; 32] = [0x99; 32];
 
     struct Fixture {
+        test: TestStore,
         path: std::path::PathBuf,
-        store: Arc<RwLock<FileBackedShieldedStore>>,
-        _files: RemoveOnDrop,
     }
 
-    /// Removes the database's files when dropped.
-    struct RemoveOnDrop(std::path::PathBuf);
+    impl std::ops::Deref for Fixture {
+        type Target = TestStore;
 
-    impl Drop for RemoveOnDrop {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm", ".lock"] {
-                let mut file = self.0.as_os_str().to_owned();
-                file.push(suffix);
-                let _ = std::fs::remove_file(file);
-            }
+        fn deref(&self) -> &TestStore {
+            &self.test
         }
+    }
+
+    /// The durable `unsent` flag of `id`'s row for `activity_id` in the
+    /// database at `path`, read through a connection of its own.
+    fn durable_unsent(
+        path: &std::path::Path,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Option<bool> {
+        let conn = rusqlite::Connection::open(path).expect("raw connection");
+        conn.query_row(
+            "SELECT unsent FROM shielded_pending_spends \
+             WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
+            rusqlite::params![
+                id.wallet_id.as_slice(),
+                id.account_index,
+                activity_id.as_slice()
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .ok()
     }
 
     impl Fixture {
         /// A recording store holding `nullifiers` as notes reserved for a
         /// spend, as `reserve_unspent_notes` leaves them.
         fn new(tag: &str, nullifiers: &[[u8; 32]]) -> Self {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("shielded_dispatch_{tag}_{nanos}.sqlite"));
-            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
-            store.set_records_spend_dispositions(true);
-            for nullifier in nullifiers {
-                store.save_note(ID, &note(*nullifier)).unwrap();
-                store.mark_pending(ID, nullifier).unwrap();
+            let test = TestStore::open(&format!("dispatch_{tag}"), true);
+            {
+                let mut store = test.store.try_write().expect("uncontended");
+                for nullifier in nullifiers {
+                    store.save_note(ID, &note(*nullifier)).unwrap();
+                    store.mark_pending(ID, nullifier).unwrap();
+                }
             }
-            Self {
-                _files: RemoveOnDrop(path.clone()),
-                path,
-                store: Arc::new(RwLock::new(store)),
-            }
+            let path = test.path.0.clone();
+            Self { test, path }
         }
 
         /// Close the store and open it again from disk, recording.
         fn reopen(self) -> Self {
-            let Self {
-                path,
-                store,
-                _files,
-            } = self;
-            drop(Arc::try_unwrap(store).ok().expect("sole owner"));
-            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-            store.set_records_spend_dispositions(true);
-            Self {
-                path,
-                store: Arc::new(RwLock::new(store)),
-                _files,
-            }
+            let Self { test, path } = self;
+            let test = test.reopen();
+            test.store
+                .try_write()
+                .expect("uncontended")
+                .set_records_spend_dispositions(true);
+            Self { test, path }
         }
 
-        /// The durable `unsent` flag of the row for `activity_id`, read
-        /// through a connection of its own.
         fn durable_unsent(&self, activity_id: &[u8; 32]) -> Option<bool> {
-            let conn = rusqlite::Connection::open(&self.path).expect("raw connection");
-            conn.query_row(
-                "SELECT unsent FROM shielded_pending_spends \
-                 WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
-                rusqlite::params![
-                    ID.wallet_id.as_slice(),
-                    ID.account_index,
-                    activity_id.as_slice()
-                ],
-                |row| row.get::<_, bool>(0),
-            )
-            .ok()
+            durable_unsent(&self.path, ID, activity_id)
         }
 
         async fn disposition(&self, st_hash: &[u8; 32]) -> Option<ShieldedSpendDisposition> {
@@ -6582,20 +6588,7 @@ mod dispatch_tests {
                         .collect(),
                 )
             };
-            let durable_unsent = {
-                let conn = rusqlite::Connection::open(&self.path).expect("raw connection");
-                conn.query_row(
-                    "SELECT unsent FROM shielded_pending_spends \
-                     WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
-                    rusqlite::params![
-                        id.wallet_id.as_slice(),
-                        id.account_index,
-                        payload.activity_id.as_slice()
-                    ],
-                    |row| row.get::<_, bool>(0),
-                )
-                .ok()
-            };
+            let durable_unsent = durable_unsent(&self.path, id, &payload.activity_id);
             let activity_id = payload.activity_id;
             self.seen.lock().unwrap().push(Seen {
                 payload: Some(payload),
@@ -6641,38 +6634,8 @@ mod dispatch_tests {
     }
 
     fn entry(tag: u8) -> Option<ShieldedActivityEntry> {
-        Some(ShieldedActivityEntry {
-            id: [tag; 32],
-            kind: ShieldedActivityKind::Sent,
-            direction: ShieldedDirection::Out,
-            amount: 1,
-            fee: None,
-            counterparty: None,
-            memo: None,
-            block_height: None,
-            status: ShieldedActivityStatus::Pending,
-            created_at_ms: 1,
-            min_note_position: None,
-            note_cmxs: vec![],
-            spent_nullifiers: vec![],
-        })
+        Some(pending_entry([tag; 32]))
     }
-
-    fn actions(tag: u8, nullifiers: &[[u8; 32]]) -> Vec<dpp::shielded::SerializedAction> {
-        nullifiers
-            .iter()
-            .map(|nullifier| dpp::shielded::SerializedAction {
-                nullifier: *nullifier,
-                rk: [tag; 32],
-                cmx: action_cmx(tag, nullifier),
-                encrypted_note: vec![tag; 216],
-                cv_net: [tag; 32],
-                spend_auth_sig: [tag; 64],
-            })
-            .collect()
-    }
-
-    const IDENTITY: [u8; 32] = [0x99; 32];
 
     /// A signed transition of `kind`'s type with one action per
     /// `nullifiers`.
@@ -6773,19 +6736,22 @@ mod dispatch_tests {
         }
     }
 
-    /// Send `st` for the first time as the shared spend helper does, with
-    /// the outcome `result`.
-    async fn send_spend(
+    /// Send `st` for the first time by `send` the way `kind`'s operation
+    /// does: type 20 through [`send_first`], every other kind through the
+    /// shared spend helper.
+    async fn send_spend<F, Fut>(
         fixture: &Fixture,
         dispatch: Option<&DispatchContext>,
         pending_entry: &Option<ShieldedActivityEntry>,
         notes: &[ShieldedNote],
         st: &StateTransition,
         kind: ShieldedDispatchKind,
-        sends: &Arc<AtomicUsize>,
-        log: &Arc<Mutex<Vec<&'static str>>>,
-        result: Result<(), PlatformWalletError>,
-    ) -> Result<(), PlatformWalletError> {
+        send: F,
+    ) -> Result<(), PlatformWalletError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), PlatformWalletError>>,
+    {
         let spend = FirstSend {
             id: ID,
             pending_entry,
@@ -6801,7 +6767,7 @@ mod dispatch_tests {
                 | ShieldedDispatchKind::Withdraw
         );
         if matches!(kind, ShieldedDispatchKind::IdentityCreate { .. }) {
-            return send_first(&fixture.store, dispatch, &spend, sender(sends, log, result)).await;
+            return send_first(&fixture.store, dispatch, &spend, send).await;
         }
         send_spend_with_redrive(
             &fixture.store,
@@ -6809,7 +6775,7 @@ mod dispatch_tests {
             &spend,
             "test spend",
             proves_execution,
-            sender(sends, log, result),
+            send,
         )
         .await
     }
@@ -6838,9 +6804,7 @@ mod dispatch_tests {
                 &notes_of(&[N1, N2]),
                 &st,
                 kind,
-                &sends,
-                &hook.log,
-                Ok(()),
+                sender(&sends, &hook.log, Ok(())),
             )
             .await;
             assert!(
@@ -6881,14 +6845,6 @@ mod dispatch_tests {
             let pending_entry = entry(tag);
             let activity_id = [tag; 32];
             let unsent_at_send = Arc::new(Mutex::new(None));
-            let spend = FirstSend {
-                id: ID,
-                pending_entry: &pending_entry,
-                anchor: [0x5A; 32],
-                notes: &notes_of(&[N1, N2]),
-                state_transition: &st,
-                kind,
-            };
             let send = {
                 let sends = Arc::clone(&sends);
                 let log = Arc::clone(&hook.log);
@@ -6901,20 +6857,17 @@ mod dispatch_tests {
                     Ok(())
                 }
             };
-            let result = if matches!(kind, ShieldedDispatchKind::IdentityCreate { .. }) {
-                send_first(&fixture.store, Some(&dispatch), &spend, send).await
-            } else {
-                send_spend_with_redrive(
-                    &fixture.store,
-                    Some(&dispatch),
-                    &spend,
-                    "test spend",
-                    false,
-                    send,
-                )
-                .await
-            };
-            result.unwrap();
+            send_spend(
+                &fixture,
+                Some(&dispatch),
+                &pending_entry,
+                &notes_of(&[N1, N2]),
+                &st,
+                kind,
+                send,
+            )
+            .await
+            .unwrap();
             assert_eq!(hook.log(), vec!["dispatch", "send"], "{kind:?}");
             assert_eq!(sends.load(Ordering::SeqCst), 1);
             let seen = hook.seen().pop().unwrap();
@@ -6957,12 +6910,14 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Err(PlatformWalletError::ShieldedSpendUnconfirmed {
-                operation: "test spend",
-                reason: "timeout".to_owned(),
-            }),
+            sender(
+                &sends,
+                &hook.log,
+                Err(PlatformWalletError::ShieldedSpendUnconfirmed {
+                    operation: "test spend",
+                    reason: "timeout".to_owned(),
+                }),
+            ),
         )
         .await
         .unwrap_err();
@@ -6988,18 +6943,9 @@ mod dispatch_tests {
                     .set_records_spend_dispositions(false);
                 let st = transition(kind, tag, &[N1, N2]);
                 let sends = Arc::new(AtomicUsize::new(0));
-                let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
                 let activity_id = [tag; 32];
                 let rows_at_send = Arc::new(Mutex::new(None));
                 let pending_entry = entry(tag);
-                let spend = FirstSend {
-                    id: ID,
-                    pending_entry: &pending_entry,
-                    anchor: [0x5A; 32],
-                    notes: &notes_of(&[N1, N2]),
-                    state_transition: &st,
-                    kind,
-                };
                 let send = {
                     let sends = Arc::clone(&sends);
                     let rows_at_send = Arc::clone(&rows_at_send);
@@ -7017,14 +6963,17 @@ mod dispatch_tests {
                         }
                     }
                 };
-                let result = if matches!(kind, ShieldedDispatchKind::IdentityCreate { .. }) {
-                    send_first(&fixture.store, None, &spend, send).await
-                } else {
-                    send_spend_with_redrive(&fixture.store, None, &spend, "test spend", true, send)
-                        .await
-                };
+                let result = send_spend(
+                    &fixture,
+                    None,
+                    &pending_entry,
+                    &notes_of(&[N1, N2]),
+                    &st,
+                    kind,
+                    send,
+                )
+                .await;
                 assert_eq!(result.is_ok(), !unconfirmed);
-                assert!(log.lock().unwrap().is_empty());
                 assert_eq!(sends.load(Ordering::SeqCst), 1);
                 assert_eq!(
                     *rows_at_send.lock().unwrap(),
@@ -7067,9 +7016,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Ok(()),
+            sender(&sends, &hook.log, Ok(())),
         )
         .await
         .unwrap();
@@ -7122,9 +7069,7 @@ mod dispatch_tests {
             &notes_of(&[N1, N2, N3]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Ok(()),
+            sender(&sends, &hook.log, Ok(())),
         )
         .await
         .unwrap();
@@ -7154,9 +7099,7 @@ mod dispatch_tests {
                 &notes_of(&[N1]),
                 &st,
                 kind,
-                &sends,
-                &hook.log,
-                Ok(()),
+                sender(&sends, &hook.log, Ok(())),
             ),
         )
         .await
@@ -7184,9 +7127,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Ok(()),
+            sender(&sends, &hook.log, Ok(())),
         )
         .await
         .unwrap();
@@ -7222,9 +7163,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Ok(()),
+            sender(&sends, &hook.log, Ok(())),
         )
         .await;
         assert!(matches!(
@@ -7257,9 +7196,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Ok(()),
+            sender(&sends, &hook.log, Ok(())),
         )
         .await;
         assert!(matches!(
@@ -7303,9 +7240,7 @@ mod dispatch_tests {
                 &notes_of(&[N1]),
                 &st,
                 kind,
-                &sends,
-                &hook.log,
-                Ok(()),
+                sender(&sends, &hook.log, Ok(())),
             )
             .await;
             assert!(result.is_err(), "case {case}");
@@ -7334,9 +7269,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &refusing.log,
-            Ok(()),
+            sender(&sends, &refusing.log, Ok(())),
         )
         .await
         .unwrap_err();
@@ -7351,9 +7284,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &accepting.log,
-            Ok(()),
+            sender(&sends, &accepting.log, Ok(())),
         )
         .await;
         assert!(
@@ -7384,9 +7315,7 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &accepting.log,
-            Ok(()),
+            sender(&sends, &accepting.log, Ok(())),
         )
         .await
         .unwrap();
@@ -7425,9 +7354,7 @@ mod dispatch_tests {
                 &notes_of(&[N1]),
                 &st,
                 kind,
-                &sends,
-                &hook.log,
-                Ok(()),
+                sender(&sends, &hook.log, Ok(())),
             )
             .await;
             assert!(
@@ -7578,6 +7505,10 @@ mod dispatch_tests {
             .await
             .unwrap();
         assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(
+            hook.admitted.lock().unwrap().is_empty(),
+            "the hook isn't asked about a transition whose first send is in progress"
+        );
         assert_eq!(fixture.redrives().await, vec![redrive.clone()]);
         drop(held);
         redrive_pass(&fixture, Some(&dispatch), &sends)
@@ -7638,9 +7569,7 @@ mod dispatch_tests {
                 &notes,
                 &st,
                 kind,
-                &first_sends,
-                &log,
-                Ok(()),
+                sender(&first_sends, &log, Ok(())),
             ),
             async {
                 gate.entered.notified().await;
@@ -7682,9 +7611,7 @@ mod dispatch_tests {
                     &notes,
                     &st,
                     kind,
-                    &sends,
-                    &hanging.log,
-                    Ok(()),
+                    sender(&sends, &hanging.log, Ok(())),
                 ),
             )
             .await;
@@ -7756,9 +7683,7 @@ mod dispatch_tests {
                 &notes_of(&[N1]),
                 &st,
                 kind,
-                &sends,
-                &hook.log,
-                result,
+                sender(&sends, &hook.log, result),
             )
             .await;
             assert_eq!(
@@ -7798,11 +7723,13 @@ mod dispatch_tests {
             &notes_of(&[N1]),
             &st,
             kind,
-            &sends,
-            &hook.log,
-            Err(PlatformWalletError::ShieldedBroadcastFailed(
-                "rejected".into(),
-            )),
+            sender(
+                &sends,
+                &hook.log,
+                Err(PlatformWalletError::ShieldedBroadcastFailed(
+                    "rejected".into(),
+                )),
+            ),
         )
         .await;
         assert!(result.is_err());
@@ -7823,6 +7750,41 @@ mod dispatch_tests {
             ))
         );
         assert!(fixture.unspent().await.is_empty(), "the notes stay held");
+        assert_eq!(
+            fixture.status(ID, &[0x55; 32]).await,
+            ShieldedActivityStatus::Failed
+        );
+    }
+
+    /// A spend whose operation started before the hook was set, and so has
+    /// no hook, is refused before its broadcast once the store records.
+    #[tokio::test]
+    async fn a_spend_started_before_the_hook_was_set_is_not_sent() {
+        for (tag, kind) in (0x60u8..).zip(KINDS) {
+            let fixture = Fixture::new("hook_set_meanwhile", &[N1]);
+            let st = transition(kind, tag, &[N1, DUMMY]);
+            let sends = Arc::new(AtomicUsize::new(0));
+            let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+            let result = send_spend(
+                &fixture,
+                None,
+                &entry(tag),
+                &notes_of(&[N1]),
+                &st,
+                kind,
+                sender(&sends, &log, Ok(())),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(PlatformWalletError::ShieldedDispatchRefused { .. })
+                ),
+                "{kind:?}: {result:?}"
+            );
+            assert_eq!(sends.load(Ordering::SeqCst), 0, "{kind:?}");
+            assert_eq!(fixture.durable_unsent(&[tag; 32]), None, "{kind:?}");
+        }
     }
 
     /// The public entry points have no hook, so they refuse a store that

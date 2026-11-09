@@ -39,17 +39,41 @@ use crate::wallet::platform_wallet::WalletId;
 /// hook must not start a shield, top-up or other shield-class operation on
 /// the same wallet: it would wait for itself. Nor may it await a spend of
 /// the same coordinator.
+///
+/// # Failed sends hold their notes
+///
+/// With a hook set, every spend is armed before its first broadcast, so a
+/// first send that then fails, even one that provably never reached the
+/// network, is recorded `Unresolved(Cancelled)` and keeps its notes out of
+/// selection until the host acknowledges that disposition
+/// ([`NetworkShieldedCoordinator::spend_dispositions`]).
+///
+/// [`NetworkShieldedCoordinator::spend_dispositions`]:
+///     super::NetworkShieldedCoordinator::spend_dispositions
 #[async_trait]
 pub trait ShieldedDispatch: Send + Sync {
     /// Register `payload`'s spend before its first broadcast. Its redrive
     /// record is already durable when this runs. `Ok` lets the broadcast
-    /// go ahead; `Err` refuses it, and nothing is ever sent.
+    /// go ahead; `Err` refuses it, and this call sends nothing.
+    ///
+    /// `Ok` doesn't guarantee a broadcast: a spend resolved while the hook
+    /// ran (for example abandoned, or its wallet removed) is not sent, and
+    /// its disposition says why. A spend whose call ends without an answer
+    /// (the process stops, the caller drops the future, the hook panics), or
+    /// whose refusal can't be recorded, stays armed, and from then on only
+    /// [`Self::admit`] decides whether it is ever sent.
     async fn dispatch(&self, payload: ShieldedDispatchPayload) -> Result<(), DispatchRefused>;
 
-    /// Allow a sync pass to rebroadcast the armed spend of transition
-    /// `st_hash`, recorded under `activity_id` in `wallet_id`'s account
+    /// Allow a sync pass to send the armed spend of transition `st_hash`,
+    /// recorded under `activity_id` in `wallet_id`'s account
     /// `account_index`. `Err` skips it for this pass; the record stays armed
     /// and its attempt count is unchanged.
+    ///
+    /// This is the only check before such a send, also for a spend whose
+    /// [`Self::dispatch`] never returned `Ok` (see there), which may then be
+    /// sent for the first time. Return `Ok` only for an `st_hash` the host
+    /// has durably accepted through `dispatch`. It isn't called for a
+    /// transition whose first send is still in progress.
     async fn admit(
         &self,
         wallet_id: WalletId,
@@ -158,7 +182,6 @@ impl InFlight {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, st_hash: &[u8; 32]) -> bool {
         self.lock().contains(st_hash)
     }

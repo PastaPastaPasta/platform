@@ -2196,6 +2196,25 @@ pub(super) mod disposition_contract {
         cmx
     }
 
+    /// One action of record `tag` per nullifier, spending it with output
+    /// commitment [`action_cmx`].
+    pub(crate) fn actions(
+        tag: u8,
+        nullifiers: &[[u8; 32]],
+    ) -> Vec<dpp::shielded::SerializedAction> {
+        nullifiers
+            .iter()
+            .map(|nullifier| dpp::shielded::SerializedAction {
+                nullifier: *nullifier,
+                rk: [tag; 32],
+                cmx: action_cmx(tag, nullifier),
+                encrypted_note: vec![tag; 216],
+                cv_net: [tag; 32],
+                spend_auth_sig: [tag; 64],
+            })
+            .collect()
+    }
+
     /// A note-spend record whose bytes are a real shielded transfer with one
     /// action per nullifier, so a spent nullifier with the action's output
     /// commitment ([`action_cmx`]) proves it executed.
@@ -2204,17 +2223,7 @@ pub(super) mod disposition_contract {
         use dpp::state_transition::shielded_transfer_transition::v0::ShieldedTransferTransitionV0;
 
         let transition: dpp::state_transition::StateTransition = ShieldedTransferTransitionV0 {
-            actions: nullifiers
-                .iter()
-                .map(|nullifier| dpp::shielded::SerializedAction {
-                    nullifier: *nullifier,
-                    rk: [tag; 32],
-                    cmx: action_cmx(tag, nullifier),
-                    encrypted_note: vec![tag; 216],
-                    cv_net: [tag; 32],
-                    spend_auth_sig: [tag; 64],
-                })
-                .collect(),
+            actions: actions(tag, nullifiers),
             value_balance: 1_000,
             anchor: [0x5A; 32],
             proof: vec![tag; 40],
