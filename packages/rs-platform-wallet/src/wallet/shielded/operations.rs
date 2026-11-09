@@ -3119,6 +3119,8 @@ enum RedriveBroadcastOutcome {
     /// success signal, never a failure.
     AlreadyExecuted,
     /// Any other consensus verdict: the transition can never execute.
+    /// While dispositions are recorded the redrive loop treats it as
+    /// [`Self::Inconclusive`].
     DefinitiveRejection,
     /// Transport noise / `AlreadyExists` / anything non-definitive.
     Inconclusive,
@@ -3357,16 +3359,19 @@ where
         // durably, before anything goes out. While dispositions are recorded,
         // a record resolved since it was read (for example abandoned) is not
         // sent.
-        match store
-            .write()
-            .await
-            .mark_redrive_sent(id, &redrive.activity_id)
-        {
-            Ok(false) if recording => continue,
+        let (marked, recording_now) = {
+            let mut guard = store.write().await;
+            (
+                guard.mark_redrive_sent(id, &redrive.activity_id),
+                guard.records_spend_dispositions(),
+            )
+        };
+        match marked {
+            Ok(false) if recording_now => continue,
             Ok(_) => {}
             Err(e) => {
                 warn!(error = %e, "redrive: could not record the send; skipping the record");
-                if recording {
+                if recording_now {
                     failure = Some(PlatformWalletError::ShieldedStoreError(e.to_string()));
                 }
                 continue;
@@ -3378,7 +3383,32 @@ where
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
-        match classify_redrive_broadcast(&broadcast_result) {
+        let mut outcome = classify_redrive_broadcast(&broadcast_result);
+        if outcome == RedriveBroadcastOutcome::DefinitiveRejection {
+            let mut guard = store.write().await;
+            if guard.records_spend_dispositions() {
+                // Platform judges a re-broadcast under the protocol version
+                // of the one node that answered, unauthenticated, so its
+                // verdict cannot show that an earlier broadcast of the same
+                // bytes never executed. The scan or the prune pass settles
+                // the record.
+                outcome = RedriveBroadcastOutcome::Inconclusive;
+            } else {
+                warn!(
+                    error = %err_display,
+                    "redrive: definitive consensus rejection; the spend can never execute — \
+                     releasing the reservation"
+                );
+                for n in &redrive.nullifiers {
+                    // Also drops the redrive record via the
+                    // clear_pending hook.
+                    if let Err(e) = guard.clear_pending(id, n) {
+                        warn!(error = %e, "redrive: clear_pending failed");
+                    }
+                }
+            }
+        }
+        match outcome {
             RedriveBroadcastOutcome::Accepted => {
                 let attempts = bump_redrive_attempts_logged(store, id, &redrive.activity_id).await;
                 info!(
@@ -3401,22 +3431,7 @@ where
                      the notes spent"
                 );
             }
-            RedriveBroadcastOutcome::DefinitiveRejection if !recording => {
-                warn!(
-                    error = %err_display,
-                    "redrive: definitive consensus rejection; the spend can never execute — \
-                     releasing the reservation"
-                );
-                {
-                    let mut guard = store.write().await;
-                    for n in &redrive.nullifiers {
-                        // Also drops the redrive record via the
-                        // clear_pending hook.
-                        if let Err(e) = guard.clear_pending(id, n) {
-                            warn!(error = %e, "redrive: clear_pending failed");
-                        }
-                    }
-                }
+            RedriveBroadcastOutcome::DefinitiveRejection => {
                 record_activity_status_by_id(
                     store,
                     persister,
@@ -3427,16 +3442,10 @@ where
                 )
                 .await;
             }
-            RedriveBroadcastOutcome::DefinitiveRejection
-            | RedriveBroadcastOutcome::Inconclusive => {
+            RedriveBroadcastOutcome::Inconclusive => {
                 // `AlreadyExists` (still in a mempool after a lost-ACK
-                // retry) or transport noise: inconclusive; counts toward
-                // the cap. While dispositions are recorded a rejection is
-                // too: Platform judges a re-broadcast under the protocol
-                // version of the one node that answered, unauthenticated,
-                // so its verdict cannot show that an earlier broadcast of the
-                // same bytes never executed. The scan or the prune pass
-                // settles the record.
+                // retry), transport noise, or a rejection while dispositions
+                // are recorded: inconclusive; counts toward the cap.
                 let attempts = bump_redrive_attempts_logged(store, id, &redrive.activity_id).await;
                 debug!(
                     attempts,
@@ -5439,6 +5448,69 @@ mod release_tests {
             );
             test.assert_holds(id, &[&first]).await;
         }
+    }
+
+    /// A switch turned on during a pass governs the rest of it: a rejection
+    /// answered after the change keeps its record armed and its activity
+    /// Pending, and a record abandoned meanwhile is not sent.
+    #[tokio::test]
+    async fn a_switch_turned_on_mid_pass_holds_the_rejection_and_skips_the_abandoned() {
+        let test = TestStore::open("switch_mid_pass", true);
+        let id = SubwalletId::new([0xDD; 32], 0);
+        let rejected = spend_with_actions(0x87, &[N1]);
+        let abandoned = spend_with_actions(0x88, &[N2]);
+        {
+            let mut store = test.store.write().await;
+            arm_reserved(&mut *store, id, &rejected);
+            store.save_note(id, &note(N2)).unwrap();
+            store.mark_pending(id, &N2).unwrap();
+            store.arm_unsent_redrive(id, abandoned.clone()).unwrap();
+            store.set_records_spend_dispositions(false);
+        }
+        test.save_pending_entry(id, rejected.activity_id).await;
+        let recorded = [rejected.anchor].into_iter().collect();
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            if sent.len() == 1 {
+                let mut store = test
+                    .store
+                    .try_write()
+                    .expect("the pass holds no store guard while it sends");
+                store.set_records_spend_dispositions(true);
+                store
+                    .abandon_unsent_redrive(id, &abandoned.activity_id)
+                    .unwrap();
+            }
+            async {
+                Err(super::redrive_tests::consensus_rejection(
+                    dpp::consensus::ConsensusError::StateError(
+                        super::redrive_tests::pool_balance_error(),
+                    ),
+                ))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            test.status(id, &rejected.activity_id).await,
+            ShieldedActivityStatus::Pending
+        );
+        assert_eq!(sent, vec![rejected.st_bytes.clone()], "abandoned, not sent");
+        assert_eq!(test.disposition_of(id, &rejected).await, None);
+        assert_eq!(
+            test.store.read().await.pending_redrives(id).unwrap(),
+            vec![PendingRedrive {
+                attempts: 1,
+                ..rejected.clone()
+            }]
+        );
+        assert_eq!(
+            unspent(&*test.store.read().await, id),
+            [N2].into_iter().collect(),
+            "the rejected record's note stays held"
+        );
     }
 
     /// One redrive pass whose broadcast checks it sends the stored bytes and

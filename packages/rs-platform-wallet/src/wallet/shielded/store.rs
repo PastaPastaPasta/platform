@@ -234,7 +234,10 @@ pub enum NotExecutedReason {
     /// Nothing was sent.
     Abandoned,
     /// Platform returned a definitive consensus rejection for these exact
-    /// transition bytes.
+    /// transition bytes. This library does not currently record it: a
+    /// rejection is judged under the answering node's protocol version and
+    /// is unauthenticated, so it cannot show that an earlier broadcast of the
+    /// same bytes never executed.
     Rejected,
     /// The anchor the transition was built against left Platform's recorded
     /// anchor set while its nullifiers were still unspent, so its proof can
