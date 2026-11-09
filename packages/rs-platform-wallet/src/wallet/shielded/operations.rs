@@ -3745,6 +3745,49 @@ where
     redrive_pending_spends_gated(store, persister, wallet_id, id, recorded, None, broadcast).await
 }
 
+/// [`redrive_pending_spends_with`] in a pass whose dispatch hook admits
+/// every record.
+#[cfg(test)]
+pub(super) async fn redrive_pending_spends_admitted<S: ShieldedStore, F>(
+    store: &Arc<RwLock<S>>,
+    persister: Option<&WalletPersister>,
+    wallet_id: WalletId,
+    id: SubwalletId,
+    recorded: &std::collections::HashSet<[u8; 32]>,
+    broadcast: impl FnMut(StateTransition) -> F,
+) -> Result<(), PlatformWalletError>
+where
+    F: std::future::Future<Output = Result<(), dash_sdk::Error>>,
+{
+    struct AdmitAll;
+    #[async_trait::async_trait]
+    impl super::ShieldedDispatch for AdmitAll {
+        async fn dispatch(&self, _: ShieldedDispatchPayload) -> Result<(), DispatchRefused> {
+            Ok(())
+        }
+        async fn admit(
+            &self,
+            _: WalletId,
+            _: u32,
+            _: [u8; 32],
+            _: [u8; 32],
+        ) -> Result<(), DispatchRefused> {
+            Ok(())
+        }
+    }
+    let dispatch = DispatchContext::new(Arc::new(AdmitAll));
+    redrive_pending_spends_gated(
+        store,
+        persister,
+        wallet_id,
+        id,
+        recorded,
+        Some(&dispatch),
+        broadcast,
+    )
+    .await
+}
+
 /// [`redrive_pending_spends_dispatched`] with each re-broadcast made by
 /// `broadcast`, gated by `dispatch` when set: each
 /// record is first admitted by the hook
@@ -3805,8 +3848,8 @@ where
             Err(e) => {
                 warn!(
                     error = %e,
-                    "redrive: stored transition failed to deserialize; dropping the record \
-                     (the prune backstop still frees the notes)"
+                    "redrive: stored transition failed to deserialize; dropping the record, \
+                     with a disposition holding its notes if one is recorded for it"
                 );
                 if let Err(e) = drop_undeserializable_redrive(store, id, &redrive.activity_id).await
                 {
@@ -3840,11 +3883,22 @@ where
         // A record armed before its first send becomes possibly sent here,
         // durably, before anything goes out. While dispositions are recorded,
         // a record resolved since it was read (for example abandoned) is not
-        // sent. With recording off, a record armed by an earlier recording
-        // session is still marked sent first, and a failed mark skips the
-        // send.
+        // sent. A record armed while dispositions were recorded is sent only
+        // by a pass with a hook while they still are: the hook alone admits
+        // it, and a send while they are not would settle it without one. Any
+        // other record is marked sent first, and a failed mark skips the send.
         let (marked, recording_now, _in_flight) = {
             let mut guard = store.write().await;
+            let recording_now = guard.records_spend_dispositions();
+            if !(dispatch.is_some() && recording_now)
+                && guard.redrive_armed_recording(id, &redrive.activity_id)
+            {
+                debug!(
+                    "redrive: the record was armed while spend dispositions were recorded; \
+                     it waits for a pass with the dispatch hook"
+                );
+                continue;
+            }
             let in_flight = match dispatch {
                 Some(dispatch) => match dispatch.in_flight.claim(redrive.st_hash()) {
                     Some(in_flight) => Some(in_flight),
@@ -3857,7 +3911,7 @@ where
             };
             (
                 guard.mark_redrive_sent(id, &redrive.activity_id),
-                guard.records_spend_dispositions(),
+                recording_now,
                 in_flight,
             )
         };
@@ -3955,16 +4009,17 @@ where
 }
 
 /// Drop `id`'s redrive whose stored transition no longer deserializes.
-/// While the store records spend dispositions it is resolved
-/// `Unresolved(DeserializeDropped)` instead, which holds its notes until the
-/// disposition is acknowledged, and a failed write is returned.
+/// While the store records spend dispositions, or if the record was armed
+/// while it did, it is resolved `Unresolved(DeserializeDropped)` instead,
+/// which holds its notes until the disposition is acknowledged, and a failed
+/// write is returned.
 async fn drop_undeserializable_redrive<S: ShieldedStore>(
     store: &Arc<RwLock<S>>,
     id: SubwalletId,
     activity_id: &[u8; 32],
 ) -> Result<(), PlatformWalletError> {
     let mut guard = store.write().await;
-    if !guard.records_spend_dispositions() {
+    if !guard.records_spend_dispositions() && !guard.redrive_armed_recording(id, activity_id) {
         if let Err(e) = guard.clear_redrive(id, activity_id) {
             warn!(error = %e, "redrive: clear_redrive failed");
         }
@@ -5500,6 +5555,16 @@ mod release_tests {
             }
         }
 
+        /// [`Self::reopen`] with every redrive row read as armed before the
+        /// recording mark existed.
+        fn reopen_without_recording_marks(self) -> Self {
+            rusqlite::Connection::open(&self.path.0)
+                .unwrap()
+                .execute("UPDATE shielded_pending_spends SET armed_recording = 0", [])
+                .unwrap();
+            self.reopen()
+        }
+
         async fn dispositions(&self, id: SubwalletId) -> Vec<ShieldedSpendDispositionRecord> {
             self.store.read().await.dispositions(id.wallet_id).unwrap()
         }
@@ -6043,7 +6108,7 @@ mod release_tests {
             let recorded = [first.anchor].into_iter().collect();
 
             // The original executed after the scan's coverage.
-            redrive_pending_spends_with(
+            redrive_pending_spends_admitted(
                 &test.store,
                 None,
                 id.wallet_id,
@@ -6100,7 +6165,9 @@ mod release_tests {
         let abandoned = spend_with_actions(0x88, &[N2]);
         {
             let mut store = test.store.write().await;
+            store.set_records_spend_dispositions(false);
             arm_reserved(&mut *store, id, &rejected);
+            store.set_records_spend_dispositions(true);
             store.save_note(id, &note(N2)).unwrap();
             store.mark_pending(id, &N2).unwrap();
             store.arm_unsent_redrive(id, abandoned.clone()).unwrap();
@@ -6152,10 +6219,96 @@ mod release_tests {
         );
     }
 
+    /// A record armed while dispositions were recorded is sent only by a pass
+    /// with a hook while they still are: not by a pass without one while the
+    /// switch is on, nor after it turns on during the pass, nor by a pass
+    /// with a hook while the switch is off. A record armed with the switch
+    /// off is still sent.
+    #[tokio::test]
+    async fn a_pass_without_a_hook_never_sends_a_record_armed_while_recording() {
+        let test = TestStore::open("hookless_marked", true);
+        let id = SubwalletId::new([0xDF; 32], 0);
+        let unrecorded = spend_with_actions(0x8B, &[N1]);
+        let marked = spend_with_actions(0x8C, &[N2]);
+        {
+            let mut store = test.store.write().await;
+            arm_reserved(&mut *store, id, &marked);
+            store.set_records_spend_dispositions(false);
+            arm_reserved(&mut *store, id, &unrecorded);
+            store.set_records_spend_dispositions(true);
+        }
+        let recorded = [marked.anchor].into_iter().collect();
+        let attempts = |store: &FileBackedShieldedStore, redrive: &PendingRedrive| {
+            store
+                .pending_redrives(id)
+                .unwrap()
+                .into_iter()
+                .find(|armed| armed.activity_id == redrive.activity_id)
+                .expect("armed")
+                .attempts
+        };
+
+        let mut sent = Vec::new();
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![unrecorded.st_bytes.clone()],
+            "recording on, no hook"
+        );
+
+        test.store
+            .write()
+            .await
+            .set_records_spend_dispositions(false);
+        let mut sent = Vec::new();
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            test.store
+                .try_write()
+                .expect("the pass holds no store guard while it sends")
+                .set_records_spend_dispositions(true);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![unrecorded.st_bytes.clone()],
+            "the switch turned on mid-pass"
+        );
+
+        test.store
+            .write()
+            .await
+            .set_records_spend_dispositions(false);
+        let mut sent = Vec::new();
+        redrive_pending_spends_admitted(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![unrecorded.st_bytes.clone()],
+            "a hook with the switch off"
+        );
+        let store = test.store.read().await;
+        assert_eq!(attempts(&store, &marked), 0);
+        assert_eq!(attempts(&store, &unrecorded), 3);
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+    }
+
     /// With the switch off, a record armed unsent by an earlier recording
-    /// session is marked sent before it goes out, and a failed mark skips the
-    /// send. With the switch back on, abandon writes `NotExecuted` only for a
-    /// record whose never-sent state is still durable.
+    /// session whose row predates the recording mark is marked sent before it
+    /// goes out, and a failed mark skips the send. With the switch back on,
+    /// abandon writes `NotExecuted` only for a record whose never-sent state
+    /// is still durable.
     #[tokio::test]
     async fn switch_off_marks_a_retained_unsent_record_sent_before_sending_it() {
         let test = TestStore::open("unsent_off_then_on", true);
@@ -6171,7 +6324,7 @@ mod release_tests {
                 store.arm_unsent_redrive(id, redrive.clone()).unwrap();
             }
         }
-        let test = test.reopen();
+        let test = test.reopen_without_recording_marks();
         assert!(!test.store.read().await.records_spend_dispositions());
         let recorded = [skipped.anchor].into_iter().collect();
         let mut entered = Vec::new();
@@ -6259,9 +6412,10 @@ mod release_tests {
         assert_eq!(unspent(&*store, skipped_id), [N1].into_iter().collect());
     }
 
-    /// One redrive pass whose broadcast checks it sends the stored bytes and
-    /// reads the record's durable never-broadcast flag into `seen` as the
-    /// send starts, then fails inconclusively.
+    /// One redrive pass, with a hook admitting every record, whose broadcast
+    /// checks it sends the stored bytes and reads the record's durable
+    /// never-broadcast flag into `seen` as the send starts, then fails
+    /// inconclusively.
     async fn observed_pass(
         test: &TestStore,
         id: SubwalletId,
@@ -6269,7 +6423,7 @@ mod release_tests {
         seen: &mut Vec<Option<bool>>,
     ) -> Result<(), PlatformWalletError> {
         let recorded = [redrive.anchor].into_iter().collect();
-        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+        redrive_pending_spends_admitted(&test.store, None, id.wallet_id, id, &recorded, |st| {
             assert_eq!(
                 dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap(),
                 redrive.st_bytes
@@ -6346,9 +6500,9 @@ mod release_tests {
     }
 
     /// With the switch off, a record left unsent by an earlier recording
-    /// session is not sent while its flag cannot be cleared, and the pass
-    /// does not fail for it. An ordinary record is sent as before: claiming
-    /// it writes nothing.
+    /// session whose row predates the recording mark is not sent while its
+    /// flag cannot be cleared, and the pass does not fail for it. An ordinary
+    /// record is sent as before: claiming it writes nothing.
     #[tokio::test]
     async fn switch_off_redrive_skips_an_unsent_record_without_failing_the_pass() {
         let sdk = Arc::new(dash_sdk::SdkBuilder::new_mock().build().expect("mock sdk"));
@@ -6363,7 +6517,7 @@ mod release_tests {
             store.arm_unsent_redrive(id, unsent.clone()).unwrap();
             arm_reserved(&mut *store, id, &ordinary);
         }
-        let test = test.reopen();
+        let test = test.reopen_without_recording_marks();
         assert!(!test.store.read().await.records_spend_dispositions());
         test.store.read().await.fail_mark_sent(true);
         let recorded = [unsent.anchor, ordinary.anchor].into_iter().collect();
@@ -7804,5 +7958,254 @@ mod dispatch_tests {
         refuse_store_recording_without_hook(&fixture.store)
             .await
             .unwrap();
+    }
+
+    /// Reopen `fixture`'s store from disk without a hook: dispositions are
+    /// not recorded.
+    fn reopen_hookless(fixture: Fixture) -> Fixture {
+        let Fixture { test, path } = fixture;
+        let fixture = Fixture {
+            test: test.reopen(),
+            path,
+        };
+        assert!(!fixture
+            .store
+            .try_read()
+            .expect("uncontended")
+            .records_spend_dispositions());
+        fixture
+    }
+
+    /// A spend armed with a hook set whose dispatch never answered, reopened
+    /// without one: passes without a hook send nothing, keep its notes held
+    /// and its activity Pending, while a record armed without a hook is sent
+    /// as before. Once a hook is set again it is sent only when admitted, and
+    /// once.
+    #[tokio::test]
+    async fn a_spend_armed_with_a_hook_is_sent_only_once_a_hook_admits_it() {
+        let fixture = Fixture::new("armed_recording", &[N1, N2]);
+        let kind = ShieldedDispatchKind::Unshield;
+        let st = transition(kind, 0x56, &[N1, DUMMY]);
+        let activity_id = [0x56; 32];
+        let pending_entry = entry(0x56);
+        {
+            let hanging = TestHook::new(&fixture, Answer::Hang, true);
+            let dispatch = context(&hanging);
+            let sends = Arc::new(AtomicUsize::new(0));
+            let notes = notes_of(&[N1]);
+            let killed = tokio::time::timeout(
+                Duration::from_millis(500),
+                send_spend(
+                    &fixture,
+                    Some(&dispatch),
+                    &pending_entry,
+                    &notes,
+                    &st,
+                    kind,
+                    sender(&sends, &hanging.log, Ok(())),
+                ),
+            )
+            .await;
+            assert!(killed.is_err(), "the hook never answered");
+            assert_eq!(sends.load(Ordering::SeqCst), 0);
+        }
+        // A record armed without a hook, as before this store recorded.
+        let unrecorded = PendingRedrive {
+            activity_id: [0x57; 32],
+            ..spend_with_actions(0x57, &[N2])
+        };
+        {
+            let mut store = fixture.store.write().await;
+            store.set_records_spend_dispositions(false);
+            store
+                .set_pending_spend(ID, &N2, unrecorded.anchor, unrecorded.activity_id)
+                .unwrap();
+            store.arm_redrive(ID, unrecorded.clone()).unwrap();
+        }
+        let fixture = reopen_hookless(fixture);
+        {
+            // The host restores its notes and activity.
+            let mut store = fixture.store.write().await;
+            store.save_note(ID, &note(N1)).unwrap();
+            store.save_note(ID, &note(N2)).unwrap();
+            store
+                .save_activity(ID, pending_entry.as_ref().unwrap())
+                .unwrap();
+        }
+        let attempts = |redrives: Vec<PendingRedrive>, activity_id: [u8; 32]| {
+            redrives
+                .into_iter()
+                .find(|redrive| redrive.activity_id == activity_id)
+                .map(|redrive| redrive.attempts)
+        };
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        redrive_pass(&fixture, None, &sends).await.unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "only the record armed without a hook is sent"
+        );
+        assert_eq!(attempts(fixture.redrives().await, [0x57; 32]), Some(1));
+        assert_eq!(attempts(fixture.redrives().await, activity_id), Some(0));
+        assert_eq!(fixture.durable_unsent(&activity_id), Some(true));
+        assert!(fixture.unspent().await.is_empty(), "its notes stay held");
+        assert_eq!(
+            fixture.status(ID, &activity_id).await,
+            ShieldedActivityStatus::Pending
+        );
+
+        fixture
+            .store
+            .write()
+            .await
+            .set_records_spend_dispositions(true);
+        let refusing = TestHook::new(&fixture, Answer::Accept, false);
+        redrive_pass(&fixture, Some(&context(&refusing)), &sends)
+            .await
+            .unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "a refused admit sends nothing"
+        );
+        assert!(refusing.admitted.lock().unwrap().contains(&st_hash(&st)));
+        assert_eq!(fixture.durable_unsent(&activity_id), Some(true));
+
+        let admitting = TestHook::new(&fixture, Answer::Accept, true);
+        let marked_sends = Arc::new(AtomicUsize::new(0));
+        redrive_pending_spends_gated(
+            &fixture.store,
+            None,
+            ID.wallet_id,
+            ID,
+            &recorded(),
+            Some(&context(&admitting)),
+            |sent| {
+                let marked_sends = Arc::clone(&marked_sends);
+                let expected = st_hash(&st);
+                async move {
+                    if st_hash(&sent) == expected {
+                        marked_sends.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            marked_sends.load(Ordering::SeqCst),
+            1,
+            "admitted, sent once"
+        );
+        assert_eq!(fixture.durable_unsent(&activity_id), Some(false));
+        assert_eq!(attempts(fixture.redrives().await, activity_id), Some(1));
+    }
+
+    /// A spend sent with a hook set whose outcome stayed unknown, reopened
+    /// without one: a pass without a hook doesn't send it again; with a hook
+    /// set it is sent once a hook admits it, once.
+    #[tokio::test]
+    async fn a_spend_sent_with_a_hook_is_not_resent_without_one() {
+        let fixture = Fixture::new("sent_recording", &[N1]);
+        let kind = ShieldedDispatchKind::Transfer;
+        let st = transition(kind, 0x58, &[N1, DUMMY]);
+        let activity_id = [0x58; 32];
+        {
+            let hook = TestHook::new(&fixture, Answer::Accept, true);
+            let sends = Arc::new(AtomicUsize::new(0));
+            let _ = send_spend(
+                &fixture,
+                Some(&context(&hook)),
+                &entry(0x58),
+                &notes_of(&[N1]),
+                &st,
+                kind,
+                sender(
+                    &sends,
+                    &hook.log,
+                    Err(PlatformWalletError::ShieldedSpendUnconfirmed {
+                        operation: "test spend",
+                        reason: "timeout".to_owned(),
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(sends.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.durable_unsent(&activity_id), Some(false));
+        }
+        let fixture = reopen_hookless(fixture);
+        fixture
+            .store
+            .write()
+            .await
+            .save_note(ID, &note(N1))
+            .unwrap();
+
+        let redrive_sends = Arc::new(AtomicUsize::new(0));
+        redrive_pass(&fixture, None, &redrive_sends).await.unwrap();
+        assert_eq!(
+            redrive_sends.load(Ordering::SeqCst),
+            0,
+            "not resent without a hook"
+        );
+        assert_eq!(fixture.redrives().await[0].attempts, 0);
+        assert!(fixture.unspent().await.is_empty());
+
+        fixture
+            .store
+            .write()
+            .await
+            .set_records_spend_dispositions(true);
+        let refusing = TestHook::new(&fixture, Answer::Accept, false);
+        redrive_pass(&fixture, Some(&context(&refusing)), &redrive_sends)
+            .await
+            .unwrap();
+        assert_eq!(redrive_sends.load(Ordering::SeqCst), 0);
+        let admitting = TestHook::new(&fixture, Answer::Accept, true);
+        redrive_pass(&fixture, Some(&context(&admitting)), &redrive_sends)
+            .await
+            .unwrap();
+        assert_eq!(redrive_sends.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.redrives().await[0].attempts, 1);
+    }
+
+    /// A pass without a hook drops an undeserializable record armed while a
+    /// hook was set only with an `Unresolved(DeserializeDropped)`
+    /// disposition, which holds its note.
+    #[tokio::test]
+    async fn a_hookless_pass_resolves_an_undeserializable_record_armed_with_a_hook() {
+        let fixture = Fixture::new("undeserializable_recording", &[N1]);
+        let broken = PendingRedrive {
+            activity_id: [0x59; 32],
+            st_bytes: vec![0xFF; 8],
+            ..spend_with_actions(0x59, &[N1])
+        };
+        {
+            let mut store = fixture.store.write().await;
+            store
+                .set_pending_spend(ID, &N1, broken.anchor, broken.activity_id)
+                .unwrap();
+            store.arm_redrive(ID, broken.clone()).unwrap();
+        }
+        let fixture = reopen_hookless(fixture);
+        fixture
+            .store
+            .write()
+            .await
+            .save_note(ID, &note(N1))
+            .unwrap();
+        let sends = Arc::new(AtomicUsize::new(0));
+        redrive_pass(&fixture, None, &sends).await.unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        assert!(fixture.redrives().await.is_empty());
+        assert_eq!(
+            fixture.disposition(&broken.st_hash()).await,
+            Some(ShieldedSpendDisposition::Unresolved(
+                UnresolvedReason::DeserializeDropped
+            ))
+        );
+        assert!(fixture.unspent().await.is_empty(), "its note stays held");
     }
 }

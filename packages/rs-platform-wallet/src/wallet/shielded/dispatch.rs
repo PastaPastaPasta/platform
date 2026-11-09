@@ -71,9 +71,14 @@ pub trait ShieldedDispatch: Send + Sync {
     ///
     /// This is the only check before such a send, also for a spend whose
     /// [`Self::dispatch`] never returned `Ok` (see there), which may then be
-    /// sent for the first time. Return `Ok` only for an `st_hash` the host
-    /// has durably accepted through `dispatch`. It isn't called for a
-    /// transition whose first send is still in progress.
+    /// sent for the first time. It must return `Ok` only for an `st_hash`
+    /// the host has durably accepted through `dispatch`, and refuse every
+    /// other one, including one it has no record of or cannot read its
+    /// record for. It isn't called for a transition whose first send is
+    /// still in progress.
+    ///
+    /// A pass without a hook never sends a spend armed while one was set,
+    /// even after a restart; it waits for this check.
     async fn admit(
         &self,
         wallet_id: WalletId,

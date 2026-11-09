@@ -451,10 +451,10 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // and across passes the receipt was persisted on an earlier pass,
     // so `mark_spent`'s by-nullifier lookup still resolves.
     let mut scanned_nullifiers: Vec<[u8; 32]> = Vec::new();
-    // While spend dispositions are recorded, the output commitment of the
-    // action that revealed each nullifier: proof of which transition spent
-    // the note.
-    let recording_dispositions = store.records_spend_dispositions();
+    // The output commitment of the action that revealed each nullifier:
+    // proof of which transition spent the note. Collected whether or not
+    // dispositions are recorded, since a record armed while they were is
+    // resolved with it either way.
     let mut spending_action_cmxs: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
 
     while let Some(item) = stream.next().await {
@@ -489,10 +489,8 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
                 PlatformWalletError::ShieldedSyncFailed("Invalid nullifier length".into())
             })?;
             scanned_nullifiers.push(nf_bytes);
-            if recording_dispositions {
-                if let Ok(cmx) = <[u8; 32]>::try_from(raw_note.cmx.as_slice()) {
-                    spending_action_cmxs.insert(nf_bytes, cmx);
-                }
+            if let Ok(cmx) = <[u8; 32]>::try_from(raw_note.cmx.as_slice()) {
+                spending_action_cmxs.insert(nf_bytes, cmx);
             }
             let global_pos = batch.start_index + i as u64;
             if global_pos < tree_size {
@@ -1250,6 +1248,9 @@ pub(super) mod pass_pause {
         /// `clear()` has reset the store and released the store guard, and
         /// still holds `accounts`.
         AfterClearReset,
+        /// `set_shielded_dispatch` has set one of the hook and the recording
+        /// switch, and not yet the other.
+        DispatchSetHalfway,
     }
 
     type Armed = Mutex<HashMap<(usize, Point), Arc<Pause>>>;

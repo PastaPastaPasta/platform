@@ -1697,3 +1697,149 @@ async fn a_persistent_disposition_failure_fails_only_its_wallets_pass() {
     drop(coordinator);
     remove_store_files(&path);
 }
+
+/// A spend armed while a hook was set, whose own action the pool holds at
+/// [`SPENT_AT`]: the scan's proof that it executed.
+fn spend_of_the_pool_action(tag: u8) -> super::store::PendingRedrive {
+    use dpp::serialization::PlatformSerializable;
+    use dpp::state_transition::shielded_transfer_transition::v0::ShieldedTransferTransitionV0;
+
+    let mut actions = super::store::disposition_contract::actions(tag, &[SPENT_NULLIFIER]);
+    actions[0].cmx = <[u8; 32]>::try_from(pool_note(SPENT_AT, SPENT_AT).cmx.as_slice()).unwrap();
+    let transition: dpp::state_transition::StateTransition = ShieldedTransferTransitionV0 {
+        actions,
+        value_balance: 1_000,
+        anchor: [0x5A; 32],
+        proof: vec![tag; 40],
+        binding_signature: [tag; 64],
+    }
+    .into();
+    super::store::PendingRedrive {
+        st_bytes: transition.serialize_to_bytes().unwrap(),
+        ..spend(tag, &[SPENT_NULLIFIER])
+    }
+}
+
+/// A hook that counts every call and refuses each one.
+#[derive(Default)]
+struct CountingHook {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl super::dispatch::ShieldedDispatch for CountingHook {
+    async fn dispatch(
+        &self,
+        _payload: super::dispatch::ShieldedDispatchPayload,
+    ) -> Result<(), super::dispatch::DispatchRefused> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(super::dispatch::DispatchRefused::new("counted"))
+    }
+
+    async fn admit(
+        &self,
+        _wallet_id: [u8; 32],
+        _account_index: u32,
+        _activity_id: [u8; 32],
+        _st_hash: [u8; 32],
+    ) -> Result<(), super::dispatch::DispatchRefused> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(super::dispatch::DispatchRefused::new("counted"))
+    }
+}
+
+/// A spend armed while a hook was set lands, and a pass without a hook scans
+/// its spend: the scan writes one `Executed` on its own action's proof,
+/// holding the note until acknowledged, and nothing is sent. Once the hook is
+/// set, a further pass writes and sends nothing more.
+#[tokio::test]
+async fn a_hookless_scan_resolves_a_landed_spend_armed_with_a_hook_executed() {
+    let path = tree_path();
+    let id = SubwalletId::new(WALLET, 0);
+    let redrive = spend_of_the_pool_action(0x96);
+    {
+        let armed = coordinator_on(pool_sdk().await, &path);
+        armed.set_records_spend_dispositions(true).await;
+        arm_reserved(&mut *armed.store().write().await, id, &redrive);
+    }
+    let mut sdk = pool_sdk().await;
+    sdk.mock()
+        .expect_fetch(
+            drive_proof_verifier::types::NoParamQuery {},
+            Some(dash_sdk::query_types::ShieldedAnchors(vec![redrive.anchor])),
+        )
+        .await
+        .expect("mock recorded anchors");
+    let coordinator = coordinator_on(sdk, &path);
+    // The host restores the note.
+    coordinator
+        .store()
+        .write()
+        .await
+        .save_note(id, &note(SPENT_NULLIFIER))
+        .unwrap();
+    let host = Host::inline();
+    register_with(&coordinator, &host).await;
+    coordinator.mark_hydrated(WALLET, true).await;
+    assert!(!coordinator
+        .store()
+        .read()
+        .await
+        .records_spend_dispositions());
+
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    let records = coordinator
+        .store()
+        .read()
+        .await
+        .dispositions(WALLET)
+        .unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].st_hash, redrive.st_hash());
+    assert_eq!(records[0].disposition, ShieldedSpendDisposition::Executed);
+    assert_eq!(records[0].held_nullifiers, vec![SPENT_NULLIFIER]);
+    assert!(coordinator
+        .store()
+        .read()
+        .await
+        .pending_redrives(id)
+        .unwrap()
+        .is_empty());
+    assert!(host.took_spent(id, SPENT_NULLIFIER));
+
+    let hook = Arc::new(CountingHook::default());
+    coordinator
+        .set_shielded_dispatch(hook.clone())
+        .await
+        .unwrap();
+    let outcome = coordinator.sync(true).await;
+    assert_eq!(outcome.success_count(), 1, "{outcome:?}");
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 0, "nothing is sent");
+    assert_eq!(
+        coordinator
+            .store()
+            .read()
+            .await
+            .dispositions(WALLET)
+            .unwrap(),
+        records,
+        "nothing more is written"
+    );
+
+    assert!(coordinator
+        .store()
+        .write()
+        .await
+        .ack_disposition(id, &redrive.st_hash())
+        .unwrap());
+    assert!(coordinator
+        .store()
+        .read()
+        .await
+        .dispositions(WALLET)
+        .unwrap()
+        .is_empty());
+    drop(coordinator);
+    remove_store_files(&path);
+}

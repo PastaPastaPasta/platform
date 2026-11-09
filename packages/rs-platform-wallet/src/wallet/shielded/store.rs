@@ -669,7 +669,9 @@ pub trait ShieldedStore: Send + Sync {
     /// note-spend record is refused with
     /// [`ShieldedDispositionRefusal::RedriveArmed`]: it leaves only by a
     /// resolution, which records its disposition. Identity-debit guards (no
-    /// nullifiers) may still be overwritten.
+    /// nullifiers) may still be overwritten. While it is off, overwriting a
+    /// record armed while it was on ([`Self::redrive_armed_recording`]) is
+    /// refused the same way.
     fn arm_redrive(&mut self, id: SubwalletId, redrive: PendingRedrive) -> Result<(), Self::Error>;
 
     /// Every armed redrive record for `id`.
@@ -702,7 +704,8 @@ pub trait ShieldedStore: Send + Sync {
     /// While [`Self::records_spend_dispositions`] is on, an armed note-spend
     /// record is refused with [`ShieldedDispositionRefusal::RedriveArmed`];
     /// resolve it with [`Self::resolve_redrive`] instead. Identity-debit
-    /// guards are still cleared.
+    /// guards are still cleared. While it is off, so is a record armed while
+    /// it was on ([`Self::redrive_armed_recording`]).
     fn clear_redrive(&mut self, id: SubwalletId, activity_id: &[u8; 32])
         -> Result<(), Self::Error>;
 
@@ -829,8 +832,24 @@ pub trait ShieldedStore: Send + Sync {
     /// changes memory, and `clear_pending` refuses with
     /// [`ShieldedDispositionRefusal::RedriveArmed`] while an armed record
     /// carries the nullifier. While it is off they keep their memory-first
-    /// behaviour.
+    /// behaviour, except for records armed while it was on (see
+    /// [`Self::redrive_armed_recording`]).
     fn records_spend_dispositions(&self) -> bool;
+
+    /// Whether `id`'s redrive for `activity_id` is armed and was armed while
+    /// [`Self::records_spend_dispositions`] was on: by
+    /// [`Self::arm_unsent_redrive`], or by [`Self::arm_redrive`] for a
+    /// note-spend record. The mark is durable where the record is, and no
+    /// later re-arm clears it; it goes with the record.
+    ///
+    /// While dispositions are not recorded, such a record still leaves only
+    /// with a disposition: no pass without a dispatch hook sends it,
+    /// [`Self::arm_redrive`], [`Self::clear_pending`] and
+    /// [`Self::clear_redrive`] refuse it with
+    /// [`ShieldedDispositionRefusal::RedriveArmed`], and
+    /// [`Self::resolve_redrives_spending`] and [`Self::mark_spent`] resolve
+    /// it as they do while dispositions are recorded.
+    fn redrive_armed_recording(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool;
 
     /// Before `id`'s note with `nullifier` is marked spent, resolve every
     /// armed note-spend redrive that carries it, as [`Self::resolve_redrive`]
@@ -849,9 +868,11 @@ pub trait ShieldedStore: Send + Sync {
     /// still reported as newly detected.
     ///
     /// Records are resolved whether or not the note is known: a store that
-    /// lacks the note cannot tell the spend was another transition's. A
-    /// no-op while [`Self::records_spend_dispositions`] is off. All records
-    /// the nullifier resolves commit together; on error nothing changed.
+    /// lacks the note cannot tell the spend was another transition's. While
+    /// [`Self::records_spend_dispositions`] is off, only records armed while
+    /// it was on ([`Self::redrive_armed_recording`]) are resolved. All
+    /// records the nullifier resolves commit together; on error nothing
+    /// changed.
     fn resolve_redrives_spending(
         &mut self,
         id: SubwalletId,
@@ -1176,6 +1197,12 @@ pub(super) struct SubwalletState {
     /// armed redrive may have been broadcast. An id here counts only while
     /// `redrives` holds it; every arm and removal keeps the two in step.
     pub unsent_redrives: BTreeSet<[u8; 32]>,
+    /// Activity ids of armed note-spend redrives armed while spend
+    /// dispositions were recorded (see
+    /// [`ShieldedStore::redrive_armed_recording`]). Like `unsent_redrives`,
+    /// an id here counts only while `redrives` holds it, and every removal
+    /// keeps the two in step; unlike it, re-arming never clears an id.
+    pub armed_recording: BTreeSet<[u8; 32]>,
     /// Notes this subwallet SENT, recovered via OVK during the scan.
     /// Append-only send history in recording order.
     pub outgoing_notes: Vec<ShieldedOutgoingNote>,
@@ -1273,6 +1300,7 @@ impl SubwalletState {
         for id in &dropped {
             self.redrives.remove(id);
             self.unsent_redrives.remove(id);
+            self.armed_recording.remove(id);
         }
         dropped
     }
@@ -1357,6 +1385,28 @@ impl SubwalletState {
     /// Whether `activity_id`'s redrive is armed and was never broadcast.
     pub(super) fn redrive_is_unsent(&self, activity_id: &[u8; 32]) -> bool {
         self.redrives.contains_key(activity_id) && self.unsent_redrives.contains(activity_id)
+    }
+
+    /// Mark `activity_id`'s armed redrive as armed while spend dispositions
+    /// were recorded.
+    pub(super) fn mark_armed_recording(&mut self, activity_id: [u8; 32]) {
+        if self.redrives.contains_key(&activity_id) {
+            self.armed_recording.insert(activity_id);
+        }
+    }
+
+    /// Whether `activity_id`'s redrive is armed and was armed while spend
+    /// dispositions were recorded.
+    pub(super) fn redrive_armed_recording(&self, activity_id: &[u8; 32]) -> bool {
+        self.redrives.contains_key(activity_id) && self.armed_recording.contains(activity_id)
+    }
+
+    /// The first armed redrive carrying `nullifier` that was armed while
+    /// spend dispositions were recorded.
+    pub(super) fn armed_recording_carrying(&self, nullifier: &[u8; 32]) -> Option<[u8; 32]> {
+        self.redrives_carrying(nullifier)
+            .into_iter()
+            .find(|activity_id| self.armed_recording.contains(activity_id))
     }
 
     /// Activity ids of the armed redrives that carry `nullifier`.
@@ -1465,6 +1515,7 @@ impl SubwalletState {
     pub(super) fn clear_redrive(&mut self, activity_id: &[u8; 32]) {
         self.redrives.remove(activity_id);
         self.unsent_redrives.remove(activity_id);
+        self.armed_recording.remove(activity_id);
     }
 
     /// The armed note-spend redrive `resolve_redrive` may resolve as
@@ -1533,6 +1584,7 @@ impl SubwalletState {
     ) -> Option<PendingRedrive> {
         let redrive = self.redrives.remove(activity_id)?;
         self.unsent_redrives.remove(activity_id);
+        self.armed_recording.remove(activity_id);
         for nullifier in &redrive.nullifiers {
             match self
                 .redrives
@@ -1952,6 +2004,11 @@ impl ShieldedStore for InMemoryShieldedStore {
     }
 
     fn records_spend_dispositions(&self) -> bool {
+        false
+    }
+
+    fn redrive_armed_recording(&self, _id: SubwalletId, _activity_id: &[u8; 32]) -> bool {
+        // This store never records spend dispositions.
         false
     }
 

@@ -556,9 +556,11 @@ impl NetworkShieldedCoordinator {
     ///
     /// Neither the hook nor recording is stored: a reopened store starts
     /// without both. Set it after every open, before the first spend or
-    /// sync; a sync pass without it handles the spends armed under it the
-    /// way it handles any spend. A spend already being built when it is set
-    /// is refused before its broadcast.
+    /// sync. A sync pass without it never sends a spend armed under it, nor
+    /// releases its notes; its scan still resolves one it sees land. A sync
+    /// pass reads the hook once when it starts, so one set while it runs
+    /// applies from the next pass. A spend already being built when it is
+    /// set is refused before its broadcast.
     pub async fn set_shielded_dispatch(
         &self,
         hook: Arc<dyn ShieldedDispatch>,
@@ -572,12 +574,21 @@ impl NetworkShieldedCoordinator {
         if self.dispatch.get().is_some() {
             return Err(already_set());
         }
-        // Recording first: a spend that already sees the hook must find the
-        // store recording.
-        self.set_records_spend_dispositions(true).await;
+        // Both change under one store guard, so nothing that reads the switch
+        // under it sees recording on without the hook, and a spend or pass
+        // that already sees the hook finds the store recording.
+        let mut store = self.store.write().await;
         self.dispatch
             .set(DispatchContext::new(hook))
-            .map_err(|_| already_set())
+            .map_err(|_| already_set())?;
+        #[cfg(test)]
+        super::sync::pass_pause::reached(
+            super::sync::pass_pause::key(&self.store),
+            super::sync::pass_pause::Point::DispatchSetHalfway,
+        )
+        .await;
+        store.set_records_spend_dispositions(true);
+        Ok(())
     }
 
     /// The dispatch hook and its in-flight set, once set.
@@ -1644,6 +1655,8 @@ impl NetworkShieldedCoordinator {
 
         #[cfg(test)]
         let pass_key = super::sync::pass_pause::key(&self.store);
+        // Every decision of this pass uses this one reading of the hook.
+        let dispatch = self.dispatch_context();
         // Snapshot the flat subwallet registry. This Vec is both
         // the IVK fan-out for sync_notes_across and the
         // identity-map for per-wallet summary demux below. Each
@@ -1776,7 +1789,7 @@ impl NetworkShieldedCoordinator {
                     id.wallet_id,
                     *id,
                     &recorded,
-                    self.dispatch_context(),
+                    dispatch,
                 )
                 .await
                 {
@@ -2186,6 +2199,11 @@ impl NetworkShieldedCoordinator {
                         // removes exactly the snapshot's reservation.
                         Ok(true) => {}
                         Ok(false) => continue,
+                        // Armed while dispositions were recorded: it waits for
+                        // them to be recorded again.
+                        Err(FileShieldedStoreError::Disposition(
+                            ShieldedDispositionRefusal::RedriveArmed { .. },
+                        )) => continue,
                         Err(e) => {
                             tracing::warn!(
                                 wallet_id = %hex::encode(id.wallet_id),
@@ -2469,6 +2487,9 @@ impl NetworkShieldedCoordinator {
                             .then_some(owner)
                     })
                     .collect();
+                if Self::retirement_waits_for_recording(&store, &owners, &entry.id) {
+                    continue;
+                }
                 for owner in owners {
                     Self::retire_observed_note_spend(
                         &mut store,
@@ -2545,6 +2566,9 @@ impl NetworkShieldedCoordinator {
                             .then_some(owner)
                     })
                     .collect();
+                if Self::retirement_waits_for_recording(&store, &owners, &entry_id) {
+                    continue;
+                }
                 for owner in owners {
                     Self::retire_observed_note_spend(
                         &mut store,
@@ -2560,6 +2584,20 @@ impl NetworkShieldedCoordinator {
             }
         }
         Ok(())
+    }
+
+    /// A redrive armed while dispositions were recorded leaves only with a
+    /// disposition, so while they are not, its activity waits for the scan
+    /// or a recording pass to resolve it.
+    fn retirement_waits_for_recording(
+        store: &FileBackedShieldedStore,
+        owners: &[SubwalletId],
+        activity_id: &[u8; 32],
+    ) -> bool {
+        !store.records_spend_dispositions()
+            && owners
+                .iter()
+                .any(|owner| store.redrive_armed_recording(*owner, activity_id))
     }
 
     /// Retire `owner`'s note-spend redrive for `activity_id` once its
@@ -4459,6 +4497,44 @@ mod tests {
             }
         }
 
+        /// Halfway through setting the hook, the hook is set and nothing that
+        /// reads the switch under the store guard sees recording on, so
+        /// recording is never seen on without the hook.
+        #[tokio::test]
+        async fn recording_is_never_seen_on_without_the_hook() {
+            use crate::wallet::shielded::sync::pass_pause;
+            let dir = temp_dir("release_hook_halfway");
+            let coordinator = Arc::new(coordinator_with_one_wallet(&dir).await);
+            let pause = pass_pause::arm_at(
+                pass_pause::key(&coordinator.store),
+                pass_pause::Point::DispatchSetHalfway,
+            );
+            let setter = tokio::spawn({
+                let coordinator = Arc::clone(&coordinator);
+                async move {
+                    coordinator
+                        .set_shielded_dispatch(Arc::new(AcceptingHook))
+                        .await
+                }
+            });
+            pause.reached.acquire().await.unwrap().forget();
+            assert!(
+                coordinator.dispatch_context().is_some(),
+                "the hook is set before recording"
+            );
+            if let Ok(store) = coordinator.store.try_read() {
+                assert!(
+                    !store.records_spend_dispositions(),
+                    "recording on without the hook"
+                );
+            }
+            pause.resume.add_permits(1);
+            setter.await.unwrap().unwrap();
+            assert!(coordinator.store.read().await.records_spend_dispositions());
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// Setting the hook turns recording on and hands the hook to every
         /// spend; it can be set once and never replaced.
         #[tokio::test]
@@ -4744,7 +4820,7 @@ mod tests {
             }
             let recorded = records.iter().map(|record| record.anchor).collect();
             let mut verdicts = verdicts.into_iter();
-            super::super::super::operations::redrive_pending_spends_with(
+            super::super::super::operations::redrive_pending_spends_admitted(
                 &coordinator.store,
                 None,
                 ID.wallet_id,
@@ -5114,6 +5190,206 @@ mod tests {
                 .is_empty());
             assert!(coordinator
                 .pending_spend_redrives(ID.wallet_id)
+                .await
+                .unwrap()
+                .is_empty());
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Reopened without a hook, a spend armed while a hook was set whose
+        /// outputs are observed before its spend is scanned: the activity pass
+        /// succeeds, the spend stays armed with its note held, and its
+        /// activity stays Pending, with no disposition written.
+        #[tokio::test]
+        async fn hookless_observed_outputs_leave_a_spend_armed_with_a_hook_pending() {
+            let dir = temp_dir("release_observed_hookless");
+            let held = spend(0xAC, &[[0xBD; 32]]);
+            {
+                let coordinator = coordinator_with_one_wallet(&dir).await;
+                coordinator.set_records_spend_dispositions(true).await;
+                arm_with_observed_output(&coordinator, &held, [0xC5; 32]).await;
+            }
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            {
+                // The host restores its note and activity.
+                let mut store = coordinator.store.write().await;
+                store.save_note(ID, &note([0xBD; 32])).unwrap();
+                store
+                    .save_activity(ID, &pending_entry(held.activity_id, vec![[0xC5; 32]]))
+                    .unwrap();
+            }
+            let keys = coordinator.accounts.read().await[&ID].clone();
+            observe_output(&coordinator, [0xD7; 32], [0xC5; 32]).await;
+            let mut failed = None;
+            let derived = coordinator
+                .derive_activity_into_changeset(
+                    &[(ID, keys)],
+                    &mut ShieldedChangeSet::default(),
+                    &mut failed,
+                )
+                .await;
+            assert!(derived.is_ok(), "the activity pass succeeds: {derived:?}");
+            assert_eq!(failed, None);
+            assert_eq!(
+                status(&coordinator, &held.activity_id).await,
+                ShieldedActivityStatus::Pending
+            );
+            assert_eq!(
+                coordinator
+                    .pending_spend_redrives(ID.wallet_id)
+                    .await
+                    .unwrap(),
+                vec![(ID, held.clone())]
+            );
+            assert!(coordinator
+                .spend_dispositions(ID.wallet_id)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(!unspent(&*coordinator.store.read().await, ID).contains(&[0xBD; 32]));
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Reopened without a hook, a spend armed while a hook was set whose
+        /// outputs the scan reconstructs as a new activity entry: the
+        /// activity pass succeeds and saves nothing for it, and the spend
+        /// stays armed with no disposition written.
+        #[tokio::test]
+        async fn hookless_reconstructed_entry_waits_for_a_spend_armed_with_a_hook() {
+            let input = [0xB9; 32];
+            let output_cmx = [0xC6; 32];
+            /// A hookless coordinator under `dir` holding the spend's input and
+            /// an observed output, as the host restores them.
+            async fn restored(dir: &std::path::Path) -> NetworkShieldedCoordinator {
+                let coordinator = coordinator_with_one_wallet(dir).await;
+                coordinator
+                    .store
+                    .write()
+                    .await
+                    .save_note(ID, &note([0xB9; 32]))
+                    .unwrap();
+                observe_output(&coordinator, [0xD8; 32], [0xC6; 32]).await;
+                coordinator
+            }
+            async fn derive(
+                coordinator: &NetworkShieldedCoordinator,
+            ) -> Result<(), PlatformWalletError> {
+                let keys = coordinator.accounts.read().await[&ID].clone();
+                coordinator
+                    .derive_activity_into_changeset(
+                        &[(ID, keys)],
+                        &mut ShieldedChangeSet::default(),
+                        &mut None,
+                    )
+                    .await
+            }
+            // The entry id the scan gives these outputs.
+            let probe_dir = temp_dir("release_reconstructed_probe");
+            let entry_id = {
+                let probe = restored(&probe_dir).await;
+                derive(&probe).await.unwrap();
+                let entries = probe
+                    .store
+                    .read()
+                    .await
+                    .get_activity(ID, 0, usize::MAX)
+                    .unwrap();
+                entries
+                    .into_iter()
+                    .find(|entry| entry.note_cmxs.contains(&output_cmx))
+                    .expect("the scan reconstructs an entry for the output")
+                    .id
+            };
+            let _ = std::fs::remove_dir_all(&probe_dir);
+
+            let dir = temp_dir("release_reconstructed_hookless");
+            let held = PendingRedrive {
+                activity_id: entry_id,
+                ..spend(0xAF, &[input])
+            };
+            {
+                let coordinator = coordinator_with_one_wallet(&dir).await;
+                coordinator.set_records_spend_dispositions(true).await;
+                arm_reserved(&mut *coordinator.store.write().await, ID, &held);
+            }
+            let coordinator = restored(&dir).await;
+            let derived = derive(&coordinator).await;
+            assert!(derived.is_ok(), "the activity pass succeeds: {derived:?}");
+            assert!(coordinator
+                .store
+                .read()
+                .await
+                .get_activity_by_entry_id(ID, &entry_id)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                coordinator
+                    .pending_spend_redrives(ID.wallet_id)
+                    .await
+                    .unwrap(),
+                vec![(ID, held.clone())]
+            );
+            assert!(coordinator
+                .spend_dispositions(ID.wallet_id)
+                .await
+                .unwrap()
+                .is_empty());
+            drop(coordinator);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Reopened without a hook, a spend armed while a hook was set whose
+        /// anchor is pruned: the prune keeps it armed with its note held and
+        /// its activity Pending, while one armed without a hook is released.
+        #[tokio::test]
+        async fn hookless_prune_keeps_a_spend_armed_with_a_hook() {
+            let dir = temp_dir("release_prune_hookless");
+            let marked = spend(0xAD, &[[0xBE; 32]]);
+            let unrecorded = spend(0xAE, &[[0xBF; 32]]);
+            {
+                let coordinator = coordinator_with_one_wallet(&dir).await;
+                coordinator.set_records_spend_dispositions(true).await;
+                arm_with_activity(&coordinator, &marked).await;
+            }
+            let coordinator = coordinator_with_one_wallet(&dir).await;
+            {
+                // The host restores its note and activity.
+                let mut store = coordinator.store.write().await;
+                store.save_note(ID, &note([0xBE; 32])).unwrap();
+                store
+                    .save_activity(ID, &pending_entry(marked.activity_id, vec![]))
+                    .unwrap();
+            }
+            arm_with_activity(&coordinator, &unrecorded).await;
+            let snapshot = stale_snapshot(&coordinator).await;
+            assert_eq!(snapshot.len(), 2);
+            assert!(coordinator
+                .release_stranded_spends(snapshot, &HashSet::new())
+                .await
+                .is_empty());
+            assert_eq!(
+                coordinator
+                    .pending_spend_redrives(ID.wallet_id)
+                    .await
+                    .unwrap(),
+                vec![(ID, marked.clone())]
+            );
+            assert_eq!(
+                unspent(&*coordinator.store.read().await, ID),
+                BTreeSet::from([[0xBF; 32]])
+            );
+            assert_eq!(
+                status(&coordinator, &marked.activity_id).await,
+                ShieldedActivityStatus::Pending
+            );
+            assert_eq!(
+                status(&coordinator, &unrecorded.activity_id).await,
+                ShieldedActivityStatus::Failed
+            );
+            assert!(coordinator
+                .spend_dispositions(ID.wallet_id)
                 .await
                 .unwrap()
                 .is_empty());
