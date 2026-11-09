@@ -5585,6 +5585,10 @@ mod release_tests {
         let test = test.reopen();
         let mut store = test.store.write().await;
         store.set_records_spend_dispositions(true);
+        store.save_note(skipped_id, &note(N1)).unwrap();
+        store.save_note(sent_id, &note(N2)).unwrap();
+        assert!(unspent(&*store, skipped_id).is_empty());
+        assert!(unspent(&*store, sent_id).is_empty());
         assert_eq!(
             store.redrive_row_unsent(sent_id, &sent.activity_id),
             Some(false)
