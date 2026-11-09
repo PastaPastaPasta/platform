@@ -1143,6 +1143,23 @@ impl FileBackedShieldedStore {
         self.resolve_redrive(id, activity_id, disposition).map(drop)
     }
 
+    /// Whether every note `id`'s armed redrive for `activity_id` spends is
+    /// known to this store and not marked spent. Only then can evidence that
+    /// the transition cannot execute from now on, such as a pruned anchor,
+    /// show it never did: an unknown note may have been spent by it unseen.
+    /// This relies on the notes' spent marks and the scan watermark having
+    /// advanced together, which holds while dispositions are recorded
+    /// throughout. `false` when no such redrive is armed.
+    pub(super) fn redrive_inputs_known_unspent(
+        &self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> bool {
+        self.subwallets
+            .get(&id)
+            .is_some_and(|sw| sw.redrive_inputs_known_unspent(activity_id))
+    }
+
     /// Resolve `id`'s note-spend redrive for `activity_id` as
     /// `NotExecuted(Abandoned)` and release its notes, only while the store
     /// shows it was never broadcast. Refused with
@@ -1901,12 +1918,6 @@ impl ShieldedStore for FileBackedShieldedStore {
             sw.unsent_redrives.remove(activity_id);
         }
         Ok(true)
-    }
-
-    fn redrive_inputs_known_unspent(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool {
-        self.subwallets
-            .get(&id)
-            .is_some_and(|sw| sw.redrive_inputs_known_unspent(activity_id))
     }
 
     fn record_outgoing_note(

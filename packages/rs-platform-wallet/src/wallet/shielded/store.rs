@@ -861,13 +861,6 @@ pub trait ShieldedStore: Send + Sync {
         activity_id: &[u8; 32],
     ) -> Result<bool, Self::Error>;
 
-    /// Whether every note `id`'s armed redrive for `activity_id` spends is
-    /// known to this store and not marked spent. Only then can evidence that
-    /// the transition cannot execute from now on, such as a pruned anchor,
-    /// show it never did: an unknown note may have been spent by it unseen.
-    /// `false` when no such redrive is armed.
-    fn redrive_inputs_known_unspent(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool;
-
     // ── Outgoing history (per-subwallet) ───────────────────────────────
 
     /// Record an outgoing (sent) note recovered via OVK for `id`.
@@ -1367,7 +1360,7 @@ impl SubwalletState {
     }
 
     /// Whether every note `activity_id`'s armed redrive spends is known and
-    /// not marked spent. See [`ShieldedStore::redrive_inputs_known_unspent`].
+    /// not marked spent. See `FileBackedShieldedStore::redrive_inputs_known_unspent`.
     pub(super) fn redrive_inputs_known_unspent(&self, activity_id: &[u8; 32]) -> bool {
         self.redrives.get(activity_id).is_some_and(|redrive| {
             redrive.nullifiers.iter().all(|nullifier| {
@@ -1934,12 +1927,6 @@ impl ShieldedStore for InMemoryShieldedStore {
             sw.unsent_redrives.remove(activity_id);
             sw.redrives.contains_key(activity_id)
         }))
-    }
-
-    fn redrive_inputs_known_unspent(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool {
-        self.subwallets
-            .get(&id)
-            .is_some_and(|sw| sw.redrive_inputs_known_unspent(activity_id))
     }
 
     fn record_outgoing_note(
