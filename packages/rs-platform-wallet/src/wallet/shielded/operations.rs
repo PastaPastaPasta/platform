@@ -2895,7 +2895,9 @@ fn resolve_if_armed<S: ShieldedStore>(
 /// spend's activity is resolved `Unresolved(Cancelled)` instead, which holds
 /// the notes until the disposition is acknowledged: an armed record may have
 /// been broadcast, and no failure of a later send proves it never executed.
-/// If the write fails, nothing is released.
+/// If the write fails, nothing is released. Callers mark the activity Failed
+/// before this runs and learn nothing of the write's outcome, so a caller
+/// that arms a record before its first send must not reuse that ordering.
 async fn cancel_pending<S: ShieldedStore>(
     store: &Arc<RwLock<S>>,
     id: SubwalletId,
@@ -3358,7 +3360,9 @@ where
         // A record armed before its first send becomes possibly sent here,
         // durably, before anything goes out. While dispositions are recorded,
         // a record resolved since it was read (for example abandoned) is not
-        // sent.
+        // sent. With recording off, a record armed by an earlier recording
+        // session is still marked sent first, and a failed mark skips the
+        // send.
         let (marked, recording_now) = {
             let mut guard = store.write().await;
             (

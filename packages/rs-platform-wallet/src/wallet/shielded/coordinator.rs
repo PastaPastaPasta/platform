@@ -2019,10 +2019,11 @@ impl NetworkShieldedCoordinator {
     /// snapshot (`stale_pending_spends` returns only anchored entries).
     ///
     /// While the store records spend dispositions, a reservation whose
-    /// snapshot redrive is still armed resolves that redrive as
-    /// `NotExecuted(Pruned)` (`Unresolved(Unattributable)` if one of its
-    /// notes is already spent) under the same guard, releasing all of its
-    /// notes; a reservation another armed redrive holds is skipped. Returns
+    /// snapshot redrive is still armed resolves that redrive under the same
+    /// guard: as `NotExecuted(Pruned)`, releasing all of its notes, when every
+    /// one of them is known and unspent, and otherwise as
+    /// `Unresolved(Unattributable)`, which holds them. A reservation another
+    /// armed redrive holds is skipped. Returns
     /// the wallets whose disposition write failed; their reservations stay.
     async fn release_stranded_spends(
         &self,

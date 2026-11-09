@@ -264,9 +264,11 @@ pub enum UnresolvedReason {
     /// with [`ShieldedDispositionRefusal::ReservationShared`]), one of its
     /// notes was no longer reserved, or one was already marked spent (as a
     /// restored snapshot does). The spend may belong to another transition.
+    /// Also written when the record's anchor was pruned while one of its
+    /// notes was spent or unknown to this store.
     Unattributable,
-    /// The first send failed without a definitive verdict, so the transition
-    /// may still execute.
+    /// A send of an armed record failed. No failure of a later send proves
+    /// that an earlier one never executed.
     Cancelled,
 }
 
