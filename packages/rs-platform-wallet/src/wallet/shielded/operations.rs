@@ -4959,7 +4959,7 @@ mod release_tests {
     use crate::wallet::shielded::store::disposition_contract::{
         action_cmx, arm_reserved, assert_holds_by_value, note, spend, spend_with_actions, unspent,
     };
-    use crate::wallet::shielded::store::ShieldedSpendDispositionRecord;
+    use crate::wallet::shielded::store::{NotExecutedReason, ShieldedSpendDispositionRecord};
     use std::collections::BTreeSet;
 
     const N1: [u8; 32] = [0x61; 32];
@@ -5515,6 +5515,109 @@ mod release_tests {
             [N2].into_iter().collect(),
             "the rejected record's note stays held"
         );
+    }
+
+    /// With the switch off, a record armed unsent by an earlier recording
+    /// session is marked sent before it goes out, and a failed mark skips the
+    /// send. With the switch back on, abandon writes `NotExecuted` only for a
+    /// record whose never-sent state is still durable.
+    #[tokio::test]
+    async fn switch_off_marks_a_retained_unsent_record_sent_before_sending_it() {
+        let test = TestStore::open("unsent_off_then_on", true);
+        let skipped_id = SubwalletId::new([0xDE; 32], 0);
+        let sent_id = SubwalletId::new([0xDE; 32], 1);
+        let skipped = spend_with_actions(0x89, &[N1]);
+        let sent = spend_with_actions(0x8A, &[N2]);
+        {
+            let mut store = test.store.write().await;
+            for (id, nullifier, redrive) in [(skipped_id, N1, &skipped), (sent_id, N2, &sent)] {
+                store.save_note(id, &note(nullifier)).unwrap();
+                store.mark_pending(id, &nullifier).unwrap();
+                store.arm_unsent_redrive(id, redrive.clone()).unwrap();
+            }
+        }
+        let test = test.reopen();
+        assert!(!test.store.read().await.records_spend_dispositions());
+        let recorded = [skipped.anchor].into_iter().collect();
+        let mut entered = Vec::new();
+        for (id, fail_mark) in [(skipped_id, true), (sent_id, false)] {
+            test.store.read().await.fail_mark_sent(fail_mark);
+            redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+                let bytes =
+                    dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap();
+                let activity_id = if bytes == sent.st_bytes {
+                    sent.activity_id
+                } else {
+                    skipped.activity_id
+                };
+                entered.push((
+                    bytes,
+                    test.store
+                        .try_read()
+                        .expect("the pass holds no store guard while it sends")
+                        .redrive_row_unsent(id, &activity_id),
+                ));
+                async {
+                    Err(dash_sdk::Error::TimeoutReached(
+                        std::time::Duration::from_secs(1),
+                        "waiting".to_string(),
+                    ))
+                }
+            })
+            .await
+            .expect("the switch-off pass does not fail");
+        }
+        assert_eq!(
+            entered,
+            vec![(sent.st_bytes.clone(), Some(false))],
+            "only the record whose mark succeeded went out, after the mark"
+        );
+        {
+            let store = test.store.read().await;
+            assert_eq!(
+                store.redrive_row_unsent(skipped_id, &skipped.activity_id),
+                Some(true)
+            );
+            assert_eq!(store.pending_redrives(skipped_id).unwrap()[0].attempts, 0);
+            assert_eq!(store.pending_redrives(sent_id).unwrap()[0].attempts, 1);
+        }
+
+        let test = test.reopen();
+        let mut store = test.store.write().await;
+        store.set_records_spend_dispositions(true);
+        assert_eq!(
+            store.redrive_row_unsent(sent_id, &sent.activity_id),
+            Some(false)
+        );
+        let refused = store
+            .abandon_unsent_redrive(sent_id, &sent.activity_id)
+            .unwrap_err();
+        assert!(matches!(
+            refused.disposition_refusal(),
+            Some(ShieldedDispositionRefusal::MayHaveBeenBroadcast { .. })
+        ));
+        assert_eq!(
+            store.redrive_row_unsent(skipped_id, &skipped.activity_id),
+            Some(true)
+        );
+        store
+            .abandon_unsent_redrive(skipped_id, &skipped.activity_id)
+            .unwrap();
+        drop(store);
+        assert_eq!(test.disposition_of(sent_id, &sent).await, None);
+        assert_eq!(
+            test.disposition_of(skipped_id, &skipped).await,
+            Some(ShieldedSpendDisposition::NotExecuted(
+                NotExecutedReason::Abandoned
+            ))
+        );
+        let store = test.store.read().await;
+        assert_eq!(store.pending_redrives(sent_id).unwrap().len(), 1);
+        assert!(
+            unspent(&*store, sent_id).is_empty(),
+            "the sent record stays held"
+        );
+        assert_eq!(unspent(&*store, skipped_id), [N1].into_iter().collect());
     }
 
     /// One redrive pass whose broadcast checks it sends the stored bytes and
