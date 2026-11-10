@@ -545,8 +545,9 @@ impl NetworkShieldedCoordinator {
     /// Set the host's dispatch hook for this network's shielded note
     /// spends (see [`ShieldedDispatch`]). From then on every note spend
     /// through a wallet of this network is armed durably before the hook is
-    /// awaited, and broadcast only once it returns `Ok`; every rebroadcast by
-    /// a sync pass first awaits [`ShieldedDispatch::admit`].
+    /// awaited, and broadcast only once it returns `Ok`; every rebroadcast of
+    /// such a spend by a sync pass first awaits [`ShieldedDispatch::admit`].
+    /// A spend armed while no hook was set is rebroadcast as if none were.
     ///
     /// Setting it also turns on spend-disposition recording
     /// ([`Self::spend_dispositions`]) for good. The hook can't be replaced
@@ -554,16 +555,16 @@ impl NetworkShieldedCoordinator {
     /// second call is refused with
     /// [`PlatformWalletError::InvalidParameter`] and changes nothing.
     ///
-    /// While recording is on, a disposition the note scan cannot record
-    /// fails that pass for its own wallet only: that wallet's watermarks
-    /// don't advance, the pass's later steps (redrive, prune, balances,
-    /// activity, identity redrive, host hand-off and hold lift) skip it, its
-    /// outcome is an error, and the next pass retries it. Every other
-    /// wallet's pass goes on as usual, so a failure that persists repeats
-    /// for its wallet on every pass until its cause is fixed. A failure in
-    /// the later redrive, prune and activity steps is also reported only for
-    /// its own wallet, though a failed activity step skips that step for the
-    /// wallets after it until the next pass.
+    /// A scan commit that fails, for example a disposition the scan can't
+    /// record, fails that pass for its own wallet only: that wallet's
+    /// watermarks don't advance, the pass's later steps (redrive, prune,
+    /// balances, activity, identity redrive, host hand-off and hold lift)
+    /// skip it, its outcome is an error, and the next pass retries it. Every
+    /// other wallet's pass goes on as usual, so a failure that persists
+    /// repeats for its wallet on every pass until its cause is fixed. A
+    /// failure in the later redrive, prune and activity steps is also
+    /// reported only for its own wallet, though a failed activity step skips
+    /// that step for the wallets after it until the next pass.
     ///
     /// Neither the hook nor recording is stored: a reopened store starts
     /// without both. Set it after every open, before the first spend or
@@ -571,7 +572,8 @@ impl NetworkShieldedCoordinator {
     /// releases its notes; its scan still resolves one it sees land. A sync
     /// pass reads the hook once when it starts, so one set while it runs
     /// applies from the next pass. A spend already being built when it is
-    /// set is refused before its broadcast.
+    /// set is refused before its broadcast, unless the broadcast had already
+    /// started.
     pub async fn set_shielded_dispatch(
         &self,
         hook: Arc<dyn ShieldedDispatch>,

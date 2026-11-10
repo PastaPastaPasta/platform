@@ -705,7 +705,8 @@ pub trait ShieldedStore: Send + Sync {
     /// record is refused with [`ShieldedDispositionRefusal::RedriveArmed`];
     /// resolve it with [`Self::resolve_redrive`] instead. Identity-debit
     /// guards are still cleared. While it is off, so is a record armed while
-    /// it was on ([`Self::redrive_armed_recording`]).
+    /// it was on, also one the store could not load when it opened (which
+    /// [`Self::redrive_armed_recording`] doesn't report).
     fn clear_redrive(&mut self, id: SubwalletId, activity_id: &[u8; 32])
         -> Result<(), Self::Error>;
 
@@ -796,12 +797,12 @@ pub trait ShieldedStore: Send + Sync {
     /// return their keys (`st_hash`). They stay held. Other holds are
     /// untouched.
     ///
-    /// A sync pass that covered `id` calls this after applying the spent
-    /// nullifiers it scanned, under the same store write guard. A marked hold
-    /// is from then on held like any other: no later pass marks it again, and
-    /// only [`lift_scanned_holds`](Self::lift_scanned_holds) with the keys
-    /// returned here, or [`ack_disposition`](Self::ack_disposition), lifts
-    /// it.
+    /// A sync pass that covered `id` calls this just before applying the
+    /// spent nullifiers it scanned, under the same store write guard. A
+    /// marked hold is from then on held like any other: no later pass marks
+    /// it again, and only [`lift_scanned_holds`](Self::lift_scanned_holds)
+    /// with the keys returned here, or
+    /// [`ack_disposition`](Self::ack_disposition), lifts it.
     fn mark_holds_scanned(&mut self, id: SubwalletId) -> Result<Vec<[u8; 32]>, Self::Error>;
 
     /// Lift the holds of `id` that [`mark_holds_scanned`](Self::mark_holds_scanned)
@@ -1097,6 +1098,12 @@ pub trait ShieldedStore: Send + Sync {
     /// marked: its spend may still land after any scan while its anchor is
     /// recorded, and the anchor is gone with the record, so only
     /// [`ack_disposition`](Self::ack_disposition) lifts it.
+    ///
+    /// A durable record armed while dispositions were recorded that the
+    /// store could not load when it opened (it was retained and skipped as
+    /// damaged) has no record to resolve, so it is kept, with a warning; the
+    /// rest of the purge goes on. A wallet added again under the same id
+    /// finds it retained and skipped again.
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error>;
 
     /// Drop the account-scoped state and nullifier-backed redrives for exactly
@@ -1110,11 +1117,17 @@ pub trait ShieldedStore: Send + Sync {
     /// changed — their stored notes belong to the old key) are
     /// purged, so the accounts that remain bound keep their fresh
     /// in-memory notes and watermarks across the re-bind.
+    ///
+    /// Keeps a damaged durable record armed while dispositions were recorded,
+    /// as [`Self::purge_wallet`] does.
     fn purge_subwallet(&mut self, id: SubwalletId) -> Result<(), Self::Error>;
 
     /// Drop ALL in-memory per-subwallet state for every subwallet
     /// of every wallet. The shared commitment tree is left
     /// untouched. Used by `NetworkShieldedCoordinator::clear()`.
+    ///
+    /// Keeps a damaged durable record armed while dispositions were recorded,
+    /// as [`Self::purge_wallet`] does.
     fn purge_all_subwallets(&mut self) -> Result<(), Self::Error>;
 
     /// Empty the shared commitment tree back to zero leaves.

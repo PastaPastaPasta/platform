@@ -781,10 +781,12 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
 }
 
 /// What a completed pass commits for its subwallets after saving its
-/// receipts, under its store write guard: the spent nullifiers it scanned
-/// ([`apply_scanned_nullifier_spends`]), then the marking of the holds a
-/// wallet removal left for the subwallet's next completed scan
-/// ([`ShieldedStore::mark_holds_scanned`]).
+/// receipts, under its store write guard: the marking of the holds a wallet
+/// removal left for the subwallet's next completed scan
+/// ([`ShieldedStore::mark_holds_scanned`]), then the spent nullifiers it
+/// scanned ([`apply_scanned_nullifier_spends`]). A failed marking returns
+/// before any note is marked spent, so a retry still reports each spend as
+/// newly detected.
 ///
 /// The marked holds stay held. Returns the per-subwallet count of notes
 /// newly flipped to spent and, per subwallet, the holds it marked; the
@@ -796,8 +798,6 @@ pub(super) fn commit_scan<S: ShieldedStore>(
     scanned_nullifiers: &[[u8; 32]],
     changeset: &mut ShieldedChangeSet,
 ) -> Result<ScanCommit, S::Error> {
-    let newly_spent =
-        apply_scanned_nullifier_spends(store, subwallet_ids, scanned_nullifiers, changeset)?;
     let mut scanned_holds = BTreeMap::new();
     for id in subwallet_ids {
         let scanned = store.mark_holds_scanned(*id)?;
@@ -805,6 +805,8 @@ pub(super) fn commit_scan<S: ShieldedStore>(
             scanned_holds.insert(*id, scanned);
         }
     }
+    let newly_spent =
+        apply_scanned_nullifier_spends(store, subwallet_ids, scanned_nullifiers, changeset)?;
     Ok((newly_spent, scanned_holds))
 }
 
@@ -815,7 +817,7 @@ pub(super) type ScanCommit = (
     BTreeMap<SubwalletId, Vec<[u8; 32]>>,
 );
 
-/// Commit the scan's spends and mark the holds awaiting it as scanned
+/// Mark the holds awaiting the scan as scanned and commit its spends
 /// ([`commit_scan`]), then advance the subwallets' watermarks to
 /// `new_index`, one wallet at a time. A failed write fails only its wallet:
 /// it returns before that wallet's watermarks move, so the next pass rescans
@@ -1674,6 +1676,71 @@ mod disposition_tests {
             disposition_of(&store, failing, &failing_spend),
             Some(ShieldedSpendDisposition::Executed)
         );
+    }
+
+    /// A wallet whose scan can't mark the holds a removal left for it marks
+    /// none of its notes spent, so the retry still reports its spends and
+    /// hands them to the host.
+    #[test]
+    fn a_failed_scan_marking_leaves_the_spends_to_the_retry() {
+        let test = TestStore::new("scan_marking");
+        let id = SubwalletId::new([0xCA; 32], 0);
+        let held = spend_with_actions(0x87, &[[0x6C; 32]]);
+        let spent = [0x6D; 32];
+        let mut store = test.open();
+        arm_reserved(&mut store, id, &held);
+        store
+            .resolve_redrive(
+                id,
+                &held.activity_id,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+            )
+            .unwrap();
+        store.purge_wallet(id.wallet_id).unwrap();
+        // The wallet is added again and its host restores a note unspent.
+        store.save_note(id, &note(spent)).unwrap();
+        store.set_last_synced_note_index(id, 10).unwrap();
+
+        store.fail_disposition_updates(true);
+        let mut changeset = ShieldedChangeSet::default();
+        assert!(
+            apply_spends_and_advance(
+                &mut store,
+                &[id],
+                &[spent],
+                &BTreeMap::new(),
+                20,
+                &mut changeset
+            )
+            .is_err(),
+            "a failed marking fails the wallet"
+        );
+        assert_eq!(store.last_synced_note_index(id).unwrap(), 10);
+        assert_eq!(unspent(&store, id), BTreeSet::from([spent]));
+
+        store.fail_disposition_updates(false);
+        let mut changeset = ShieldedChangeSet::default();
+        let (newly_spent, scanned_holds) = apply_spends_and_advance(
+            &mut store,
+            &[id],
+            &[spent],
+            &BTreeMap::new(),
+            20,
+            &mut changeset,
+        )
+        .expect("retry");
+        assert_eq!(
+            newly_spent.get(&id),
+            Some(&1),
+            "the retry reports the spend"
+        );
+        assert_eq!(
+            changeset.nullifiers_spent.get(&id),
+            Some(&vec![spent]),
+            "the retry hands the spend to the host"
+        );
+        assert_eq!(scanned_holds.get(&id), Some(&vec![held.st_hash()]));
+        assert_eq!(store.last_synced_note_index(id).unwrap(), 20);
     }
 
     /// A pass resolves a record `Executed`, and the process ends before the

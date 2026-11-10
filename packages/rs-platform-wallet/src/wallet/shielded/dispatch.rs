@@ -10,8 +10,12 @@
 //! 2. it awaits [`ShieldedDispatch::dispatch`]. A refusal records the spend
 //!    `NotExecuted(Refused)`, frees its notes and sends nothing;
 //! 3. only then is the transition broadcast;
-//! 4. every rebroadcast of an armed record by a sync pass first awaits
-//!    [`ShieldedDispatch::admit`]; a refusal skips it for that pass.
+//! 4. every rebroadcast by a sync pass of a spend armed under the hook
+//!    first awaits [`ShieldedDispatch::admit`]; a refusal skips it for that
+//!    pass.
+//!
+//! A spend armed while no hook was set is rebroadcast as if none were, and
+//! never put to [`ShieldedDispatch::admit`].
 //!
 //! [`NetworkShieldedCoordinator::set_shielded_dispatch`]:
 //!     super::NetworkShieldedCoordinator::set_shielded_dispatch
@@ -68,6 +72,10 @@ pub trait ShieldedDispatch: Send + Sync {
     /// recorded under `activity_id` in `wallet_id`'s account
     /// `account_index`. `Err` skips it for this pass; the record stays armed
     /// and its attempt count is unchanged.
+    ///
+    /// It is asked only about spends armed while a hook was set, in this run
+    /// of the process or an earlier one. A spend armed while none was set is
+    /// never put to it: a sync pass rebroadcasts it as if no hook were set.
     ///
     /// This is the only check before such a send, also for a spend whose
     /// [`Self::dispatch`] never returned `Ok` (see there), which may then be

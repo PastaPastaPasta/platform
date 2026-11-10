@@ -860,10 +860,10 @@ impl FileBackedShieldedStore {
         Ok(())
     }
 
-    /// While dispositions are not recorded, refuse to overwrite `id`'s row for
-    /// `activity_id` if it was armed while they were, including a row this
-    /// open could not decode (a damaged mark counts as set).
-    fn refuse_overwriting_armed_recording(
+    /// While dispositions are not recorded, refuse to overwrite or delete
+    /// `id`'s row for `activity_id` if it was armed while they were, including
+    /// a row this open could not decode (a damaged mark counts as set).
+    fn refuse_durably_armed_recording(
         &self,
         id: SubwalletId,
         activity_id: &[u8; 32],
@@ -1300,21 +1300,27 @@ impl FileBackedShieldedStore {
         Ok(keys)
     }
 
-    /// Delete pending-spend rows with `delete` in one transaction, and drop
-    /// the in-scope subwallets' state with `drop_memory` after the commit.
-    /// While the disposition switch is on, every armed note-spend redrive in
-    /// scope (while it is off, every one armed while it was on) is first
-    /// resolved [`UnresolvedReason::Purged`] in the same
-    /// transaction, holding its notes as [`ShieldedStore::resolve_redrive`]
-    /// does; a conflicting disposition fails the purge with nothing changed.
+    /// Delete the pending-spend rows `rows` selects, then run `also`, and
+    /// drop the in-scope subwallets' state with `drop_memory` once that is
+    /// durable. While the disposition switch is on, every armed note-spend
+    /// redrive in scope (while it is off, every one armed while it was on) is
+    /// first resolved [`UnresolvedReason::Purged`] in the same transaction,
+    /// holding its notes as [`ShieldedStore::resolve_redrive`] does; a
+    /// conflicting disposition fails the purge with nothing changed.
     ///
-    /// `transaction` names a multi-statement `delete`, which always runs in
-    /// a transaction; a single statement with no disposition to write runs
-    /// on its own.
+    /// A row armed while dispositions were recorded that this open could not
+    /// decode has no redrive to resolve, so it is kept, with a warning naming
+    /// it, and the rest of the purge goes on. Like every such row it is
+    /// skipped again at the next open.
+    ///
+    /// The purge runs in one transaction named `transaction`, which a purge
+    /// whose `also` writes must pass. With no name and nothing to resolve,
+    /// its only write is one delete statement, run on its own.
     fn purge_pending(
         &mut self,
         in_scope: impl Fn(&SubwalletId) -> bool,
-        delete: impl FnOnce(&rusqlite::Connection) -> Result<(), FileShieldedStoreError>,
+        rows: PurgeRows<'_>,
+        also: impl FnOnce(&rusqlite::Connection) -> Result<(), FileShieldedStoreError>,
         drop_memory: impl FnOnce(&mut Self),
         transaction: Option<&str>,
     ) -> Result<(), FileShieldedStoreError> {
@@ -1334,11 +1340,55 @@ impl FileBackedShieldedStore {
                     .map(|redrive| (*id, redrive))
             })
             .collect();
+        let purge_rows = |conn: &rusqlite::Connection| {
+            let storage =
+                |e: rusqlite::Error| FileShieldedStoreError::Storage(format!("{}: {e}", rows.what));
+            for (id, redrive) in &purged {
+                conn.execute(
+                    "DELETE FROM shielded_pending_spends \
+                     WHERE wallet_id = ?1 AND account_index = ?2 AND activity_id = ?3",
+                    rusqlite::params![
+                        id.wallet_id.as_slice(),
+                        id.account_index,
+                        redrive.activity_id.as_slice(),
+                    ],
+                )
+                .map_err(storage)?;
+            }
+            let mut kept = conn
+                .prepare(&format!(
+                    "SELECT quote(wallet_id), quote(account_index), quote(activity_id) \
+                     FROM shielded_pending_spends WHERE ({}) AND armed_recording IS NOT 0",
+                    rows.condition
+                ))
+                .map_err(storage)?;
+            let kept = kept
+                .query_map(rows.params, |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM shielded_pending_spends WHERE ({}) AND armed_recording = 0",
+                    rows.condition
+                ),
+                rows.params,
+            )
+            .map_err(storage)?;
+            also(conn)?;
+            Ok::<_, FileShieldedStoreError>(kept)
+        };
         let mut written = Vec::with_capacity(purged.len());
-        {
+        let kept = {
             let mut conn = self.pending_conn.lock().expect("pending_conn mutex");
             if purged.is_empty() && transaction.is_none() {
-                delete(&conn)?;
+                purge_rows(&conn)?
             } else {
                 let what = transaction.unwrap_or("purge");
                 let tx = conn
@@ -1359,15 +1409,34 @@ impl FileBackedShieldedStore {
                         written.push(record);
                     }
                 }
-                delete(&tx)?;
+                let kept = purge_rows(&tx)?;
                 tx.commit()
                     .map_err(|e| FileShieldedStoreError::Storage(format!("commit {what}: {e}")))?;
+                kept
             }
+        };
+        for (wallet_id, account_index, activity_id) in kept {
+            tracing::warn!(
+                wallet_id = %wallet_id,
+                account_index = %account_index,
+                activity_id = %activity_id,
+                "purge kept a damaged redrive row armed while spend dispositions were \
+                 recorded; it has no redrive to resolve, so it stays on disk"
+            );
         }
         self.cache_holds(written);
         drop_memory(self);
         Ok(())
     }
+}
+
+/// The pending-spend rows one purge covers: an SQL condition on
+/// `shielded_pending_spends` with its parameters, and the purge's name in
+/// its errors.
+struct PurgeRows<'a> {
+    condition: &'static str,
+    params: &'a [&'a dyn rusqlite::ToSql],
+    what: &'static str,
 }
 
 #[cfg(test)]
@@ -1659,7 +1728,7 @@ impl ShieldedStore for FileBackedShieldedStore {
 
     fn arm_redrive(&mut self, id: SubwalletId, redrive: PendingRedrive) -> Result<(), Self::Error> {
         self.refuse_unresolved_note_spend(id, &redrive.activity_id)?;
-        self.refuse_overwriting_armed_recording(id, &redrive.activity_id)?;
+        self.refuse_durably_armed_recording(id, &redrive.activity_id)?;
         let armed_recording = self.records_dispositions && !redrive.nullifiers.is_empty();
         {
             let conn = self.pending_conn.lock().expect("pending_conn mutex");
@@ -1768,6 +1837,7 @@ impl ShieldedStore for FileBackedShieldedStore {
         activity_id: &[u8; 32],
     ) -> Result<(), Self::Error> {
         self.refuse_unresolved_note_spend(id, activity_id)?;
+        self.refuse_durably_armed_recording(id, activity_id)?;
         if self.redrive_armed_recording(id, activity_id) {
             return Err(ShieldedDispositionRefusal::RedriveArmed {
                 activity_id: *activity_id,
@@ -2317,7 +2387,8 @@ impl ShieldedStore for FileBackedShieldedStore {
         // state on the next open. Delete them first, scoped by
         // wallet_id — SQL before memory, so an Err return means neither
         // store was touched (fail-atomic) rather than a memory purge
-        // the caller can't distinguish from a no-op.
+        // the caller can't distinguish from a no-op. A damaged row armed
+        // while dispositions were recorded stays (see `purge_pending`).
         // The wallet's dispositions stay and keep holding their notes, the
         // Purged ones written here included. Every hold but a Purged one is
         // marked for the next completed scan in the same transaction. A
@@ -2331,14 +2402,12 @@ impl ShieldedStore for FileBackedShieldedStore {
         let marked = std::cell::RefCell::new(Vec::new());
         self.purge_pending(
             |id| id.wallet_id == wallet_id,
+            PurgeRows {
+                condition: "wallet_id = ?1",
+                params: rusqlite::params![wallet_id.as_slice()],
+                what: "purge pending spends for wallet",
+            },
             |conn| {
-                conn.execute(
-                    "DELETE FROM shielded_pending_spends WHERE wallet_id = ?1",
-                    rusqlite::params![wallet_id.as_slice()],
-                )
-                .map_err(|e| {
-                    FileShieldedStoreError::Storage(format!("purge pending spends for wallet: {e}"))
-                })?;
                 *marked.borrow_mut() = Self::mark_holds_for_next_scan(conn, wallet_id)?;
                 Ok(())
             },
@@ -2357,20 +2426,12 @@ impl ShieldedStore for FileBackedShieldedStore {
         // retain those rows and their minimal in-memory state.
         self.purge_pending(
             |scoped| *scoped == id,
-            |conn| {
-                conn.execute(
-                    "DELETE FROM shielded_pending_spends \
-                     WHERE wallet_id = ?1 AND account_index = ?2 \
-                       AND length(nullifiers) > 0",
-                    rusqlite::params![id.wallet_id.as_slice(), id.account_index],
-                )
-                .map(drop)
-                .map_err(|e| {
-                    FileShieldedStoreError::Storage(format!(
-                        "purge pending spends for subwallet: {e}"
-                    ))
-                })
+            PurgeRows {
+                condition: "wallet_id = ?1 AND account_index = ?2 AND length(nullifiers) > 0",
+                params: rusqlite::params![id.wallet_id.as_slice(), id.account_index],
+                what: "purge pending spends for subwallet",
             },
+            |_| Ok(()),
             |store| {
                 let identity_redrives = store
                     .subwallets
@@ -2391,17 +2452,16 @@ impl ShieldedStore for FileBackedShieldedStore {
 
     fn purge_all_subwallets(&mut self) -> Result<(), Self::Error> {
         // Durable redrive rows for every wallet go with the in-memory
-        // purge; SQL first for the same fail-atomic reason as
-        // `purge_wallet`.
+        // purge, except damaged ones armed while dispositions were recorded;
+        // SQL first for the same fail-atomic reason as `purge_wallet`.
         self.purge_pending(
             |_| true,
-            |conn| {
-                conn.execute("DELETE FROM shielded_pending_spends", [])
-                    .map(drop)
-                    .map_err(|e| {
-                        FileShieldedStoreError::Storage(format!("purge all pending spends: {e}"))
-                    })
+            PurgeRows {
+                condition: "1",
+                params: &[],
+                what: "purge all pending spends",
             },
+            |_| Ok(()),
             |store| store.subwallets.clear(),
             None,
         )
@@ -3800,6 +3860,146 @@ mod tests {
             assert_eq!(store.pending_redrives(id).unwrap(), vec![marked]);
             drop(store);
             remove_store_files(&path);
+        }
+
+        /// Arm `redrive` with its notes reserved while dispositions are
+        /// recorded, then damage its durable row so that the next open
+        /// retains it but can't load it.
+        fn arm_damaged_while_recording(
+            path: &std::path::Path,
+            id: SubwalletId,
+            redrive: &PendingRedrive,
+        ) {
+            {
+                let mut store = FileBackedShieldedStore::open_path(path, 100).expect("open");
+                store.set_records_spend_dispositions(true);
+                arm_reserved(&mut store, id, redrive);
+            }
+            let damaged = rusqlite::Connection::open(path)
+                .unwrap()
+                .execute(
+                    "UPDATE shielded_pending_spends SET attempts = -1 WHERE activity_id = ?1",
+                    [redrive.activity_id.as_slice()],
+                )
+                .unwrap();
+            assert_eq!(damaged, 1);
+        }
+
+        /// The activity ids of every durable redrive row at `path`.
+        fn durable_activities(path: &std::path::Path) -> Vec<[u8; 32]> {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            let mut rows = conn
+                .prepare("SELECT activity_id FROM shielded_pending_spends ORDER BY activity_id")
+                .unwrap();
+            rows.query_map([], |row| row.get::<_, [u8; 32]>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+
+        /// With the switch off, clearing a damaged row armed while it was on
+        /// by its activity is refused, and the row stays.
+        #[test]
+        fn a_hookless_clear_redrive_keeps_a_damaged_row_armed_while_recording() {
+            let path = temp_tree_path("damaged_mark_clear_redrive");
+            let id = SubwalletId::new([0xE6; 32], 0);
+            let damaged = disposition_contract::spend_with_actions(0x72, &[[0xF1; 32]]);
+            arm_damaged_while_recording(&path, id, &damaged);
+            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+            assert!(
+                store.pending_redrives(id).unwrap().is_empty(),
+                "the damaged row is skipped"
+            );
+            assert!(matches!(
+                store
+                    .clear_redrive(id, &damaged.activity_id)
+                    .expect_err("refused")
+                    .disposition_refusal(),
+                Some(ShieldedDispositionRefusal::RedriveArmed { activity_id })
+                    if *activity_id == damaged.activity_id
+            ));
+            assert_eq!(durable_activities(&path), vec![damaged.activity_id]);
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// With the switch off, a clear by a nullifier that a damaged row
+        /// armed while it was on shares with a record armed while it was off
+        /// releases that record and deletes its row only.
+        #[test]
+        fn a_hookless_clear_pending_keeps_a_damaged_row_armed_while_recording() {
+            let path = temp_tree_path("damaged_mark_clear_pending");
+            let id = SubwalletId::new([0xE8; 32], 0);
+            let input = [0xF5; 32];
+            let damaged = disposition_contract::spend_with_actions(0x77, &[input]);
+            let unrecorded = disposition_contract::spend_with_actions(0x78, &[input]);
+            arm_damaged_while_recording(&path, id, &damaged);
+            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+            arm_reserved(&mut store, id, &unrecorded);
+            assert!(store.clear_pending(id, &input).unwrap());
+            assert!(store.pending_redrives(id).unwrap().is_empty());
+            assert_eq!(
+                durable_activities(&path),
+                vec![damaged.activity_id],
+                "only the released record's row goes"
+            );
+            drop(store);
+            remove_store_files(&path);
+        }
+
+        /// With the switch off, each purge keeps a damaged row armed while it
+        /// was on and purges the rest of its scope: a record armed while it
+        /// was on is resolved Purged, one armed while it was off goes. A
+        /// reopen skips the kept row again.
+        #[test]
+        fn hookless_purges_keep_a_damaged_row_armed_while_recording() {
+            for scope in ["wallet", "account", "all"] {
+                let path = temp_tree_path(&format!("damaged_mark_purge_{scope}"));
+                let id = SubwalletId::new([0xE7; 32], 0);
+                let damaged = disposition_contract::spend_with_actions(0x74, &[[0xF2; 32]]);
+                let marked = disposition_contract::spend_with_actions(0x75, &[[0xF3; 32]]);
+                let unrecorded = disposition_contract::spend_with_actions(0x76, &[[0xF4; 32]]);
+                arm_damaged_while_recording(&path, id, &damaged);
+                {
+                    let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                    store.set_records_spend_dispositions(true);
+                    arm_reserved(&mut store, id, &marked);
+                }
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                arm_reserved(&mut store, id, &unrecorded);
+                assert_eq!(store.pending_redrives(id).unwrap().len(), 2);
+                match scope {
+                    "wallet" => store.purge_wallet(id.wallet_id),
+                    "account" => store.purge_subwallet(id),
+                    _ => store.purge_all_subwallets(),
+                }
+                .unwrap_or_else(|e| panic!("{scope} purge: {e}"));
+                assert!(store.pending_redrives(id).unwrap().is_empty(), "{scope}");
+                assert_eq!(
+                    durable_activities(&path),
+                    vec![damaged.activity_id],
+                    "{scope} purge keeps the damaged row only"
+                );
+                assert_eq!(
+                    store
+                        .dispositions(id.wallet_id)
+                        .unwrap()
+                        .into_iter()
+                        .map(|record| (record.st_hash, record.disposition))
+                        .collect::<Vec<_>>(),
+                    vec![(
+                        marked.st_hash(),
+                        ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged)
+                    )],
+                    "{scope}"
+                );
+                drop(store);
+                let store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                assert!(store.pending_redrives(id).unwrap().is_empty(), "{scope}");
+                assert_eq!(durable_activities(&path), vec![damaged.activity_id]);
+                drop(store);
+                remove_store_files(&path);
+            }
         }
 
         /// A store written before the recording mark existed: its rows,

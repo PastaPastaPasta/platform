@@ -3689,8 +3689,9 @@ pub(super) async fn redrive_pending_identity_shields<S: ShieldedStore>(
 /// first, and a failed write is returned after the remaining records were
 /// tried, so the sync pass reports it and the next pass retries.
 ///
-/// With a dispatch hook set (`dispatch`), each re-broadcast is first
-/// admitted by the hook (see [`redrive_pending_spends_gated`]).
+/// With a dispatch hook set (`dispatch`), each re-broadcast of a record
+/// armed while it was set is first admitted by the hook (see
+/// [`redrive_pending_spends_gated`]).
 pub(super) async fn redrive_pending_spends_dispatched<S: ShieldedStore>(
     sdk: &Arc<dash_sdk::Sdk>,
     store: &Arc<RwLock<S>>,
@@ -3789,13 +3790,19 @@ where
 }
 
 /// [`redrive_pending_spends_dispatched`] with each re-broadcast made by
-/// `broadcast`, gated by `dispatch` when set: each
-/// record is first admitted by the hook
+/// `broadcast`, gated by `dispatch` when set: a record armed while
+/// dispositions were recorded is first admitted by the hook
 /// ([`ShieldedDispatch::admit`](super::ShieldedDispatch::admit), awaited
 /// with no store guard held), and a record whose transition is in flight,
 /// from a first send or another rebroadcast, is skipped. Either skip leaves
 /// its attempt count unchanged. A rebroadcast holds its transition in flight
-/// until its outcome is handled.
+/// until its outcome is handled. Any other record is re-broadcast without
+/// asking the hook.
+///
+/// Whether a record was armed while dispositions were recorded is read with
+/// the pass's records. A pass without a hook never sends such a record, even
+/// if it is resolved, removed or armed again before its turn, and no pass
+/// sends such a record once it is no longer armed.
 async fn redrive_pending_spends_gated<S: ShieldedStore, F>(
     store: &Arc<RwLock<S>>,
     persister: Option<&WalletPersister>,
@@ -3812,10 +3819,16 @@ where
 
     let (redrives, recording) = {
         let guard = store.read().await;
-        (
-            guard.pending_redrives(id),
-            guard.records_spend_dispositions(),
-        )
+        let redrives = guard.pending_redrives(id).map(|redrives| {
+            redrives
+                .into_iter()
+                .map(|redrive| {
+                    let armed_recording = guard.redrive_armed_recording(id, &redrive.activity_id);
+                    (redrive, armed_recording)
+                })
+                .collect::<Vec<_>>()
+        });
+        (redrives, guard.records_spend_dispositions())
     };
     let redrives = match redrives {
         Ok(r) => r,
@@ -3832,7 +3845,7 @@ where
         }
     };
     let mut failure = None;
-    for redrive in redrives {
+    for (redrive, armed_recording) in redrives {
         // Empty-nullifier identity debits are wallet-wide and are driven by
         // `redrive_pending_identity_shields`, independently of spending anchors.
         if redrive.nullifiers.is_empty() {
@@ -3863,6 +3876,16 @@ where
                 debug!("redrive: the record is in flight; skipping it this pass");
                 continue;
             }
+        }
+        let mut admitted = false;
+        if armed_recording {
+            let Some(dispatch) = dispatch else {
+                debug!(
+                    "redrive: the record was armed while spend dispositions were recorded; \
+                     it waits for a pass with the dispatch hook"
+                );
+                continue;
+            };
             if let Err(refused) = dispatch
                 .hook
                 .admit(
@@ -3879,23 +3902,24 @@ where
                 );
                 continue;
             }
+            admitted = true;
         }
         // A record armed before its first send becomes possibly sent here,
         // durably, before anything goes out. While dispositions are recorded,
         // a record resolved since it was read (for example abandoned) is not
         // sent. A record armed while dispositions were recorded is sent only
-        // by a pass with a hook while they still are: the hook alone admits
-        // it, and a send while they are not would settle it without one. Any
-        // other record is marked sent first, and a failed mark skips the send.
+        // once the hook admitted it in this pass, while they still are: a
+        // send while they are not would settle it without the hook. Any other
+        // record is marked sent first, and a failed mark skips the send.
         let (marked, recording_now, _in_flight) = {
             let mut guard = store.write().await;
             let recording_now = guard.records_spend_dispositions();
-            if !(dispatch.is_some() && recording_now)
+            if !(admitted && recording_now)
                 && guard.redrive_armed_recording(id, &redrive.activity_id)
             {
                 debug!(
                     "redrive: the record was armed while spend dispositions were recorded; \
-                     it waits for a pass with the dispatch hook"
+                     it waits for a pass whose dispatch hook admits it"
                 );
                 continue;
             }
@@ -3916,6 +3940,13 @@ where
             )
         };
         match marked {
+            Ok(false) if armed_recording => {
+                debug!(
+                    "redrive: the record armed while spend dispositions were recorded is \
+                     no longer armed; not sending it"
+                );
+                continue;
+            }
             Ok(false) if recording_now => continue,
             Ok(_) => {}
             Err(e) => {
@@ -6219,6 +6250,144 @@ mod release_tests {
         );
     }
 
+    /// With dispositions not recorded, arm one record of `N1` the way a
+    /// spend without the switch does and one of `N2` never sent while the
+    /// switch was on, both on the recorded anchor.
+    async fn arm_unrecorded_and_unsent_marked(
+        test: &TestStore,
+        id: SubwalletId,
+    ) -> (PendingRedrive, PendingRedrive) {
+        let unrecorded = spend_with_actions(0x89, &[N1]);
+        let marked = spend_with_actions(0x8A, &[N2]);
+        let mut store = test.store.write().await;
+        store.set_records_spend_dispositions(false);
+        arm_reserved(&mut *store, id, &unrecorded);
+        store.set_records_spend_dispositions(true);
+        store.save_note(id, &note(N2)).unwrap();
+        store.mark_pending(id, &N2).unwrap();
+        store.arm_unsent_redrive(id, marked.clone()).unwrap();
+        store.set_records_spend_dispositions(false);
+        (unrecorded, marked)
+    }
+
+    /// A pass without a hook never sends a record armed while dispositions
+    /// were recorded, even once the record is gone: one whose wallet is
+    /// purged while the pass sends an earlier record is not sent, and keeps
+    /// its Purged disposition and held notes.
+    #[tokio::test]
+    async fn a_hookless_pass_never_sends_a_record_armed_while_recording_after_its_purge() {
+        let test = TestStore::open("purged_mid_pass", true);
+        let id = SubwalletId::new([0xD7; 32], 0);
+        let (unrecorded, purged) = arm_unrecorded_and_unsent_marked(&test, id).await;
+        let recorded = [unrecorded.anchor].into_iter().collect();
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            if sent.len() == 1 {
+                test.store
+                    .try_write()
+                    .expect("the pass holds no store guard while it sends")
+                    .purge_wallet(id.wallet_id)
+                    .unwrap();
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![unrecorded.st_bytes.clone()],
+            "the purged record is not sent"
+        );
+        assert_eq!(
+            test.disposition_of(id, &purged).await,
+            Some(ShieldedSpendDisposition::Unresolved(
+                UnresolvedReason::Purged
+            ))
+        );
+        assert_eq!(test.held_by(id, &purged).await, vec![N2]);
+        assert!(test
+            .store
+            .read()
+            .await
+            .pending_redrives(id)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A pass without a hook skips a record by the mark it read with the
+    /// pass's records: one armed again without the mark before its turn is
+    /// still not sent by that pass.
+    #[tokio::test]
+    async fn a_hookless_pass_skips_a_record_armed_while_recording_and_armed_again_unmarked() {
+        let test = TestStore::open("rearmed_mid_pass", true);
+        let id = SubwalletId::new([0xD9; 32], 0);
+        let (unrecorded, rearmed) = arm_unrecorded_and_unsent_marked(&test, id).await;
+        let recorded = [unrecorded.anchor].into_iter().collect();
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            if sent.len() == 1 {
+                let mut store = test
+                    .store
+                    .try_write()
+                    .expect("the pass holds no store guard while it sends");
+                store.purge_wallet(id.wallet_id).unwrap();
+                store.arm_redrive(id, rearmed.clone()).unwrap();
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![unrecorded.st_bytes.clone()],
+            "the record read as marked is not sent"
+        );
+        let store = test.store.read().await;
+        assert!(!store.redrive_armed_recording(id, &rearmed.activity_id));
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![rearmed.clone()]);
+    }
+
+    /// With a hook while dispositions are not recorded, a state only tests
+    /// reach, a record armed while they were that is purged before its turn
+    /// is not sent, though the hook admits it.
+    #[tokio::test]
+    async fn an_admitted_record_armed_while_recording_is_not_sent_once_purged() {
+        let test = TestStore::open("admitted_purged_mid_pass", true);
+        let id = SubwalletId::new([0xDB; 32], 0);
+        let (unrecorded, purged) = arm_unrecorded_and_unsent_marked(&test, id).await;
+        let recorded = [unrecorded.anchor].into_iter().collect();
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_admitted(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            if sent.len() == 1 {
+                test.store
+                    .try_write()
+                    .expect("the pass holds no store guard while it sends")
+                    .purge_wallet(id.wallet_id)
+                    .unwrap();
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![unrecorded.st_bytes.clone()],
+            "the purged record is not sent"
+        );
+        assert_eq!(
+            test.disposition_of(id, &purged).await,
+            Some(ShieldedSpendDisposition::Unresolved(
+                UnresolvedReason::Purged
+            ))
+        );
+    }
+
     /// A record armed while dispositions were recorded is sent only by a pass
     /// with a hook while they still are: not by a pass without one while the
     /// switch is on, nor after it turns on during the pass, nor by a pass
@@ -7645,6 +7814,64 @@ mod dispatch_tests {
         assert_eq!(fixture.redrives().await[0].attempts, 1);
     }
 
+    /// A pass with the hook asks it only about the record armed while
+    /// dispositions were recorded: one armed before is rebroadcast without
+    /// asking, and the other goes out only once the hook admits it.
+    #[tokio::test]
+    async fn a_hooked_pass_asks_admit_only_for_a_record_armed_under_the_hook() {
+        async fn pass(fixture: &Fixture, hook: &Arc<TestHook>) -> Vec<Vec<u8>> {
+            let mut sent = Vec::new();
+            redrive_pending_spends_gated(
+                &fixture.store,
+                None,
+                ID.wallet_id,
+                ID,
+                &recorded(),
+                Some(&context(hook)),
+                |st| {
+                    sent.push(st.serialize_to_bytes().unwrap());
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .unwrap();
+            sent
+        }
+
+        let fixture = Fixture::new("admit_marked_only", &[N1, N2]);
+        let before = spend_with_actions(0x4A, &[N1]);
+        let under = spend_with_actions(0x4B, &[N2]);
+        {
+            let mut store = fixture.store.write().await;
+            store.set_records_spend_dispositions(false);
+            store
+                .set_pending_spend(ID, &N1, before.anchor, before.activity_id)
+                .unwrap();
+            store.arm_redrive(ID, before.clone()).unwrap();
+            store.set_records_spend_dispositions(true);
+            store
+                .set_pending_spend(ID, &N2, under.anchor, under.activity_id)
+                .unwrap();
+            store.arm_redrive(ID, under.clone()).unwrap();
+        }
+
+        let refusing = TestHook::new(&fixture, Answer::Accept, false);
+        assert_eq!(
+            pass(&fixture, &refusing).await,
+            vec![before.st_bytes.clone()],
+            "the record armed before the hook is sent without it"
+        );
+        assert_eq!(*refusing.admitted.lock().unwrap(), vec![under.st_hash()]);
+
+        let admitting = TestHook::new(&fixture, Answer::Accept, true);
+        assert_eq!(
+            pass(&fixture, &admitting).await,
+            vec![before.st_bytes.clone(), under.st_bytes.clone()],
+            "the admitted record is sent"
+        );
+        assert_eq!(*admitting.admitted.lock().unwrap(), vec![under.st_hash()]);
+    }
+
     /// A record whose transition is in flight is skipped by the redrive
     /// pass, with no attempt counted; once released it is sent again.
     #[tokio::test]
@@ -7980,7 +8207,7 @@ mod dispatch_tests {
     /// without one: passes without a hook send nothing, keep its notes held
     /// and its activity Pending, while a record armed without a hook is sent
     /// as before. Once a hook is set again it is sent only when admitted, and
-    /// once.
+    /// once, while the record armed without one is sent without asking it.
     #[tokio::test]
     async fn a_spend_armed_with_a_hook_is_sent_only_once_a_hook_admits_it() {
         let fixture = Fixture::new("armed_recording", &[N1, N2]);
@@ -8066,10 +8293,10 @@ mod dispatch_tests {
             .unwrap();
         assert_eq!(
             sends.load(Ordering::SeqCst),
-            1,
-            "a refused admit sends nothing"
+            2,
+            "a refused admit sends nothing; the record armed without a hook goes without it"
         );
-        assert!(refusing.admitted.lock().unwrap().contains(&st_hash(&st)));
+        assert_eq!(*refusing.admitted.lock().unwrap(), vec![st_hash(&st)]);
         assert_eq!(fixture.durable_unsent(&activity_id), Some(true));
 
         let admitting = TestHook::new(&fixture, Answer::Accept, true);
