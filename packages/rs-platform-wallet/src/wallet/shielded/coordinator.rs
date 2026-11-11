@@ -547,7 +547,8 @@ impl NetworkShieldedCoordinator {
     /// through a wallet of this network is armed durably before the hook is
     /// awaited, and broadcast only once it returns `Ok`; every rebroadcast of
     /// such a spend by a sync pass first awaits [`ShieldedDispatch::admit`].
-    /// A spend armed while no hook was set is rebroadcast as if none were.
+    /// A spend armed while no hook was set is never put to
+    /// [`ShieldedDispatch::admit`]; a sync pass rebroadcasts it without asking.
     ///
     /// Setting it also turns on spend-disposition recording
     /// ([`Self::spend_dispositions`]) for good. The hook can't be replaced

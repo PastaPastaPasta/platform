@@ -14,8 +14,8 @@
 //!    first awaits [`ShieldedDispatch::admit`]; a refusal skips it for that
 //!    pass.
 //!
-//! A spend armed while no hook was set is rebroadcast as if none were, and
-//! never put to [`ShieldedDispatch::admit`].
+//! A spend armed while no hook was set is never put to
+//! [`ShieldedDispatch::admit`]: a sync pass rebroadcasts it without asking.
 //!
 //! [`NetworkShieldedCoordinator::set_shielded_dispatch`]:
 //!     super::NetworkShieldedCoordinator::set_shielded_dispatch
@@ -75,7 +75,7 @@ pub trait ShieldedDispatch: Send + Sync {
     ///
     /// It is asked only about spends armed while a hook was set, in this run
     /// of the process or an earlier one. A spend armed while none was set is
-    /// never put to it: a sync pass rebroadcasts it as if no hook were set.
+    /// never put to it: a sync pass rebroadcasts it without asking.
     ///
     /// This is the only check before such a send, also for a spend whose
     /// [`Self::dispatch`] never returned `Ok` (see there), which may then be

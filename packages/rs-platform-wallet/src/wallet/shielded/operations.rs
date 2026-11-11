@@ -7915,6 +7915,72 @@ mod dispatch_tests {
         assert_eq!(*admitting.admitted.lock().unwrap(), vec![under.st_hash()]);
     }
 
+    /// A hooked pass that read a record as armed before the hook doesn't send
+    /// it once it is armed again under the hook before its turn: the pass
+    /// never asked the hook about it, so it waits for the next pass, still
+    /// durably never sent.
+    #[tokio::test]
+    async fn a_hooked_pass_skips_a_record_armed_under_the_hook_after_it_was_read() {
+        let fixture = Fixture::new("marked_at_its_turn", &[N1, N2]);
+        let first = spend_with_actions(0x44, &[N1]);
+        let rearmed = spend_with_actions(0x45, &[N2]);
+        {
+            let mut store = fixture.store.write().await;
+            store.set_records_spend_dispositions(false);
+            for redrive in [&first, &rearmed] {
+                store
+                    .set_pending_spend(
+                        ID,
+                        &redrive.nullifiers[0],
+                        redrive.anchor,
+                        redrive.activity_id,
+                    )
+                    .unwrap();
+                store.arm_redrive(ID, redrive.clone()).unwrap();
+            }
+            store.set_records_spend_dispositions(true);
+        }
+        let hook = TestHook::new(&fixture, Answer::Accept, true);
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_gated(
+            &fixture.store,
+            None,
+            ID.wallet_id,
+            ID,
+            &recorded(),
+            Some(&context(&hook)),
+            |st| {
+                sent.push(st.serialize_to_bytes().unwrap());
+                if sent.len() == 1 {
+                    let mut store = fixture
+                        .store
+                        .try_write()
+                        .expect("the pass holds no store guard while it sends");
+                    store.set_records_spend_dispositions(false);
+                    store.clear_redrive(ID, &rearmed.activity_id).unwrap();
+                    store.set_records_spend_dispositions(true);
+                    store.arm_unsent_redrive(ID, rearmed.clone()).unwrap();
+                }
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![first.st_bytes.clone()],
+            "the record armed again under the hook waits for the next pass"
+        );
+        assert!(hook.admitted.lock().unwrap().is_empty());
+        assert!(fixture
+            .store
+            .read()
+            .await
+            .redrive_armed_recording(ID, &rearmed.activity_id));
+        assert_eq!(fixture.durable_unsent(&rearmed.activity_id), Some(true));
+    }
+
     /// A record whose transition is in flight is skipped by the redrive
     /// pass, with no attempt counted; once released it is sent again.
     #[tokio::test]
