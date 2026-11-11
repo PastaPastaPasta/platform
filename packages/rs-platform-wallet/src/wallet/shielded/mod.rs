@@ -37,6 +37,7 @@ pub mod balance;
 #[cfg(test)]
 mod balance_tests;
 pub mod coordinator;
+pub mod dispatch;
 pub mod file_store;
 pub mod fund_from_asset_lock;
 pub mod keys;
@@ -46,6 +47,8 @@ pub mod prover;
 pub mod seed_pool;
 pub mod store;
 pub mod sync;
+#[cfg(test)]
+mod sync_interleave_tests;
 #[cfg(test)]
 mod viewing_key_bind_tests;
 
@@ -59,13 +62,19 @@ pub use balance::{
     ShieldedLocalBalanceState,
 };
 pub use coordinator::NetworkShieldedCoordinator;
+pub use dispatch::{
+    DispatchRefused, DispatchedNote, ShieldedDispatch, ShieldedDispatchKind,
+    ShieldedDispatchPayload,
+};
 pub use file_store::{FileBackedShieldedStore, FileShieldedStoreError};
 pub use keys::{AccountViewingKeys, OrchardKeySet};
 pub use prover::CachedOrchardProver;
 pub use seed_pool::{SeedPoolOutcome, SeedPoolProgress, DEFAULT_SEED_POOL_TARGET_NOTES};
 pub use store::{
-    IdentityDebitRecoveryRecord, IdentityDebitRecoveryStatus, InMemoryShieldedStore, ShieldedNote,
-    ShieldedOutgoingNote, ShieldedStore, SubwalletId,
+    AsDispositionRefusal, IdentityDebitRecoveryRecord, IdentityDebitRecoveryStatus,
+    InMemoryShieldedStore, NotExecutedReason, PendingRedrive, ShieldedDispositionRefusal,
+    ShieldedNote, ShieldedOutgoingNote, ShieldedSpendDisposition, ShieldedSpendDispositionRecord,
+    ShieldedStore, SubwalletId, UnknownDispositionValue, UnresolvedReason,
 };
 pub use sync::{ShieldedSyncSummary, SyncNotesResult};
 

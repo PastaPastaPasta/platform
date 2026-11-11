@@ -26,7 +26,7 @@
 //! [`NetworkShieldedCoordinator::sync`]:
 //!     super::coordinator::NetworkShieldedCoordinator::sync
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use dash_sdk::platform::shielded::{
@@ -35,7 +35,7 @@ use dash_sdk::platform::shielded::{
 use futures::StreamExt;
 use grovedb_commitment_tree::{ExtractedNoteCommitment, Note as OrchardNote, PaymentAddress};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::keys::AccountViewingKeys;
 use super::store::{ShieldedStore, SubwalletId};
@@ -148,6 +148,20 @@ pub struct MultiSyncNotesResult {
     /// subwallet. The caller decides whether to queue it on the
     /// shared `WalletPersister`.
     pub changeset: ShieldedChangeSet,
+    /// Per subwallet, the dispositions whose holds this pass marked as
+    /// scanned ([`ShieldedStore::mark_holds_scanned`]). They stay held until
+    /// the caller lifts them with [`ShieldedStore::lift_scanned_holds`].
+    pub scanned_holds: BTreeMap<SubwalletId, Vec<[u8; 32]>>,
+    /// Wallets the pass skipped because they were removed after the caller
+    /// took its subwallet list. Nothing was saved for them.
+    pub removed_wallets: BTreeSet<crate::wallet::platform_wallet::WalletId>,
+    /// Wallets whose scanned spends, scan marks or watermarks could not be
+    /// committed, with the error. Their watermarks did not advance and
+    /// [`Self::scanned_holds`] has none of their holds, so the next pass
+    /// rescans and retries them; the other wallets' commits stand. The
+    /// caller skips every later step of the pass for them, the host hand-off
+    /// included, and reports them as failed.
+    pub failed_wallets: BTreeMap<crate::wallet::platform_wallet::WalletId, String>,
 }
 
 impl MultiSyncNotesResult {
@@ -186,6 +200,11 @@ impl MultiSyncNotesResult {
 /// `subwallets` must be non-empty; otherwise the function
 /// returns an empty result without contacting Platform.
 ///
+/// `removed_since_list` tells, under the pass's store write guard, whether a
+/// wallet was removed after the caller took `subwallets`. The pass skips such
+/// a wallet whole: it saves no note, advances no watermark and marks no hold
+/// for it, and lists it in [`MultiSyncNotesResult::removed_wallets`].
+///
 /// Privilege boundary: only the viewing-key half is required
 /// (FVK for nullifier derivation, IVK for trial decryption).
 /// No `SpendAuthorizingKey` is needed by sync — the spend
@@ -194,12 +213,15 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     sdk: &Arc<dash_sdk::Sdk>,
     store: &Arc<RwLock<S>>,
     subwallets: &[(SubwalletId, AccountViewingKeys)],
+    removed_since_list: &(dyn Fn(crate::wallet::platform_wallet::WalletId) -> bool + Sync),
     on_progress: Option<&super::coordinator::ShieldedProgressCallback>,
     on_tree_progress: Option<&super::coordinator::ShieldedTreeProgressCallback>,
 ) -> Result<MultiSyncNotesResult, PlatformWalletError> {
     if subwallets.is_empty() {
         return Ok(MultiSyncNotesResult::default());
     }
+    #[cfg(test)]
+    let store_key = pass_pause::key(store);
 
     // Snapshot each subwallet's watermark and the shared tree's
     // current leaf count. Two distinct quantities drive the rest
@@ -217,8 +239,36 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // caught-up subwallet doesn't re-derive nullifiers for notes
     // it already stored, while a lagging one still saves from its
     // own start.
+    //
+    // Both are read under the write guard the whole pass holds (see
+    // below), never under a separate read guard. A purge or restore
+    // that ran between this read and the scan would leave the pass
+    // scanning from a watermark the store no longer has, and writing it
+    // back over the purged or restored one, so a restored note's spend
+    // below it would never be scanned.
+    let mut store = store.write().await;
+    // A removal purges under this guard, so from here on the set of removed
+    // wallets can only grow by removals whose purge waits for this pass.
+    let removed_wallets: BTreeSet<_> = subwallets
+        .iter()
+        .map(|(id, _)| id.wallet_id)
+        .filter(|wallet_id| removed_since_list(*wallet_id))
+        .collect();
+    let subwallets: Vec<(SubwalletId, AccountViewingKeys)> = subwallets
+        .iter()
+        .filter(|(id, _)| !removed_wallets.contains(&id.wallet_id))
+        .cloned()
+        .collect();
+    let subwallets = subwallets.as_slice();
+    if subwallets.is_empty() {
+        return Ok(MultiSyncNotesResult {
+            removed_wallets,
+            ..Default::default()
+        });
+    }
+    #[cfg(test)]
+    pass_pause::reached(store_key, pass_pause::Point::AfterWatermarkRead).await;
     let (watermarks, already_have, tree_size) = {
-        let store = store.read().await;
         let mut watermarks: BTreeMap<SubwalletId, u64> = BTreeMap::new();
         let mut min_idx: Option<u64> = None;
         for (id, _) in subwallets {
@@ -302,14 +352,13 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
         }));
     }
 
-    // Acquire the store write lock for the whole interleaved consume.
-    // This is the only writer during a pass, so holding it across
+    // The store write guard taken above covers the whole interleaved
+    // consume. This is the only writer during a pass, so holding it across
     // `stream.next().await` is safe: the stream's producer side is the
     // SDK's network fetch loop, which never touches the store, so there
     // is no lock-ordering deadlock. Backpressure is pull-based — a slow
     // append simply polls the stream less often, capping in-flight
     // network fetches at `max_concurrent`.
-    let mut store = store.write().await;
 
     let stream = sync_shielded_notes_stream(sdk, &driver_ivk, aligned_start, Some(sync_config));
     futures::pin_mut!(stream);
@@ -402,6 +451,11 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // and across passes the receipt was persisted on an earlier pass,
     // so `mark_spent`'s by-nullifier lookup still resolves.
     let mut scanned_nullifiers: Vec<[u8; 32]> = Vec::new();
+    // The output commitment of the action that revealed each nullifier:
+    // proof of which transition spent the note. Collected whether or not
+    // dispositions are recorded, since a record armed while they were is
+    // resolved with it either way.
+    let mut spending_action_cmxs: BTreeMap<[u8; 32], [u8; 32]> = BTreeMap::new();
 
     while let Some(item) = stream.next().await {
         let batch = item.map_err(|e| PlatformWalletError::ShieldedSyncFailed(e.to_string()))?;
@@ -435,6 +489,9 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
                 PlatformWalletError::ShieldedSyncFailed("Invalid nullifier length".into())
             })?;
             scanned_nullifiers.push(nf_bytes);
+            if let Ok(cmx) = <[u8; 32]>::try_from(raw_note.cmx.as_slice()) {
+                spending_action_cmxs.insert(nf_bytes, cmx);
+            }
             let global_pos = batch.start_index + i as u64;
             if global_pos < tree_size {
                 continue;
@@ -675,28 +732,24 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
     // Scan-based spend detection. Now that THIS pass's receipts are
     // persisted (above), replay every scanned action's nullifier
     // against each subwallet — see [`apply_scanned_nullifier_spends`]
-    // for the ordering rationale.
-    let subwallet_ids: Vec<SubwalletId> = subwallets.iter().map(|(id, _)| *id).collect();
-    let newly_spent_per_subwallet = apply_scanned_nullifier_spends(
-        &mut *store,
-        &subwallet_ids,
-        &scanned_nullifiers,
-        &mut changeset,
-    )
-    .map_err(|e| PlatformWalletError::ShieldedStoreError(e.to_string()))?;
-
-    // Advance every subwallet's watermark to the same global
+    // for the ordering rationale — then mark the holds a wallet removal
+    // left for this scan as scanned ([`commit_scan`]).
+    //
+    // Then advance every subwallet's watermark to the same global
     // tree position so the next sync resumes coherently across
     // the union. `total_notes_scanned` is accumulated from every
     // streamed batch's note count — identical to the one-shot path's
     // `result.total_notes_scanned`.
+    let subwallet_ids: Vec<SubwalletId> = subwallets.iter().map(|(id, _)| *id).collect();
     let new_index = aligned_start + total_notes_scanned;
-    for (id, _) in subwallets {
-        store
-            .set_last_synced_note_index(*id, new_index)
-            .map_err(|e| PlatformWalletError::ShieldedStoreError(e.to_string()))?;
-        changeset.record_synced_index(*id, new_index);
-    }
+    let ((newly_spent_per_subwallet, scanned_holds), failed_wallets) = apply_spends_and_advance(
+        &mut *store,
+        &subwallet_ids,
+        &scanned_nullifiers,
+        &spending_action_cmxs,
+        new_index,
+        &mut changeset,
+    );
     // Drop the write lock before returning so the caller's
     // persister queue (which may take its own synchronous
     // mutex) doesn't nest under our store lock.
@@ -721,7 +774,129 @@ pub(super) async fn sync_notes_across<S: ShieldedStore>(
         per_subwallet_newly_spent: newly_spent_per_subwallet,
         total_scanned: scanned_volume,
         changeset,
+        scanned_holds,
+        removed_wallets,
+        failed_wallets,
     })
+}
+
+/// What a completed pass commits for its subwallets after saving its
+/// receipts, under its store write guard: the marking of the holds a wallet
+/// removal left for the subwallet's next completed scan
+/// ([`ShieldedStore::mark_holds_scanned`]), then the spent nullifiers it
+/// scanned ([`apply_scanned_nullifier_spends`]). A failed marking returns
+/// before any note is marked spent, so a retry still reports each spend as
+/// newly detected.
+///
+/// The marked holds stay held. Returns the per-subwallet count of notes
+/// newly flipped to spent and, per subwallet, the holds it marked; the
+/// caller lifts those only once the host holds this pass's spent state
+/// durably (see `NetworkShieldedCoordinator::sync`).
+pub(super) fn commit_scan<S: ShieldedStore>(
+    store: &mut S,
+    subwallet_ids: &[SubwalletId],
+    scanned_nullifiers: &[[u8; 32]],
+    changeset: &mut ShieldedChangeSet,
+) -> Result<ScanCommit, S::Error> {
+    let mut scanned_holds = BTreeMap::new();
+    for id in subwallet_ids {
+        let scanned = store.mark_holds_scanned(*id)?;
+        if !scanned.is_empty() {
+            scanned_holds.insert(*id, scanned);
+        }
+    }
+    let newly_spent =
+        apply_scanned_nullifier_spends(store, subwallet_ids, scanned_nullifiers, changeset)?;
+    Ok((newly_spent, scanned_holds))
+}
+
+/// Per subwallet, the notes [`commit_scan`] newly marked spent and the holds
+/// it marked as scanned.
+pub(super) type ScanCommit = (
+    BTreeMap<SubwalletId, usize>,
+    BTreeMap<SubwalletId, Vec<[u8; 32]>>,
+);
+
+/// Mark the holds awaiting the scan as scanned and commit its spends
+/// ([`commit_scan`]), then advance the subwallets' watermarks to
+/// `new_index`, one wallet at a time. A failed write fails only its wallet:
+/// it returns before that wallet's watermarks move, so the next pass rescans
+/// the same range for it and retries, and the other wallets commit as usual.
+/// The failed wallets come back with their errors, and the newly spent
+/// counts and scanned holds only cover the others.
+///
+/// Within a wallet every redrive the scanned spends settle is resolved first
+/// ([`ShieldedStore::resolve_redrives_spending`], with the spending action's
+/// output commitment from `spending_action_cmxs` as proof), before any of
+/// its notes is marked, so a failed disposition write fails the wallet with
+/// none of its notes marked and the retry still reports each spend as newly
+/// detected.
+fn apply_spends_and_advance<S: ShieldedStore>(
+    store: &mut S,
+    subwallet_ids: &[SubwalletId],
+    scanned_nullifiers: &[[u8; 32]],
+    spending_action_cmxs: &BTreeMap<[u8; 32], [u8; 32]>,
+    new_index: u64,
+    changeset: &mut ShieldedChangeSet,
+) -> (
+    ScanCommit,
+    BTreeMap<crate::wallet::platform_wallet::WalletId, String>,
+) {
+    let mut by_wallet: BTreeMap<crate::wallet::platform_wallet::WalletId, Vec<SubwalletId>> =
+        BTreeMap::new();
+    for id in subwallet_ids {
+        by_wallet.entry(id.wallet_id).or_default().push(*id);
+    }
+    let mut committed: ScanCommit = Default::default();
+    let mut failed = BTreeMap::new();
+    for (wallet_id, ids) in by_wallet {
+        let mut wallet_changeset = ShieldedChangeSet::default();
+        match commit_wallet_scan(
+            store,
+            &ids,
+            scanned_nullifiers,
+            spending_action_cmxs,
+            new_index,
+            &mut wallet_changeset,
+        ) {
+            Ok((newly_spent, scanned_holds)) => {
+                crate::changeset::merge::Merge::merge(changeset, wallet_changeset);
+                committed.0.extend(newly_spent);
+                committed.1.extend(scanned_holds);
+            }
+            Err(e) => {
+                warn!(
+                    wallet_id = %hex::encode(wallet_id),
+                    error = %e,
+                    "shielded scan commit failed for this wallet; the next pass retries it"
+                );
+                failed.insert(wallet_id, e.to_string());
+            }
+        }
+    }
+    (committed, failed)
+}
+
+/// [`apply_spends_and_advance`] for one wallet's subwallets.
+fn commit_wallet_scan<S: ShieldedStore>(
+    store: &mut S,
+    subwallet_ids: &[SubwalletId],
+    scanned_nullifiers: &[[u8; 32]],
+    spending_action_cmxs: &BTreeMap<[u8; 32], [u8; 32]>,
+    new_index: u64,
+    changeset: &mut ShieldedChangeSet,
+) -> Result<ScanCommit, S::Error> {
+    for id in subwallet_ids {
+        for nf in scanned_nullifiers {
+            store.resolve_redrives_spending(*id, nf, spending_action_cmxs.get(nf))?;
+        }
+    }
+    let committed = commit_scan(store, subwallet_ids, scanned_nullifiers, changeset)?;
+    for id in subwallet_ids {
+        store.set_last_synced_note_index(*id, new_index)?;
+        changeset.record_synced_index(*id, new_index);
+    }
+    Ok(committed)
 }
 
 /// Scan-based spend detection: replay the set of nullifiers seen on
@@ -1043,6 +1218,93 @@ mod tests {
     }
 }
 
+/// Test-only pause points in a sync pass, so a test can interleave a
+/// removal, restore or crash there.
+#[cfg(test)]
+pub(super) mod pass_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tokio::sync::{RwLock, Semaphore};
+
+    /// One armed pause: the pass adds a permit to `reached` when it stops,
+    /// and waits for a permit on `resume`.
+    pub(crate) struct Pause {
+        pub(crate) reached: Semaphore,
+        pub(crate) resume: Semaphore,
+    }
+
+    /// Where a pass stops.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) enum Point {
+        /// `sync()` has taken its subwallet list, not yet the store guard.
+        AfterListSnapshot,
+        /// The pass holds the store guard and read its watermarks.
+        AfterWatermarkRead,
+        /// The pass is done; `sync()` has not handed its changeset to the
+        /// host yet.
+        BeforeHostSave,
+        /// The host save returned; `sync()` has not taken the store guard
+        /// to lift the scanned holds yet.
+        BeforeScanLift,
+        /// `clear()` has reset the store and released the store guard, and
+        /// still holds `accounts`.
+        AfterClearReset,
+        /// `set_shielded_dispatch` has set one of the hook and the recording
+        /// switch, and not yet the other.
+        DispatchSetHalfway,
+    }
+
+    type Armed = Mutex<HashMap<(usize, Point), Arc<Pause>>>;
+
+    fn armed() -> &'static Armed {
+        static ARMED: OnceLock<Armed> = OnceLock::new();
+        ARMED.get_or_init(Default::default)
+    }
+
+    /// Identifies a store, so a pause armed by one test stops only passes
+    /// over that test's store.
+    pub(crate) fn key<S>(store: &Arc<RwLock<S>>) -> usize {
+        Arc::as_ptr(store) as *const () as usize
+    }
+
+    /// Stop the next pass over the store keyed `key` after its watermark
+    /// read, until the test adds a permit to `resume`.
+    pub(crate) fn arm(key: usize) -> Arc<Pause> {
+        arm_at(key, Point::AfterWatermarkRead)
+    }
+
+    /// Stop the next pass over the store keyed `key` at `point`, until the
+    /// test adds a permit to `resume`.
+    pub(crate) fn arm_at(key: usize, point: Point) -> Arc<Pause> {
+        let pause = Arc::new(Pause {
+            reached: Semaphore::new(0),
+            resume: Semaphore::new(0),
+        });
+        armed()
+            .lock()
+            .expect("pass pause registry")
+            .insert((key, point), pause.clone());
+        pause
+    }
+
+    pub(crate) async fn reached(key: usize, point: Point) {
+        let pause = armed()
+            .lock()
+            .expect("pass pause registry")
+            .remove(&(key, point));
+        if let Some(pause) = pause {
+            pause.reached.add_permits(1);
+            pause
+                .resume
+                .acquire()
+                .await
+                .expect("pass pause resume")
+                .forget();
+        }
+    }
+}
+
 /// OVK outgoing-note recovery: round-trip a real Orchard output
 /// encrypted with the wallet's OVK back into a `ShieldedOutgoingNote`.
 ///
@@ -1074,3 +1336,484 @@ mod ovk_builder_roundtrip_tests;
 /// full-decryption and the OVK send-history recovery primitives.
 #[cfg(test)]
 mod memo_roundtrip_tests;
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::ScanCommit;
+    use crate::changeset::ShieldedChangeSet;
+    use crate::wallet::platform_wallet::WalletId;
+    use crate::wallet::shielded::file_store::FileBackedShieldedStore;
+    use crate::wallet::shielded::store::disposition_contract::{
+        action_cmx, arm_reserved, assert_holds_by_value, note, spend_with_actions, unspent,
+    };
+    use crate::wallet::shielded::store::{
+        PendingRedrive, ShieldedSpendDisposition, ShieldedStore, SubwalletId, UnresolvedReason,
+    };
+    use crate::wallet::shielded::ShieldedNote;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    struct TestStore {
+        path: std::path::PathBuf,
+    }
+
+    impl TestStore {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self {
+                path: std::env::temp_dir()
+                    .join(format!("shielded_sync_disposition_{tag}_{nanos}.sqlite")),
+            }
+        }
+
+        fn open(&self) -> FileBackedShieldedStore {
+            let mut store = FileBackedShieldedStore::open_path(&self.path, 100).expect("open");
+            store.set_records_spend_dispositions(true);
+            store
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", ".lock"] {
+                let mut file = self.path.as_os_str().to_owned();
+                file.push(suffix);
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
+
+    /// [`super::apply_spends_and_advance`], with every failed wallet as the
+    /// error.
+    fn apply_spends_and_advance(
+        store: &mut FileBackedShieldedStore,
+        subwallet_ids: &[SubwalletId],
+        scanned_nullifiers: &[[u8; 32]],
+        spending_action_cmxs: &BTreeMap<[u8; 32], [u8; 32]>,
+        new_index: u64,
+        changeset: &mut ShieldedChangeSet,
+    ) -> Result<ScanCommit, BTreeMap<WalletId, String>> {
+        let (committed, failed) = super::apply_spends_and_advance(
+            store,
+            subwallet_ids,
+            scanned_nullifiers,
+            spending_action_cmxs,
+            new_index,
+            changeset,
+        );
+        if failed.is_empty() {
+            Ok(committed)
+        } else {
+            Err(failed)
+        }
+    }
+
+    /// The scanned spend of each of `redrive`'s notes by its own action.
+    fn own_actions(redrive: &PendingRedrive, tag: u8) -> BTreeMap<[u8; 32], [u8; 32]> {
+        redrive
+            .nullifiers
+            .iter()
+            .map(|nullifier| (*nullifier, action_cmx(tag, nullifier)))
+            .collect()
+    }
+
+    fn disposition_of(
+        store: &FileBackedShieldedStore,
+        id: SubwalletId,
+        redrive: &PendingRedrive,
+    ) -> Option<ShieldedSpendDisposition> {
+        store
+            .dispositions(id.wallet_id)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.st_hash == redrive.st_hash())
+            .map(|record| record.disposition)
+    }
+
+    #[test]
+    fn mark_spent_records_executed_first() {
+        let test = TestStore::new("executed");
+        let id = SubwalletId::new([0xC4; 32], 0);
+        let nullifiers = [[0x63; 32], [0x64; 32]];
+        let first = spend_with_actions(0x80, &nullifiers);
+        let unreserved = [0x67; 32];
+        let mut store = test.open();
+        arm_reserved(&mut store, id, &first);
+        store.save_note(id, &note(unreserved)).unwrap();
+        let mut scanned = own_actions(&first, 0x80);
+        scanned.insert(unreserved, [0x01; 32]);
+        let scanned_nullifiers: Vec<[u8; 32]> = scanned.keys().copied().collect();
+
+        let mut changeset = ShieldedChangeSet::default();
+        let (newly_spent, _) = apply_spends_and_advance(
+            &mut store,
+            &[id],
+            &scanned_nullifiers,
+            &scanned,
+            20,
+            &mut changeset,
+        )
+        .unwrap();
+        assert_eq!(
+            newly_spent.get(&id),
+            Some(&3),
+            "every spend is still reported as new"
+        );
+        assert_eq!(
+            disposition_of(&store, id, &first),
+            Some(ShieldedSpendDisposition::Executed)
+        );
+        assert_eq!(
+            store.dispositions(id.wallet_id).unwrap().len(),
+            1,
+            "a note no redrive reserved writes nothing"
+        );
+        assert!(store.pending_redrives(id).unwrap().is_empty());
+        drop(store);
+
+        let store = test.open();
+        assert_eq!(
+            disposition_of(&store, id, &first),
+            Some(ShieldedSpendDisposition::Executed)
+        );
+        assert_holds_by_value(&store.dispositions(id.wallet_id).unwrap(), &[&first]);
+        assert!(store.pending_redrives(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_spend_by_another_transition_is_not_read_as_the_armed_one_executing() {
+        let test = TestStore::new("other_transition");
+        let id = SubwalletId::new([0xC6; 32], 0);
+        let nullifier = [0x68; 32];
+        // An earlier transition spent the note but its outcome was lost and
+        // the note released; a later spend of our own now reserves it.
+        let earlier = spend_with_actions(0x83, &[nullifier]);
+        let respend = spend_with_actions(0x84, &[nullifier]);
+        let mut store = test.open();
+        arm_reserved(&mut store, id, &respend);
+        // The scan sees the note spent by the earlier transition's action.
+        let scanned = own_actions(&earlier, 0x83);
+
+        let mut changeset = ShieldedChangeSet::default();
+        apply_spends_and_advance(
+            &mut store,
+            &[id],
+            &[nullifier],
+            &scanned,
+            20,
+            &mut changeset,
+        )
+        .unwrap();
+        assert_eq!(
+            disposition_of(&store, id, &respend),
+            Some(ShieldedSpendDisposition::Unresolved(
+                UnresolvedReason::Unattributable
+            ))
+        );
+        drop(store);
+        let store = test.open();
+        assert_eq!(
+            disposition_of(&store, id, &respend),
+            Some(ShieldedSpendDisposition::Unresolved(
+                UnresolvedReason::Unattributable
+            ))
+        );
+        assert_holds_by_value(&store.dispositions(id.wallet_id).unwrap(), &[&respend]);
+    }
+
+    #[test]
+    fn a_failed_disposition_write_fails_the_pass_and_the_next_pass_retries() {
+        let test = TestStore::new("failure");
+        let id = SubwalletId::new([0xC5; 32], 0);
+        let nullifiers = [[0x65; 32], [0x66; 32]];
+        let first = spend_with_actions(0x81, &nullifiers[..1]);
+        let second = spend_with_actions(0x82, &nullifiers[1..]);
+        let mut scanned = own_actions(&first, 0x81);
+        scanned.extend(own_actions(&second, 0x82));
+        let mut store = test.open();
+        arm_reserved(&mut store, id, &first);
+        arm_reserved(&mut store, id, &second);
+        store.set_last_synced_note_index(id, 10).unwrap();
+
+        // The second record's disposition write fails.
+        store.fail_disposition_write_for(&second.activity_id, true);
+        let mut changeset = ShieldedChangeSet::default();
+        assert!(
+            apply_spends_and_advance(&mut store, &[id], &nullifiers, &scanned, 20, &mut changeset)
+                .is_err(),
+            "a failed disposition write fails the pass"
+        );
+        assert_eq!(
+            store.last_synced_note_index(id).unwrap(),
+            10,
+            "the watermark does not advance past the failed range"
+        );
+        assert!(
+            store
+                .get_all_notes(id)
+                .unwrap()
+                .iter()
+                .all(|note| !note.is_spent),
+            "no note is marked before every disposition is written"
+        );
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![second.clone()]);
+        assert!(unspent(&store, id).is_empty());
+
+        // The next pass rescans the same range and succeeds.
+        store.fail_disposition_write_for(&second.activity_id, false);
+        let mut changeset = ShieldedChangeSet::default();
+        let (newly_spent, _) =
+            apply_spends_and_advance(&mut store, &[id], &nullifiers, &scanned, 20, &mut changeset)
+                .expect("retry");
+        assert_eq!(
+            newly_spent.get(&id),
+            Some(&2),
+            "both spends are still reported as new"
+        );
+        assert_eq!(store.last_synced_note_index(id).unwrap(), 20);
+        assert!(store.pending_redrives(id).unwrap().is_empty());
+        assert_eq!(unspent(&store, id), BTreeSet::new());
+        drop(store);
+
+        let store = test.open();
+        let dispositions = store.dispositions(id.wallet_id).unwrap();
+        assert_eq!(dispositions.len(), 2);
+        assert!(dispositions
+            .iter()
+            .all(|record| record.disposition == ShieldedSpendDisposition::Executed));
+        assert_holds_by_value(&dispositions, &[&first, &second]);
+    }
+
+    /// One wallet whose disposition writes keep failing doesn't hold back
+    /// another: the healthy wallet's spends are resolved and marked, its
+    /// watermark advances and its spends reach the changeset, while the
+    /// failing wallet is reported, keeps its watermark, record and
+    /// reservations, and contributes nothing to the changeset. Pass after
+    /// pass, until the failure clears.
+    #[test]
+    fn a_persistent_disposition_failure_fails_only_its_wallet() {
+        let test = TestStore::new("isolation");
+        let healthy = SubwalletId::new([0xC8; 32], 0);
+        let failing = SubwalletId::new([0xC9; 32], 0);
+        let healthy_spend = spend_with_actions(0x85, &[[0x69; 32]]);
+        let failing_spend = spend_with_actions(0x86, &[[0x6A; 32]]);
+        let mut scanned = own_actions(&healthy_spend, 0x85);
+        scanned.extend(own_actions(&failing_spend, 0x86));
+        let nullifiers: Vec<[u8; 32]> = scanned.keys().copied().collect();
+        let mut store = test.open();
+        arm_reserved(&mut store, healthy, &healthy_spend);
+        arm_reserved(&mut store, failing, &failing_spend);
+        store.set_last_synced_note_index(healthy, 10).unwrap();
+        store.set_last_synced_note_index(failing, 10).unwrap();
+        store.fail_disposition_write_for(&failing_spend.activity_id, true);
+
+        for index in [20, 30] {
+            let mut changeset = ShieldedChangeSet::default();
+            let ((newly_spent, _), failed) = super::apply_spends_and_advance(
+                &mut store,
+                &[healthy, failing],
+                &nullifiers,
+                &scanned,
+                index,
+                &mut changeset,
+            );
+            assert_eq!(
+                failed.keys().copied().collect::<Vec<_>>(),
+                vec![failing.wallet_id],
+                "only the failing wallet is reported"
+            );
+            assert_eq!(store.last_synced_note_index(failing).unwrap(), 10);
+            assert_eq!(
+                store.pending_redrives(failing).unwrap(),
+                vec![failing_spend.clone()]
+            );
+            assert!(
+                unspent(&store, failing).is_empty(),
+                "its notes stay reserved"
+            );
+            assert!(!newly_spent.contains_key(&failing));
+            assert!(changeset
+                .synced_indices
+                .keys()
+                .chain(changeset.nullifiers_spent.keys())
+                .all(|id| id.wallet_id == healthy.wallet_id));
+
+            assert_eq!(store.last_synced_note_index(healthy).unwrap(), index);
+            assert_eq!(changeset.synced_indices.get(&healthy), Some(&index));
+            if index == 20 {
+                assert_eq!(newly_spent.get(&healthy), Some(&1));
+                assert_eq!(
+                    changeset.nullifiers_spent.get(&healthy),
+                    Some(&vec![[0x69; 32]])
+                );
+            }
+            assert_eq!(
+                disposition_of(&store, healthy, &healthy_spend),
+                Some(ShieldedSpendDisposition::Executed)
+            );
+        }
+
+        store.fail_disposition_write_for(&failing_spend.activity_id, false);
+        let mut changeset = ShieldedChangeSet::default();
+        let (newly_spent, _) = apply_spends_and_advance(
+            &mut store,
+            &[healthy, failing],
+            &nullifiers,
+            &scanned,
+            40,
+            &mut changeset,
+        )
+        .expect("retry");
+        assert_eq!(
+            newly_spent.get(&failing),
+            Some(&1),
+            "the retry reports its spend"
+        );
+        assert_eq!(store.last_synced_note_index(failing).unwrap(), 40);
+        assert_eq!(
+            disposition_of(&store, failing, &failing_spend),
+            Some(ShieldedSpendDisposition::Executed)
+        );
+    }
+
+    /// A wallet whose scan can't mark the holds a removal left for it marks
+    /// none of its notes spent, so the retry still reports its spends and
+    /// hands them to the host.
+    #[test]
+    fn a_failed_scan_marking_leaves_the_spends_to_the_retry() {
+        let test = TestStore::new("scan_marking");
+        let id = SubwalletId::new([0xCA; 32], 0);
+        let held = spend_with_actions(0x87, &[[0x6C; 32]]);
+        let spent = [0x6D; 32];
+        let mut store = test.open();
+        arm_reserved(&mut store, id, &held);
+        store
+            .resolve_redrive(
+                id,
+                &held.activity_id,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+            )
+            .unwrap();
+        store.purge_wallet(id.wallet_id).unwrap();
+        // The wallet is added again and its host restores a note unspent.
+        store.save_note(id, &note(spent)).unwrap();
+        store.set_last_synced_note_index(id, 10).unwrap();
+
+        store.fail_disposition_updates(true);
+        let mut changeset = ShieldedChangeSet::default();
+        assert!(
+            apply_spends_and_advance(
+                &mut store,
+                &[id],
+                &[spent],
+                &BTreeMap::new(),
+                20,
+                &mut changeset
+            )
+            .is_err(),
+            "a failed marking fails the wallet"
+        );
+        assert_eq!(store.last_synced_note_index(id).unwrap(), 10);
+        assert_eq!(unspent(&store, id), BTreeSet::from([spent]));
+
+        store.fail_disposition_updates(false);
+        let mut changeset = ShieldedChangeSet::default();
+        let (newly_spent, scanned_holds) = apply_spends_and_advance(
+            &mut store,
+            &[id],
+            &[spent],
+            &BTreeMap::new(),
+            20,
+            &mut changeset,
+        )
+        .expect("retry");
+        assert_eq!(
+            newly_spent.get(&id),
+            Some(&1),
+            "the retry reports the spend"
+        );
+        assert_eq!(
+            changeset.nullifiers_spent.get(&id),
+            Some(&vec![spent]),
+            "the retry hands the spend to the host"
+        );
+        assert_eq!(scanned_holds.get(&id), Some(&vec![held.st_hash()]));
+        assert_eq!(store.last_synced_note_index(id).unwrap(), 20);
+    }
+
+    /// A pass resolves a record `Executed`, and the process ends before the
+    /// host takes the pass's changeset. After a reopen in which the host
+    /// restores its older snapshot, the record's notes are neither selectable
+    /// nor counted, while a healthy note is. The rescan marks them spent, the
+    /// host takes that changeset and acknowledges the disposition; from then
+    /// on only the host's spent state decides.
+    #[test]
+    fn an_executed_spend_stays_held_across_a_crash_before_the_host_write() {
+        let test = TestStore::new("crash_window");
+        let id = SubwalletId::new([0xC7; 32], 0);
+        let nullifiers = [[0x69; 32], [0x6A; 32]];
+        let healthy = [0x6B; 32];
+        let first = spend_with_actions(0x85, &nullifiers);
+        let scanned = own_actions(&first, 0x85);
+        let restore = |store: &mut FileBackedShieldedStore, spent: bool| {
+            for nullifier in nullifiers {
+                let restored = ShieldedNote {
+                    is_spent: spent,
+                    ..note(nullifier)
+                };
+                store.save_note(id, &restored).unwrap();
+            }
+            store.save_note(id, &note(healthy)).unwrap();
+        };
+        let mut store = test.open();
+        arm_reserved(&mut store, id, &first);
+        let mut changeset = ShieldedChangeSet::default();
+        apply_spends_and_advance(&mut store, &[id], &nullifiers, &scanned, 20, &mut changeset)
+            .unwrap();
+        assert_eq!(
+            disposition_of(&store, id, &first),
+            Some(ShieldedSpendDisposition::Executed)
+        );
+        // The process ends before the host takes the changeset.
+        drop(changeset);
+        drop(store);
+
+        let mut store = test.open();
+        restore(&mut store, false);
+        assert_eq!(
+            unspent(&store, id),
+            BTreeSet::from([healthy]),
+            "an Executed disposition holds its notes across a restart"
+        );
+        assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
+        let mut changeset = ShieldedChangeSet::default();
+        let (newly_spent, _) =
+            apply_spends_and_advance(&mut store, &[id], &nullifiers, &scanned, 20, &mut changeset)
+                .unwrap();
+        assert_eq!(
+            newly_spent.get(&id),
+            Some(&2),
+            "the rescan reports both spends"
+        );
+        let host_spent = changeset.nullifiers_spent.get(&id).unwrap();
+        assert!(nullifiers.iter().all(|nf| host_spent.contains(nf)));
+        // The host has stored the spent state, then acknowledges.
+        assert!(store.ack_disposition(id, &first.st_hash()).unwrap());
+        drop(store);
+
+        let mut store = test.open();
+        restore(&mut store, true);
+        assert_eq!(unspent(&store, id), BTreeSet::from([healthy]));
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+        drop(store);
+        let mut store = test.open();
+        restore(&mut store, false);
+        assert_eq!(
+            unspent(&store, id),
+            BTreeSet::from([nullifiers[0], nullifiers[1], healthy]),
+            "an acknowledged disposition holds nothing"
+        );
+    }
+}

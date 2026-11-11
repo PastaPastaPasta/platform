@@ -173,6 +173,368 @@ pub struct PendingRedrive {
     pub identity_user_abandoned: bool,
 }
 
+impl PendingRedrive {
+    /// SHA-256 of [`st_bytes`](Self::st_bytes), and the key the spend's
+    /// disposition is recorded under. For bytes that are a transition's
+    /// platform serialization, as the library writes them, this equals that
+    /// transition's `StateTransition::transaction_id()`. Computed from the
+    /// bytes, so it needs no decode and also exists for a record whose bytes
+    /// no longer deserialize.
+    pub fn st_hash(&self) -> [u8; 32] {
+        dpp::util::hash::hash_single(&self.st_bytes)
+    }
+
+    /// Whether the signed transition contains an action spending
+    /// `nullifier` whose output commitment is `cmx`. Such an action can only
+    /// appear on chain as part of this exact transition. Bytes that do not
+    /// decode contain no action.
+    pub fn contains_action(&self, nullifier: &[u8; 32], cmx: &[u8; 32]) -> bool {
+        use dpp::serialization::PlatformDeserializableTrusted;
+        dpp::state_transition::StateTransition::deserialize_from_bytes_trusted(&self.st_bytes)
+            .is_ok_and(|transition| {
+                super::operations::shielded_actions(&transition)
+                    .iter()
+                    .any(|action| action.nullifier == *nullifier && action.cmx == *cmx)
+            })
+    }
+}
+
+/// Why a durable note-spend record was resolved, as evidence about whether its
+/// signed transition executed on Platform.
+///
+/// Consumers read these as evidence, so each value is written only with the
+/// proof its documentation names, and a missing record is never evidence of
+/// either outcome. When neither outcome is proved, the value is
+/// [`Unresolved`](Self::Unresolved). The enum is deliberately exhaustive: a new
+/// value is a breaking change, so no reader can fold it into a default arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShieldedSpendDisposition {
+    /// Proof that this transition executed: Platform reported its input
+    /// nullifiers spent while this record still reserved those notes, so no
+    /// other spend by this wallet could have consumed them. When written by
+    /// resolving the record, its notes stay excluded from selection until the
+    /// disposition is acknowledged, across restarts too (see
+    /// [`ShieldedSpendDispositionRecord::held_nullifiers`]).
+    Executed,
+    /// Proof that this transition has not executed and never can; the reason
+    /// names the proof.
+    NotExecuted(NotExecutedReason),
+    /// The record is gone without proof of either outcome. The transition may
+    /// have executed or may still execute.
+    Unresolved(UnresolvedReason),
+}
+
+/// The proof behind [`ShieldedSpendDisposition::NotExecuted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NotExecutedReason {
+    /// The host's dispatch hook refused the transition before its first
+    /// broadcast. Nothing was sent.
+    Refused,
+    /// The user abandoned the transition before anything was broadcast.
+    /// Nothing was sent.
+    Abandoned,
+    /// Platform returned a definitive consensus rejection for these exact
+    /// transition bytes. This library does not currently record it: a
+    /// rejection is judged under the answering node's protocol version and
+    /// is unauthenticated, so it cannot show that an earlier broadcast of the
+    /// same bytes never executed.
+    Rejected,
+    /// The anchor the transition was built against left Platform's recorded
+    /// anchor set while its nullifiers were still unspent, so its proof can
+    /// never verify.
+    Pruned,
+}
+
+/// Why a record was resolved as [`ShieldedSpendDisposition::Unresolved`].
+/// None of these values proves either outcome, so when written by resolving
+/// the record its notes stay excluded from selection until the disposition is
+/// acknowledged, as for [`ShieldedSpendDisposition::Executed`] (see
+/// [`ShieldedSpendDispositionRecord::held_nullifiers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnresolvedReason {
+    /// The stored transition bytes no longer deserialize, so the record was
+    /// dropped without a rebroadcast. The bytes may still have executed.
+    DeserializeDropped,
+    /// A wallet or account purge removed the record without proof of either
+    /// outcome. Its notes stay held until the disposition is acknowledged,
+    /// whatever later scans find.
+    Purged,
+    /// Platform reported one of the record's notes spent, or showed its
+    /// outputs, but the record did not hold that evidence alone: another
+    /// armed record reserved one of the same notes (so `Executed` is refused
+    /// with [`ShieldedDispositionRefusal::ReservationShared`]), one of its
+    /// notes was no longer reserved, or one was already marked spent (as a
+    /// restored snapshot does). The spend may belong to another transition.
+    /// Also written when the record's anchor was pruned while one of its
+    /// notes was spent or unknown to this store.
+    Unattributable,
+    /// A send of an armed record failed. No failure of a later send proves
+    /// that an earlier one never executed.
+    Cancelled,
+}
+
+/// A stored disposition string that this build does not know. Decoding never
+/// substitutes a default for it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown shielded spend disposition {kind:?} with reason {reason:?}")]
+pub struct UnknownDispositionValue {
+    /// The stored disposition string.
+    pub kind: String,
+    /// The stored reason string, if any.
+    pub reason: Option<String>,
+}
+
+impl ShieldedSpendDisposition {
+    /// Stable stored string for the disposition kind.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::NotExecuted(_) => "not_executed",
+            Self::Unresolved(_) => "unresolved",
+        }
+    }
+
+    /// Stable stored string for the reason. `None` exactly for
+    /// [`Executed`](Self::Executed).
+    pub fn reason_str(&self) -> Option<&'static str> {
+        match self {
+            Self::Executed => None,
+            Self::NotExecuted(NotExecutedReason::Refused) => Some("refused"),
+            Self::NotExecuted(NotExecutedReason::Abandoned) => Some("abandoned"),
+            Self::NotExecuted(NotExecutedReason::Rejected) => Some("rejected"),
+            Self::NotExecuted(NotExecutedReason::Pruned) => Some("pruned"),
+            Self::Unresolved(UnresolvedReason::DeserializeDropped) => Some("deserialize_dropped"),
+            Self::Unresolved(UnresolvedReason::Purged) => Some("purged"),
+            Self::Unresolved(UnresolvedReason::Unattributable) => Some("unattributable"),
+            Self::Unresolved(UnresolvedReason::Cancelled) => Some("cancelled"),
+        }
+    }
+
+    /// Decode the strings written by [`kind_str`](Self::kind_str) and
+    /// [`reason_str`](Self::reason_str). Any other combination, including a
+    /// known reason under the wrong kind, is an error.
+    pub fn from_stored(kind: &str, reason: Option<&str>) -> Result<Self, UnknownDispositionValue> {
+        let decoded = match (kind, reason) {
+            ("executed", None) => Some(Self::Executed),
+            ("not_executed", Some("refused")) => {
+                Some(Self::NotExecuted(NotExecutedReason::Refused))
+            }
+            ("not_executed", Some("abandoned")) => {
+                Some(Self::NotExecuted(NotExecutedReason::Abandoned))
+            }
+            ("not_executed", Some("rejected")) => {
+                Some(Self::NotExecuted(NotExecutedReason::Rejected))
+            }
+            ("not_executed", Some("pruned")) => Some(Self::NotExecuted(NotExecutedReason::Pruned)),
+            ("unresolved", Some("deserialize_dropped")) => {
+                Some(Self::Unresolved(UnresolvedReason::DeserializeDropped))
+            }
+            ("unresolved", Some("purged")) => Some(Self::Unresolved(UnresolvedReason::Purged)),
+            ("unresolved", Some("unattributable")) => {
+                Some(Self::Unresolved(UnresolvedReason::Unattributable))
+            }
+            ("unresolved", Some("cancelled")) => {
+                Some(Self::Unresolved(UnresolvedReason::Cancelled))
+            }
+            _ => None,
+        };
+        decoded.ok_or_else(|| UnknownDispositionValue {
+            kind: kind.to_owned(),
+            reason: reason.map(str::to_owned),
+        })
+    }
+}
+
+/// An unacknowledged disposition, kept until
+/// [`ShieldedStore::ack_disposition`] removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShieldedSpendDispositionRecord {
+    /// The subwallet that owned the resolved record.
+    pub subwallet: SubwalletId,
+    /// [`PendingRedrive::st_hash`] of the transition; the key.
+    pub st_hash: [u8; 32],
+    /// Activity-entry id of the spend.
+    pub activity_id: [u8; 32],
+    /// The evidence.
+    pub disposition: ShieldedSpendDisposition,
+    /// Wall-clock milliseconds since the Unix epoch when it was written.
+    pub at_ms: u64,
+    /// For an [`Executed`](ShieldedSpendDisposition::Executed) or
+    /// [`Unresolved`](ShieldedSpendDisposition::Unresolved) disposition
+    /// written by resolving a record, that record's input nullifiers: the
+    /// notes it spent or may have spent. They stay excluded from note
+    /// selection until this disposition is acknowledged, across restarts too,
+    /// so a host restoring an older snapshot in which they are unspent cannot
+    /// offer them again. Acknowledge only once the host's spent state for
+    /// them is durable. After [`ShieldedStore::purge_wallet`] they can also
+    /// be lifted by the subwallet's next completed scan, once the host holds
+    /// that scan's spent state durably, and the list is then empty. Empty for
+    /// a
+    /// [`NotExecuted`](ShieldedSpendDisposition::NotExecuted) disposition and
+    /// for one written by [`ShieldedStore::record_disposition`].
+    pub held_nullifiers: Vec<[u8; 32]>,
+}
+
+/// A disposition write or redrive resolution the store refused. Nothing was
+/// changed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ShieldedDispositionRefusal {
+    /// No armed redrive exists for `activity_id` in this subwallet.
+    #[error("no armed shielded redrive for activity {}", hex::encode(activity_id))]
+    RedriveNotFound { activity_id: [u8; 32] },
+    /// The redrive is an identity-debit guard (no input nullifiers). Those
+    /// keep their own recovery model and are never resolved by disposition.
+    #[error(
+        "shielded redrive for activity {} is an identity debit, not a note spend",
+        hex::encode(activity_id)
+    )]
+    IdentityDebit { activity_id: [u8; 32] },
+    /// [`ShieldedSpendDisposition::Executed`] was asked for while another
+    /// armed redrive also reserves one of this record's notes, so a spent
+    /// nullifier does not show which of the two executed. Resolving it as
+    /// [`UnresolvedReason::Unattributable`] states exactly that.
+    #[error(
+        "shielded redrive for activity {} shares a reserved note with activity {}; its execution is not provable",
+        hex::encode(activity_id),
+        hex::encode(other_activity_id)
+    )]
+    ReservationShared {
+        activity_id: [u8; 32],
+        other_activity_id: [u8; 32],
+    },
+    /// A stored disposition for `st_hash` in `subwallet` cannot be read by
+    /// this build. It is kept as written and never defaulted, skipped or
+    /// overwritten; reads of its wallet's dispositions and writes for its
+    /// transition are refused until
+    /// [`ShieldedStore::ack_disposition`]`(subwallet, st_hash)` removes it.
+    /// The notes it holds, `held_nullifiers`, stay excluded until then, so
+    /// the host acks it only once its spent state for them is durable.
+    /// The list is empty when the row holds nothing or the list itself cannot
+    /// be read.
+    #[error(
+        "unreadable shielded spend disposition for account {} transition {}: {detail}",
+        subwallet.account_index,
+        hex::encode(st_hash)
+    )]
+    Unreadable {
+        subwallet: SubwalletId,
+        st_hash: [u8; 32],
+        held_nullifiers: Vec<[u8; 32]>,
+        detail: String,
+    },
+    /// A redrive for this transition or activity is still armed in the
+    /// wallet, so the disposition must be written by resolving it.
+    #[error(
+        "shielded redrive for activity {} is still armed; resolve it instead",
+        hex::encode(activity_id)
+    )]
+    RedriveArmed { activity_id: [u8; 32] },
+    /// The store does not record spend dispositions (see
+    /// [`ShieldedStore::records_spend_dispositions`]), so the request would
+    /// leave no evidence behind.
+    #[error("this shielded store is not recording spend dispositions")]
+    NotRecording,
+    /// The record may have been broadcast, so it may have executed or may
+    /// still execute and cannot be abandoned.
+    #[error(
+        "shielded redrive for activity {} may have been broadcast; it cannot be abandoned",
+        hex::encode(activity_id)
+    )]
+    MayHaveBeenBroadcast { activity_id: [u8; 32] },
+    /// The wallet holds an unacknowledged disposition for transition
+    /// `st_hash`, so a record for it can't be armed again: its resolution
+    /// would contradict that evidence. Acknowledge the disposition first.
+    #[error(
+        "transition {} already has disposition {existing:?}; refusing to arm it again",
+        hex::encode(st_hash)
+    )]
+    DispositionRecorded {
+        st_hash: [u8; 32],
+        existing: ShieldedSpendDisposition,
+    },
+    /// An unacknowledged disposition for `st_hash` in the same wallet
+    /// already holds different evidence (another value, activity or account).
+    #[error(
+        "transition {} already has disposition {existing:?} for account {existing_account_index} activity {}; refusing {attempted:?} for account {attempted_account_index} activity {}",
+        hex::encode(st_hash),
+        hex::encode(existing_activity_id),
+        hex::encode(attempted_activity_id)
+    )]
+    Conflict {
+        st_hash: [u8; 32],
+        existing_account_index: u32,
+        existing_activity_id: [u8; 32],
+        existing: ShieldedSpendDisposition,
+        attempted_account_index: u32,
+        attempted_activity_id: [u8; 32],
+        attempted: ShieldedSpendDisposition,
+    },
+}
+
+/// Access to the [`ShieldedDispositionRefusal`] a store error carries, so
+/// code generic over [`ShieldedStore`] can tell a refusal from a storage
+/// failure.
+pub trait AsDispositionRefusal {
+    /// The refusal this error is, if it is one.
+    fn disposition_refusal(&self) -> Option<&ShieldedDispositionRefusal>;
+}
+
+/// Decide a disposition write against the unacknowledged one already stored
+/// for the same wallet and `st_hash`: `Ok(Some(record))` is the record to
+/// write, `Ok(None)` is an identical no-op, and different evidence (including
+/// a different set of held notes) is a conflict.
+pub(super) fn disposition_to_write(
+    existing: Option<&ShieldedSpendDispositionRecord>,
+    id: SubwalletId,
+    st_hash: &[u8; 32],
+    activity_id: &[u8; 32],
+    disposition: ShieldedSpendDisposition,
+    held_nullifiers: &[[u8; 32]],
+) -> Result<Option<ShieldedSpendDispositionRecord>, ShieldedDispositionRefusal> {
+    match existing {
+        Some(existing)
+            if existing.subwallet == id
+                && existing.activity_id == *activity_id
+                && existing.disposition == disposition
+                && existing.held_nullifiers == held_nullifiers =>
+        {
+            Ok(None)
+        }
+        Some(existing) => Err(ShieldedDispositionRefusal::Conflict {
+            st_hash: *st_hash,
+            existing_account_index: existing.subwallet.account_index,
+            existing_activity_id: existing.activity_id,
+            existing: existing.disposition,
+            attempted_account_index: id.account_index,
+            attempted_activity_id: *activity_id,
+            attempted: disposition,
+        }),
+        None => Ok(Some(ShieldedSpendDispositionRecord {
+            subwallet: id,
+            st_hash: *st_hash,
+            activity_id: *activity_id,
+            disposition,
+            at_ms: crate::util::now_ms(),
+            held_nullifiers: held_nullifiers.to_vec(),
+        })),
+    }
+}
+
+/// The notes resolving `redrive` as `disposition` keeps excluded from
+/// selection until the disposition is acknowledged: every input of a spend
+/// that executed or may have, and none of one that never can.
+pub(super) fn held_by_resolution(
+    redrive: &PendingRedrive,
+    disposition: ShieldedSpendDisposition,
+) -> Vec<[u8; 32]> {
+    match disposition {
+        ShieldedSpendDisposition::Executed | ShieldedSpendDisposition::Unresolved(_) => {
+            redrive.nullifiers.clone()
+        }
+        ShieldedSpendDisposition::NotExecuted(_) => Vec::new(),
+    }
+}
+
 /// What the wallet knows about an identity debit's local recovery state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityDebitRecoveryStatus {
@@ -221,7 +583,7 @@ pub(super) struct MarkSpentOutcome {
 /// batch writes without interior mutability.
 pub trait ShieldedStore: Send + Sync {
     /// The error type returned by storage operations.
-    type Error: StdError + Send + Sync + 'static;
+    type Error: StdError + AsDispositionRefusal + Send + Sync + 'static;
 
     // ── Notes (per-subwallet) ──────────────────────────────────────────
 
@@ -302,6 +664,14 @@ pub trait ShieldedStore: Send + Sync {
     /// and its note reservations are rehydrated, so the re-drive — and
     /// the linked activity row's eventual Confirmed/Failed flip —
     /// continue across relaunches.
+    ///
+    /// While [`Self::records_spend_dispositions`] is on, overwriting an armed
+    /// note-spend record is refused with
+    /// [`ShieldedDispositionRefusal::RedriveArmed`]: it leaves only by a
+    /// resolution, which records its disposition. Identity-debit guards (no
+    /// nullifiers) may still be overwritten. While it is off, overwriting a
+    /// record armed while it was on ([`Self::redrive_armed_recording`]) is
+    /// refused the same way.
     fn arm_redrive(&mut self, id: SubwalletId, redrive: PendingRedrive) -> Result<(), Self::Error>;
 
     /// Every armed redrive record for `id`.
@@ -330,8 +700,233 @@ pub trait ShieldedStore: Send + Sync {
     /// implicitly when [`Self::mark_spent`] or [`Self::clear_pending`]
     /// resolves one of its nullifiers, since a transition lands or dies
     /// atomically for all of its nullifiers.
+    ///
+    /// While [`Self::records_spend_dispositions`] is on, an armed note-spend
+    /// record is refused with [`ShieldedDispositionRefusal::RedriveArmed`];
+    /// resolve it with [`Self::resolve_redrive`] instead. Identity-debit
+    /// guards are still cleared. While it is off, so is a record armed while
+    /// it was on, also one the store could not load when it opened (which
+    /// [`Self::redrive_armed_recording`] doesn't report).
     fn clear_redrive(&mut self, id: SubwalletId, activity_id: &[u8; 32])
         -> Result<(), Self::Error>;
+
+    // ── Spend dispositions ─────────────────────────────────────────────
+
+    /// Resolve `id`'s note-spend redrive keyed by `activity_id` as one atomic
+    /// step: record `disposition` under the redrive's
+    /// [`st_hash`](PendingRedrive::st_hash), delete the redrive record, and
+    /// release its note reservations. Returns the removed record.
+    ///
+    /// For `Executed` and `Unresolved`, the record's notes become the
+    /// disposition's [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers),
+    /// written in the same step and re-applied when a durable store reopens,
+    /// so they stay excluded from [`Self::get_unspent_notes`] and
+    /// [`Self::spendable_balance`] until [`Self::ack_disposition`] lifts them.
+    /// A crash before the host stores the notes as spent therefore cannot
+    /// offer them again, even if the host restores them unspent. Released
+    /// reservations no longer carry an anchor or activity, so the prune
+    /// backstop never sees them.
+    ///
+    /// A reservation that another armed redrive also carries stays reserved
+    /// for that redrive, which stays armed; `Executed` is then refused with
+    /// [`ShieldedDispositionRefusal::ReservationShared`]. An identical
+    /// unacknowledged disposition for the same `st_hash` in the wallet is
+    /// kept as is; a different one is [`ShieldedDispositionRefusal::Conflict`].
+    /// A missing record is [`ShieldedDispositionRefusal::RedriveNotFound`]
+    /// and an identity-debit guard is
+    /// [`ShieldedDispositionRefusal::IdentityDebit`].
+    ///
+    /// Resolution never marks notes spent, so a later [`Self::mark_spent`]
+    /// of each input still returns `true` and the spend reaches the host as
+    /// newly detected, as it does without a resolution. The inputs are also
+    /// the returned record's `nullifiers` and the disposition's
+    /// `held_nullifiers`.
+    ///
+    /// Durable implementations commit every durable effect in one transaction
+    /// before changing memory. On any error nothing changed: the record, its
+    /// reservations and the stored dispositions are as they were.
+    fn resolve_redrive(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+        disposition: ShieldedSpendDisposition,
+    ) -> Result<PendingRedrive, Self::Error>;
+
+    /// Record a disposition for a transition that has no armed redrive
+    /// record, persisted before anything else changes. Returns `false` when an
+    /// identical unacknowledged disposition already exists. Different
+    /// evidence for the same `st_hash` anywhere in the wallet is
+    /// [`ShieldedDispositionRefusal::Conflict`], and a redrive for `st_hash`
+    /// or `activity_id` still armed in any of the wallet's accounts is
+    /// [`ShieldedDispositionRefusal::RedriveArmed`]; nothing changes in
+    /// either case. A disposition recorded this way holds no notes.
+    fn record_disposition(
+        &mut self,
+        id: SubwalletId,
+        st_hash: &[u8; 32],
+        activity_id: &[u8; 32],
+        disposition: ShieldedSpendDisposition,
+    ) -> Result<bool, Self::Error>;
+
+    /// Every unacknowledged disposition for `wallet_id`, across all of its
+    /// accounts, ordered by account index then `st_hash`. Purges leave
+    /// dispositions in place, so this includes accounts that are no longer
+    /// bound. A stored value this build cannot decode is an error, never
+    /// skipped or defaulted: [`ShieldedDispositionRefusal::Unreadable`] names
+    /// the row to acknowledge whenever its key can be read.
+    fn dispositions(
+        &self,
+        wallet_id: WalletId,
+    ) -> Result<Vec<ShieldedSpendDispositionRecord>, Self::Error>;
+
+    /// Remove exactly the disposition for `id` and `st_hash`, once the caller
+    /// has durably settled it. Returns `false` if there was none.
+    ///
+    /// Acknowledging an `Executed` or `Unresolved` disposition lifts the
+    /// selection exclusion of its
+    /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
+    /// (a note another unacknowledged disposition also holds stays excluded),
+    /// after which the note's own spent flag governs. Acknowledge it only
+    /// once the host's spent state for those notes is durable: a note the
+    /// host still holds as unspent becomes selectable again.
+    fn ack_disposition(&mut self, id: SubwalletId, st_hash: &[u8; 32])
+        -> Result<bool, Self::Error>;
+
+    /// Mark the holds [`purge_wallet`](Self::purge_wallet) left on `id`'s
+    /// dispositions for its next completed scan as scanned, durably, and
+    /// return their keys (`st_hash`). They stay held. Other holds are
+    /// untouched.
+    ///
+    /// A sync pass that covered `id` calls this just before applying the
+    /// spent nullifiers it scanned, under the same store write guard. A
+    /// marked hold is from then on held like any other: no later pass marks
+    /// it again, and only [`lift_scanned_holds`](Self::lift_scanned_holds)
+    /// with the keys returned here, or
+    /// [`ack_disposition`](Self::ack_disposition), lifts it.
+    fn mark_holds_scanned(&mut self, id: SubwalletId) -> Result<Vec<[u8; 32]>, Self::Error>;
+
+    /// Lift the holds of `id` that [`mark_holds_scanned`](Self::mark_holds_scanned)
+    /// returned as `st_hashes`, durably. Their
+    /// [`held_nullifiers`](ShieldedSpendDispositionRecord::held_nullifiers)
+    /// become empty and the dispositions stay. A key that a later
+    /// [`purge_wallet`](Self::purge_wallet) marked for the next scan again is
+    /// skipped, and so is an
+    /// [`Unresolved(Purged)`](UnresolvedReason::Purged) disposition, which
+    /// only [`ack_disposition`](Self::ack_disposition) lifts.
+    ///
+    /// Call it only once the host holds the spent state of the pass that
+    /// marked them durably. The host may otherwise restore an older snapshot
+    /// in which the held notes are unspent, and nothing would hold them.
+    fn lift_scanned_holds(
+        &mut self,
+        id: SubwalletId,
+        st_hashes: &[[u8; 32]],
+    ) -> Result<(), Self::Error>;
+
+    /// Whether every path that resolves or deletes a note-spend redrive
+    /// records a disposition first. Off by default; the owner turns it on
+    /// when the host installs a dispatch hook that consumes dispositions.
+    ///
+    /// While it is on, [`Self::mark_spent`] and [`Self::clear_pending`] are
+    /// persist-first: `mark_spent` resolves the records its nullifier
+    /// belongs to (as [`Self::resolve_redrives_spending`] does) before it
+    /// changes memory, and `clear_pending` refuses with
+    /// [`ShieldedDispositionRefusal::RedriveArmed`] while an armed record
+    /// carries the nullifier. While it is off they keep their memory-first
+    /// behaviour, except for records armed while it was on (see
+    /// [`Self::redrive_armed_recording`]).
+    fn records_spend_dispositions(&self) -> bool;
+
+    /// Whether `id`'s redrive for `activity_id` is armed and was armed while
+    /// [`Self::records_spend_dispositions`] was on: by
+    /// [`Self::arm_unsent_redrive`], or by [`Self::arm_redrive`] for a
+    /// note-spend record. The mark is durable where the record is, and no
+    /// later re-arm clears it; it goes with the record.
+    ///
+    /// While dispositions are not recorded, such a record still leaves only
+    /// with a disposition: no pass without a dispatch hook sends it,
+    /// [`Self::arm_redrive`], [`Self::clear_pending`] and
+    /// [`Self::clear_redrive`] refuse it with
+    /// [`ShieldedDispositionRefusal::RedriveArmed`], and
+    /// [`Self::resolve_redrives_spending`] and [`Self::mark_spent`] resolve
+    /// it as they do while dispositions are recorded.
+    fn redrive_armed_recording(&self, id: SubwalletId, activity_id: &[u8; 32]) -> bool;
+
+    /// Before `id`'s note with `nullifier` is marked spent, resolve every
+    /// armed note-spend redrive that carries it, as [`Self::resolve_redrive`]
+    /// does, so each record's notes are held until its disposition is
+    /// acknowledged. `spending_action_cmx` is the output commitment of the
+    /// on-chain action that revealed `nullifier`, when the caller observed
+    /// it.
+    ///
+    /// A record is resolved [`Executed`](ShieldedSpendDisposition::Executed)
+    /// only if its own signed transition contains that exact action (the
+    /// nullifier with that output commitment), and it alone still reserves
+    /// all of its notes and none of them is already spent. Otherwise, since
+    /// another transition may have spent the note, it is
+    /// [`Unresolved(Unattributable)`](UnresolvedReason::Unattributable).
+    /// The note's spent flag is left to [`Self::mark_spent`], so the spend is
+    /// still reported as newly detected.
+    ///
+    /// Records are resolved whether or not the note is known: a store that
+    /// lacks the note cannot tell the spend was another transition's. While
+    /// [`Self::records_spend_dispositions`] is off, only records armed while
+    /// it was on ([`Self::redrive_armed_recording`]) are resolved. All
+    /// records the nullifier resolves commit together; on error nothing
+    /// changed.
+    fn resolve_redrives_spending(
+        &mut self,
+        id: SubwalletId,
+        nullifier: &[u8; 32],
+        spending_action_cmx: Option<&[u8; 32]>,
+    ) -> Result<(), Self::Error>;
+
+    /// Arm a note-spend redrive before its transition is first broadcast,
+    /// so a later [`abandon`](super::NetworkShieldedCoordinator::abandon_shielded_spend)
+    /// can prove nothing was sent. Call [`Self::mark_redrive_sent`] before
+    /// the first broadcast. Otherwise like [`Self::arm_redrive`], which
+    /// always arms a record as possibly sent.
+    ///
+    /// Refused with [`ShieldedDispositionRefusal::NotRecording`] while
+    /// [`Self::records_spend_dispositions`] is off, with
+    /// [`ShieldedDispositionRefusal::IdentityDebit`] for a record without
+    /// nullifiers, with [`ShieldedDispositionRefusal::RedriveArmed`]
+    /// while a record for the same activity is armed, which may have been
+    /// broadcast, and with
+    /// [`ShieldedDispositionRefusal::DispositionRecorded`] while the wallet
+    /// holds an unacknowledged disposition for the same transition: the
+    /// re-armed record could never be resolved without contradicting it.
+    fn arm_unsent_redrive(
+        &mut self,
+        id: SubwalletId,
+        redrive: PendingRedrive,
+    ) -> Result<(), Self::Error>;
+
+    /// Resolve `id`'s redrive for `activity_id` as
+    /// [`NotExecuted`](ShieldedSpendDisposition::NotExecuted)`(reason)` and
+    /// release its notes, only while the store shows, durably, that it was
+    /// never broadcast (armed by [`Self::arm_unsent_redrive`] and not yet
+    /// claimed by [`Self::mark_redrive_sent`]). Refused with
+    /// [`ShieldedDispositionRefusal::MayHaveBeenBroadcast`] once it may have
+    /// gone out, and with [`ShieldedDispositionRefusal::NotRecording`] while
+    /// dispositions are not recorded. Nothing changes on any error.
+    fn resolve_unsent_redrive(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+        reason: NotExecutedReason,
+    ) -> Result<PendingRedrive, Self::Error>;
+
+    /// Claim `id`'s redrive for `activity_id` for a broadcast: if it was
+    /// armed as never broadcast, record first, durably, that it may now have
+    /// been. Returns whether the record is still armed; a caller must not
+    /// broadcast a record that is not, since it may have been resolved (for
+    /// example abandoned) since the caller read it.
+    fn mark_redrive_sent(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<bool, Self::Error>;
 
     // ── Outgoing history (per-subwallet) ───────────────────────────────
 
@@ -486,6 +1081,29 @@ pub trait ShieldedStore: Send + Sync {
     /// per-wallet. Used when a wallet is removed or its shielded
     /// binding is cleared so a later re-bind resyncs from index 0
     /// rather than resuming behind the stale watermark.
+    ///
+    /// The wallet's unacknowledged dispositions are kept and keep holding
+    /// their notes, but each hold is marked, durably in the same step, for
+    /// the subwallet's next completed scan
+    /// ([`mark_holds_scanned`](Self::mark_holds_scanned)), which may lift it
+    /// once the host holds that scan's spent state
+    /// ([`lift_scanned_holds`](Self::lift_scanned_holds)). A wallet added
+    /// again under the same id can restore an older snapshot in which the
+    /// held notes are unspent; the hold keeps them out of selection until a
+    /// scan has applied Platform's spent nullifiers to them. Nothing may
+    /// acknowledge a removed wallet's dispositions, and acknowledging still
+    /// lifts a hold.
+    ///
+    /// A [`Purged`](UnresolvedReason::Purged) disposition's hold is never
+    /// marked: its spend may still land after any scan while its anchor is
+    /// recorded, and the anchor is gone with the record, so only
+    /// [`ack_disposition`](Self::ack_disposition) lifts it.
+    ///
+    /// A durable record armed while dispositions were recorded that the
+    /// store could not load when it opened (it was retained and skipped as
+    /// damaged) has no record to resolve, so it is kept, with a warning; the
+    /// rest of the purge goes on. A wallet added again under the same id
+    /// finds it retained and skipped again.
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error>;
 
     /// Drop the account-scoped state and nullifier-backed redrives for exactly
@@ -499,11 +1117,17 @@ pub trait ShieldedStore: Send + Sync {
     /// changed — their stored notes belong to the old key) are
     /// purged, so the accounts that remain bound keep their fresh
     /// in-memory notes and watermarks across the re-bind.
+    ///
+    /// Keeps a damaged durable record armed while dispositions were recorded,
+    /// as [`Self::purge_wallet`] does.
     fn purge_subwallet(&mut self, id: SubwalletId) -> Result<(), Self::Error>;
 
     /// Drop ALL in-memory per-subwallet state for every subwallet
     /// of every wallet. The shared commitment tree is left
     /// untouched. Used by `NetworkShieldedCoordinator::clear()`.
+    ///
+    /// Keeps a damaged durable record armed while dispositions were recorded,
+    /// as [`Self::purge_wallet`] does.
     fn purge_all_subwallets(&mut self) -> Result<(), Self::Error>;
 
     /// Empty the shared commitment tree back to zero leaves.
@@ -581,6 +1205,17 @@ pub(super) struct SubwalletState {
     /// (mark_spent / clear_pending) drops the whole record — a
     /// transition lands or dies atomically for all its nullifiers.
     pub redrives: BTreeMap<[u8; 32], PendingRedrive>,
+    /// Activity ids of armed redrives this library has never broadcast
+    /// (armed by `arm_unsent_redrive` and not yet marked sent). Any other
+    /// armed redrive may have been broadcast. An id here counts only while
+    /// `redrives` holds it; every arm and removal keeps the two in step.
+    pub unsent_redrives: BTreeSet<[u8; 32]>,
+    /// Activity ids of armed note-spend redrives armed while spend
+    /// dispositions were recorded (see
+    /// [`ShieldedStore::redrive_armed_recording`]). Like `unsent_redrives`,
+    /// an id here counts only while `redrives` holds it, and every removal
+    /// keeps the two in step; unlike it, re-arming never clears an id.
+    pub armed_recording: BTreeSet<[u8; 32]>,
     /// Notes this subwallet SENT, recovered via OVK during the scan.
     /// Append-only send history in recording order.
     pub outgoing_notes: Vec<ShieldedOutgoingNote>,
@@ -611,20 +1246,27 @@ impl SubwalletState {
     }
 
     /// Borrow the selectable notes so balance reads do not clone note payloads.
-    fn unspent_notes_iter(&self) -> impl Iterator<Item = &ShieldedNote> {
-        self.notes
-            .iter()
-            .filter(|note| !note.is_spent && !self.pending_nullifiers.contains_key(&note.nullifier))
+    /// `held` is the set of nullifiers unacknowledged dispositions keep
+    /// excluded (see [`ShieldedSpendDispositionRecord::held_nullifiers`]).
+    fn unspent_notes_iter<'a>(
+        &'a self,
+        held: &'a BTreeSet<[u8; 32]>,
+    ) -> impl Iterator<Item = &'a ShieldedNote> {
+        self.notes.iter().filter(|note| {
+            !note.is_spent
+                && !self.pending_nullifiers.contains_key(&note.nullifier)
+                && !held.contains(&note.nullifier)
+        })
     }
 
-    pub(super) fn unspent_notes(&self) -> Vec<ShieldedNote> {
-        self.unspent_notes_iter().cloned().collect()
+    pub(super) fn unspent_notes(&self, held: &BTreeSet<[u8; 32]>) -> Vec<ShieldedNote> {
+        self.unspent_notes_iter(held).cloned().collect()
     }
 
     /// Both stores use the same borrowed, reservation-aware checked sum.
     /// Each caller maps overflow into its own storage error.
-    pub(super) fn spendable_balance(&self) -> Option<u64> {
-        self.unspent_notes_iter()
+    pub(super) fn spendable_balance(&self, held: &BTreeSet<[u8; 32]>) -> Option<u64> {
+        self.unspent_notes_iter(held)
             .try_fold(0u64, |total, note| total.checked_add(note.value))
     }
 
@@ -670,6 +1312,8 @@ impl SubwalletState {
             .collect();
         for id in &dropped {
             self.redrives.remove(id);
+            self.unsent_redrives.remove(id);
+            self.armed_recording.remove(id);
         }
         dropped
     }
@@ -738,9 +1382,119 @@ impl SubwalletState {
         removed
     }
 
-    /// Arm (or overwrite by activity id) a re-drivable record.
+    /// Arm (or overwrite by activity id) a re-drivable record, as possibly
+    /// broadcast.
     pub(super) fn arm_redrive(&mut self, redrive: PendingRedrive) {
+        self.unsent_redrives.remove(&redrive.activity_id);
         self.redrives.insert(redrive.activity_id, redrive);
+    }
+
+    /// Arm a note-spend record that has never been broadcast.
+    pub(super) fn arm_unsent_redrive(&mut self, redrive: PendingRedrive) {
+        self.unsent_redrives.insert(redrive.activity_id);
+        self.redrives.insert(redrive.activity_id, redrive);
+    }
+
+    /// Whether `activity_id`'s redrive is armed and was never broadcast.
+    pub(super) fn redrive_is_unsent(&self, activity_id: &[u8; 32]) -> bool {
+        self.redrives.contains_key(activity_id) && self.unsent_redrives.contains(activity_id)
+    }
+
+    /// Mark `activity_id`'s armed redrive as armed while spend dispositions
+    /// were recorded.
+    pub(super) fn mark_armed_recording(&mut self, activity_id: [u8; 32]) {
+        if self.redrives.contains_key(&activity_id) {
+            self.armed_recording.insert(activity_id);
+        }
+    }
+
+    /// Whether `activity_id`'s redrive is armed and was armed while spend
+    /// dispositions were recorded.
+    pub(super) fn redrive_armed_recording(&self, activity_id: &[u8; 32]) -> bool {
+        self.redrives.contains_key(activity_id) && self.armed_recording.contains(activity_id)
+    }
+
+    /// The first armed redrive carrying `nullifier` that was armed while
+    /// spend dispositions were recorded.
+    pub(super) fn armed_recording_carrying(&self, nullifier: &[u8; 32]) -> Option<[u8; 32]> {
+        self.redrives_carrying(nullifier)
+            .into_iter()
+            .find(|activity_id| self.armed_recording.contains(activity_id))
+    }
+
+    /// Activity ids of the armed redrives that carry `nullifier`.
+    pub(super) fn redrives_carrying(&self, nullifier: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.redrives
+            .values()
+            .filter(|redrive| redrive.nullifiers.contains(nullifier))
+            .map(|redrive| redrive.activity_id)
+            .collect()
+    }
+
+    /// Whether evidence that `activity_id`'s note-spend redrive executed is
+    /// attributable to it alone: it still reserves every one of its notes,
+    /// none of them is already marked spent, and no other armed redrive
+    /// reserves any of them.
+    pub(super) fn execution_attributable(&self, activity_id: &[u8; 32]) -> bool {
+        let Ok(redrive) = self.redrive_to_resolve(activity_id, ShieldedSpendDisposition::Executed)
+        else {
+            return false;
+        };
+        redrive.nullifiers.iter().all(|nullifier| {
+            self.pending_nullifiers.contains_key(nullifier)
+                && !self
+                    .nullifier_index
+                    .get(nullifier)
+                    .is_some_and(|&index| self.notes[index].is_spent)
+        })
+    }
+
+    /// The disposition a spent `nullifier` supports for `activity_id`'s
+    /// redrive: `Executed` only when the on-chain action that spent it, with
+    /// output commitment `spending_action_cmx`, is one of this redrive's own
+    /// actions and the execution is attributable to it; otherwise
+    /// `Unresolved(Unattributable)`.
+    pub(super) fn spent_note_disposition(
+        &self,
+        activity_id: &[u8; 32],
+        nullifier: &[u8; 32],
+        spending_action_cmx: Option<&[u8; 32]>,
+    ) -> ShieldedSpendDisposition {
+        let proven = spending_action_cmx.is_some_and(|cmx| {
+            self.redrives
+                .get(activity_id)
+                .is_some_and(|redrive| redrive.contains_action(nullifier, cmx))
+        });
+        if proven {
+            self.observed_execution_disposition(activity_id)
+        } else {
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable)
+        }
+    }
+
+    /// Whether every note `activity_id`'s armed redrive spends is known and
+    /// not marked spent. See `FileBackedShieldedStore::redrive_inputs_known_unspent`.
+    pub(super) fn redrive_inputs_known_unspent(&self, activity_id: &[u8; 32]) -> bool {
+        self.redrives.get(activity_id).is_some_and(|redrive| {
+            redrive.nullifiers.iter().all(|nullifier| {
+                self.nullifier_index
+                    .get(nullifier)
+                    .is_some_and(|&index| !self.notes[index].is_spent)
+            })
+        })
+    }
+
+    /// The disposition that observed outputs of `activity_id`'s transition
+    /// support for its redrive.
+    pub(super) fn observed_execution_disposition(
+        &self,
+        activity_id: &[u8; 32],
+    ) -> ShieldedSpendDisposition {
+        if self.execution_attributable(activity_id) {
+            ShieldedSpendDisposition::Executed
+        } else {
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable)
+        }
     }
 
     pub(super) fn pending_redrives(&self) -> Vec<PendingRedrive> {
@@ -773,6 +1527,95 @@ impl SubwalletState {
 
     pub(super) fn clear_redrive(&mut self, activity_id: &[u8; 32]) {
         self.redrives.remove(activity_id);
+        self.unsent_redrives.remove(activity_id);
+        self.armed_recording.remove(activity_id);
+    }
+
+    /// The armed note-spend redrive `resolve_redrive` may resolve as
+    /// `disposition`. Identity debits carry no input nullifiers and are
+    /// refused, and `Executed` is refused while another armed redrive
+    /// reserves one of the same notes.
+    pub(super) fn redrive_to_resolve(
+        &self,
+        activity_id: &[u8; 32],
+        disposition: ShieldedSpendDisposition,
+    ) -> Result<&PendingRedrive, ShieldedDispositionRefusal> {
+        let redrive =
+            self.redrives
+                .get(activity_id)
+                .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
+                    activity_id: *activity_id,
+                })?;
+        if redrive.nullifiers.is_empty() {
+            return Err(ShieldedDispositionRefusal::IdentityDebit {
+                activity_id: *activity_id,
+            });
+        }
+        if disposition == ShieldedSpendDisposition::Executed {
+            if let Some(other) = self.redrives.values().find(|other| {
+                other.activity_id != *activity_id
+                    && other
+                        .nullifiers
+                        .iter()
+                        .any(|nullifier| redrive.nullifiers.contains(nullifier))
+            }) {
+                return Err(ShieldedDispositionRefusal::ReservationShared {
+                    activity_id: *activity_id,
+                    other_activity_id: other.activity_id,
+                });
+            }
+        }
+        Ok(redrive)
+    }
+
+    /// Refuse a standalone disposition while a redrive for the same
+    /// transition or activity is still armed.
+    pub(super) fn ensure_no_armed_redrive(
+        &self,
+        st_hash: &[u8; 32],
+        activity_id: &[u8; 32],
+    ) -> Result<(), ShieldedDispositionRefusal> {
+        match self
+            .redrives
+            .values()
+            .find(|redrive| redrive.activity_id == *activity_id || redrive.st_hash() == *st_hash)
+        {
+            Some(redrive) => Err(ShieldedDispositionRefusal::RedriveArmed {
+                activity_id: redrive.activity_id,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Remove the redrive keyed by `activity_id` and release each of its
+    /// reservations that no remaining armed redrive carries. A reservation
+    /// another redrive still carries is repointed to that redrive's anchor
+    /// and activity, so the prune backstop judges it by the survivor.
+    pub(super) fn remove_redrive_and_release(
+        &mut self,
+        activity_id: &[u8; 32],
+    ) -> Option<PendingRedrive> {
+        let redrive = self.redrives.remove(activity_id)?;
+        self.unsent_redrives.remove(activity_id);
+        self.armed_recording.remove(activity_id);
+        for nullifier in &redrive.nullifiers {
+            match self
+                .redrives
+                .values()
+                .find(|other| other.nullifiers.contains(nullifier))
+            {
+                Some(other) => {
+                    if let Some(pending) = self.pending_nullifiers.get_mut(nullifier) {
+                        pending.anchor = Some(other.anchor);
+                        pending.activity_id = Some(other.activity_id);
+                    }
+                }
+                None => {
+                    self.pending_nullifiers.remove(nullifier);
+                }
+            }
+        }
+        Some(redrive)
     }
 
     /// Record an outgoing (sent) note. Idempotent by `cmx`: returns
@@ -824,13 +1667,41 @@ impl SubwalletState {
 
 // ── InMemoryShieldedStore ──────────────────────────────────────────────
 
-/// Trivial error type for the in-memory store (infallible in practice).
+/// Error type for the in-memory store: a message, or a typed disposition
+/// refusal.
 #[derive(Debug, Clone)]
-pub struct InMemoryStoreError(String);
+pub struct InMemoryStoreError {
+    message: String,
+    refusal: Option<ShieldedDispositionRefusal>,
+}
+
+impl InMemoryStoreError {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            refusal: None,
+        }
+    }
+}
+
+impl AsDispositionRefusal for InMemoryStoreError {
+    fn disposition_refusal(&self) -> Option<&ShieldedDispositionRefusal> {
+        self.refusal.as_ref()
+    }
+}
+
+impl From<ShieldedDispositionRefusal> for InMemoryStoreError {
+    fn from(refusal: ShieldedDispositionRefusal) -> Self {
+        Self {
+            message: refusal.to_string(),
+            refusal: Some(refusal),
+        }
+    }
+}
 
 impl fmt::Display for InMemoryStoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -853,6 +1724,12 @@ pub struct InMemoryShieldedStore {
     checkpoints: Vec<u32>,
     /// Placeholder anchor; production stores compute the real Sinsemilla root.
     anchor: [u8; 32],
+    /// Unacknowledged spend dispositions. Held outside `subwallets` so purges
+    /// leave them in place.
+    dispositions: BTreeMap<(SubwalletId, [u8; 32]), ShieldedSpendDispositionRecord>,
+    /// Keys of the dispositions whose holds a wallet purge left to the
+    /// subwallet's next completed scan.
+    holds_awaiting_scan: BTreeSet<(SubwalletId, [u8; 32])>,
 }
 
 impl InMemoryShieldedStore {
@@ -860,6 +1737,28 @@ impl InMemoryShieldedStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// The nullifiers `id`'s unacknowledged dispositions keep excluded from
+    /// selection.
+    fn held(&self, id: SubwalletId) -> BTreeSet<[u8; 32]> {
+        self.dispositions
+            .values()
+            .filter(|record| record.subwallet == id)
+            .flat_map(|record| record.held_nullifiers.iter().copied())
+            .collect()
+    }
+}
+
+/// The unacknowledged disposition for `st_hash` in any of the wallet's
+/// accounts.
+fn wallet_disposition<'a>(
+    dispositions: &'a BTreeMap<(SubwalletId, [u8; 32]), ShieldedSpendDispositionRecord>,
+    wallet_id: WalletId,
+    st_hash: &[u8; 32],
+) -> Option<&'a ShieldedSpendDispositionRecord> {
+    dispositions
+        .values()
+        .find(|record| record.subwallet.wallet_id == wallet_id && record.st_hash == *st_hash)
 }
 
 impl ShieldedStore for InMemoryShieldedStore {
@@ -871,18 +1770,20 @@ impl ShieldedStore for InMemoryShieldedStore {
     }
 
     fn get_unspent_notes(&self, id: SubwalletId) -> Result<Vec<ShieldedNote>, Self::Error> {
+        let held = self.held(id);
         Ok(self
             .subwallets
             .get(&id)
-            .map(SubwalletState::unspent_notes)
+            .map(|sw| sw.unspent_notes(&held))
             .unwrap_or_default())
     }
 
     fn spendable_balance(&self, id: SubwalletId) -> Result<u64, Self::Error> {
+        let held = self.held(id);
         self.subwallets
             .get(&id)
-            .map_or(Some(0), SubwalletState::spendable_balance)
-            .ok_or_else(|| InMemoryStoreError("spendable shielded balance exceeds u64".to_string()))
+            .map_or(Some(0), |sw| sw.spendable_balance(&held))
+            .ok_or_else(|| InMemoryStoreError::message("spendable shielded balance exceeds u64"))
     }
 
     fn get_all_notes(&self, id: SubwalletId) -> Result<Vec<ShieldedNote>, Self::Error> {
@@ -998,6 +1899,170 @@ impl ShieldedStore for InMemoryShieldedStore {
         Ok(())
     }
 
+    fn resolve_redrive(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+        disposition: ShieldedSpendDisposition,
+    ) -> Result<PendingRedrive, Self::Error> {
+        let sw =
+            self.subwallets
+                .get_mut(&id)
+                .ok_or(ShieldedDispositionRefusal::RedriveNotFound {
+                    activity_id: *activity_id,
+                })?;
+        let redrive = sw.redrive_to_resolve(activity_id, disposition)?;
+        let st_hash = redrive.st_hash();
+        let record = disposition_to_write(
+            wallet_disposition(&self.dispositions, id.wallet_id, &st_hash),
+            id,
+            &st_hash,
+            activity_id,
+            disposition,
+            &held_by_resolution(redrive, disposition),
+        )?;
+        let redrive = sw.remove_redrive_and_release(activity_id).ok_or(
+            ShieldedDispositionRefusal::RedriveNotFound {
+                activity_id: *activity_id,
+            },
+        )?;
+        if let Some(record) = record {
+            self.dispositions.insert((id, st_hash), record);
+        }
+        Ok(redrive)
+    }
+
+    fn record_disposition(
+        &mut self,
+        id: SubwalletId,
+        st_hash: &[u8; 32],
+        activity_id: &[u8; 32],
+        disposition: ShieldedSpendDisposition,
+    ) -> Result<bool, Self::Error> {
+        for (_, sw) in self
+            .subwallets
+            .iter()
+            .filter(|(subwallet, _)| subwallet.wallet_id == id.wallet_id)
+        {
+            sw.ensure_no_armed_redrive(st_hash, activity_id)?;
+        }
+        let Some(record) = disposition_to_write(
+            wallet_disposition(&self.dispositions, id.wallet_id, st_hash),
+            id,
+            st_hash,
+            activity_id,
+            disposition,
+            &[],
+        )?
+        else {
+            return Ok(false);
+        };
+        self.dispositions.insert((id, *st_hash), record);
+        Ok(true)
+    }
+
+    fn dispositions(
+        &self,
+        wallet_id: WalletId,
+    ) -> Result<Vec<ShieldedSpendDispositionRecord>, Self::Error> {
+        Ok(self
+            .dispositions
+            .values()
+            .filter(|record| record.subwallet.wallet_id == wallet_id)
+            .cloned()
+            .collect())
+    }
+
+    fn ack_disposition(
+        &mut self,
+        id: SubwalletId,
+        st_hash: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        self.holds_awaiting_scan.remove(&(id, *st_hash));
+        Ok(self.dispositions.remove(&(id, *st_hash)).is_some())
+    }
+
+    fn mark_holds_scanned(&mut self, id: SubwalletId) -> Result<Vec<[u8; 32]>, Self::Error> {
+        let scanned: Vec<_> = self
+            .holds_awaiting_scan
+            .range((id, [0u8; 32])..=(id, [0xFF; 32]))
+            .copied()
+            .collect();
+        for key in &scanned {
+            self.holds_awaiting_scan.remove(key);
+        }
+        Ok(scanned.into_iter().map(|(_, st_hash)| st_hash).collect())
+    }
+
+    fn lift_scanned_holds(
+        &mut self,
+        id: SubwalletId,
+        st_hashes: &[[u8; 32]],
+    ) -> Result<(), Self::Error> {
+        for st_hash in st_hashes {
+            let key = (id, *st_hash);
+            if self.holds_awaiting_scan.contains(&key) {
+                continue;
+            }
+            if let Some(record) = self.dispositions.get_mut(&key) {
+                if record.disposition
+                    == ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged)
+                {
+                    continue;
+                }
+                record.held_nullifiers.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn records_spend_dispositions(&self) -> bool {
+        false
+    }
+
+    fn redrive_armed_recording(&self, _id: SubwalletId, _activity_id: &[u8; 32]) -> bool {
+        // This store never records spend dispositions.
+        false
+    }
+
+    fn resolve_redrives_spending(
+        &mut self,
+        _id: SubwalletId,
+        _nullifier: &[u8; 32],
+        _spending_action_cmx: Option<&[u8; 32]>,
+    ) -> Result<(), Self::Error> {
+        // This store never records spend dispositions.
+        Ok(())
+    }
+
+    fn arm_unsent_redrive(
+        &mut self,
+        _id: SubwalletId,
+        _redrive: PendingRedrive,
+    ) -> Result<(), Self::Error> {
+        Err(ShieldedDispositionRefusal::NotRecording.into())
+    }
+
+    fn resolve_unsent_redrive(
+        &mut self,
+        _id: SubwalletId,
+        _activity_id: &[u8; 32],
+        _reason: NotExecutedReason,
+    ) -> Result<PendingRedrive, Self::Error> {
+        Err(ShieldedDispositionRefusal::NotRecording.into())
+    }
+
+    fn mark_redrive_sent(
+        &mut self,
+        id: SubwalletId,
+        activity_id: &[u8; 32],
+    ) -> Result<bool, Self::Error> {
+        Ok(self.subwallets.get_mut(&id).is_some_and(|sw| {
+            sw.unsent_redrives.remove(activity_id);
+            sw.redrives.contains_key(activity_id)
+        }))
+    }
+
     fn record_outgoing_note(
         &mut self,
         id: SubwalletId,
@@ -1082,8 +2147,8 @@ impl ShieldedStore for InMemoryShieldedStore {
         _position: u64,
         _depth: usize,
     ) -> Result<Option<grovedb_commitment_tree::MerklePath>, Self::Error> {
-        Err(InMemoryStoreError(
-            "Merkle witness not supported in in-memory store".into(),
+        Err(InMemoryStoreError::message(
+            "Merkle witness not supported in in-memory store",
         ))
     }
 
@@ -1113,6 +2178,17 @@ impl ShieldedStore for InMemoryShieldedStore {
 
     fn purge_wallet(&mut self, wallet_id: WalletId) -> Result<(), Self::Error> {
         self.subwallets.retain(|id, _| id.wallet_id != wallet_id);
+        self.holds_awaiting_scan.extend(
+            self.dispositions
+                .iter()
+                .filter(|(key, record)| {
+                    key.0.wallet_id == wallet_id
+                        && !record.held_nullifiers.is_empty()
+                        && record.disposition
+                            != ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged)
+                })
+                .map(|(key, _)| *key),
+        );
         Ok(())
     }
 
@@ -1150,6 +2226,987 @@ impl ShieldedStore for InMemoryShieldedStore {
     }
 }
 
+/// Disposition behaviour every [`ShieldedStore`] must show, run against each
+/// implementation by its own tests. Each check returns the wallets it used so
+/// a durable store can compare them across a reopen.
+#[cfg(test)]
+pub(super) mod disposition_contract {
+    use super::*;
+
+    pub(crate) fn note(nullifier: [u8; 32]) -> ShieldedNote {
+        ShieldedNote {
+            position: u64::from(nullifier[0]),
+            cmx: nullifier,
+            nullifier,
+            block_height: 1,
+            is_spent: false,
+            value: 1_000,
+            note_data: vec![0u8; 115],
+        }
+    }
+
+    /// A note-spend record whose bytes, and so its `st_hash`, are unique per `tag`.
+    pub(crate) fn spend(tag: u8, nullifiers: &[[u8; 32]]) -> PendingRedrive {
+        PendingRedrive {
+            activity_id: [tag; 32],
+            anchor: [0x5A; 32],
+            nullifiers: nullifiers.to_vec(),
+            st_bytes: vec![tag; 48],
+            attempts: 0,
+            identity_nonce_finalized: false,
+            identity_user_abandoned: false,
+        }
+    }
+
+    /// The output commitment [`spend_with_actions`] gives the action of
+    /// record `tag` that spends `nullifier`.
+    pub(crate) fn action_cmx(tag: u8, nullifier: &[u8; 32]) -> [u8; 32] {
+        let mut cmx = [tag; 32];
+        cmx[16..].copy_from_slice(&nullifier[16..]);
+        cmx
+    }
+
+    /// One action of record `tag` per nullifier, spending it with output
+    /// commitment [`action_cmx`].
+    pub(crate) fn actions(
+        tag: u8,
+        nullifiers: &[[u8; 32]],
+    ) -> Vec<dpp::shielded::SerializedAction> {
+        nullifiers
+            .iter()
+            .map(|nullifier| dpp::shielded::SerializedAction {
+                nullifier: *nullifier,
+                rk: [tag; 32],
+                cmx: action_cmx(tag, nullifier),
+                encrypted_note: vec![tag; 216],
+                cv_net: [tag; 32],
+                spend_auth_sig: [tag; 64],
+            })
+            .collect()
+    }
+
+    /// A note-spend record whose bytes are a real shielded transfer with one
+    /// action per nullifier, so a spent nullifier with the action's output
+    /// commitment ([`action_cmx`]) proves it executed.
+    pub(crate) fn spend_with_actions(tag: u8, nullifiers: &[[u8; 32]]) -> PendingRedrive {
+        use dpp::serialization::PlatformSerializable;
+        use dpp::state_transition::shielded_transfer_transition::v0::ShieldedTransferTransitionV0;
+
+        let transition: dpp::state_transition::StateTransition = ShieldedTransferTransitionV0 {
+            actions: actions(tag, nullifiers),
+            value_balance: 1_000,
+            anchor: [0x5A; 32],
+            proof: vec![tag; 40],
+            binding_signature: [tag; 64],
+        }
+        .into();
+        PendingRedrive {
+            st_bytes: transition.serialize_to_bytes().expect("serialize"),
+            ..spend(tag, nullifiers)
+        }
+    }
+
+    /// Reserve the record's notes the way a spend does, then arm it.
+    pub(crate) fn arm_reserved<S: ShieldedStore>(
+        store: &mut S,
+        id: SubwalletId,
+        redrive: &PendingRedrive,
+    ) {
+        for nullifier in &redrive.nullifiers {
+            store.save_note(id, &note(*nullifier)).unwrap();
+            store.mark_pending(id, nullifier).unwrap();
+            store
+                .set_pending_spend(id, nullifier, redrive.anchor, redrive.activity_id)
+                .unwrap();
+        }
+        store.arm_redrive(id, redrive.clone()).unwrap();
+    }
+
+    pub(crate) fn unspent<S: ShieldedStore>(store: &S, id: SubwalletId) -> BTreeSet<[u8; 32]> {
+        store
+            .get_unspent_notes(id)
+            .unwrap()
+            .into_iter()
+            .map(|note| note.nullifier)
+            .collect()
+    }
+
+    /// Each redrive's disposition among `records` holds what its value says:
+    /// every input of a spend that executed or may have, none of one that
+    /// never can.
+    pub(crate) fn assert_holds_by_value(
+        records: &[ShieldedSpendDispositionRecord],
+        redrives: &[&PendingRedrive],
+    ) {
+        for redrive in redrives {
+            let record = records
+                .iter()
+                .find(|record| record.st_hash == redrive.st_hash())
+                .unwrap_or_else(|| panic!("no disposition for {:?}", redrive.activity_id));
+            let expected: BTreeSet<[u8; 32]> = match record.disposition {
+                ShieldedSpendDisposition::NotExecuted(_) => BTreeSet::new(),
+                ShieldedSpendDisposition::Executed | ShieldedSpendDisposition::Unresolved(_) => {
+                    redrive.nullifiers.iter().copied().collect()
+                }
+            };
+            let held: BTreeSet<[u8; 32]> = record.held_nullifiers.iter().copied().collect();
+            assert_eq!(
+                held, expected,
+                "{:?} must hold what it may have spent",
+                record.disposition
+            );
+            assert_eq!(held.len(), record.held_nullifiers.len());
+        }
+    }
+
+    /// The typed refusal, read through [`AsDispositionRefusal`] as generic
+    /// callers would.
+    fn refusal<T: fmt::Debug, E: StdError + AsDispositionRefusal>(
+        result: Result<T, E>,
+    ) -> ShieldedDispositionRefusal {
+        let error = result.expect_err("the store must refuse");
+        error
+            .disposition_refusal()
+            .cloned()
+            .unwrap_or_else(|| panic!("expected a typed refusal, got {error}"))
+    }
+
+    /// `NotExecuted` releases the record's notes; `Executed` removes the
+    /// record but keeps its notes out of selection, with nothing the prune
+    /// backstop or a `clear_pending` could release.
+    pub(crate) fn resolve_records_removes_and_releases<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC1; 32], 3);
+        let executed = spend(0x11, &[[0xA1; 32], [0xA2; 32]]);
+        let rejected = spend(0x1C, &[[0xA5; 32]]);
+        arm_reserved(store, id, &executed);
+        arm_reserved(store, id, &rejected);
+        assert!(unspent(store, id).is_empty());
+
+        let removed = store
+            .resolve_redrive(
+                id,
+                &rejected.activity_id,
+                ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected),
+            )
+            .expect("resolve rejected");
+        assert_eq!(removed, rejected);
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0xA5; 32]]),
+            "NotExecuted releases every reservation of the record"
+        );
+
+        let removed = store
+            .resolve_redrive(
+                id,
+                &executed.activity_id,
+                ShieldedSpendDisposition::Executed,
+            )
+            .expect("resolve executed");
+
+        assert_eq!(removed, executed);
+        assert!(store.pending_redrives(id).unwrap().is_empty());
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0xA5; 32]]),
+            "Executed keeps the record's notes out of selection"
+        );
+        assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
+        assert!(
+            store.stale_pending_spends(id).unwrap().is_empty(),
+            "the prune backstop has nothing of an executed record to release"
+        );
+        for nullifier in &executed.nullifiers {
+            store.clear_pending(id, nullifier).unwrap();
+        }
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0xA5; 32]]),
+            "only the acknowledgement lifts the exclusion"
+        );
+        let dispositions = store.dispositions(id.wallet_id).unwrap();
+        assert_eq!(dispositions.len(), 2);
+        let record = dispositions
+            .iter()
+            .find(|record| record.st_hash == executed.st_hash())
+            .expect("the executed disposition");
+        assert_eq!(record.subwallet, id);
+        assert_eq!(record.activity_id, executed.activity_id);
+        assert_eq!(record.disposition, ShieldedSpendDisposition::Executed);
+        assert_eq!(record.held_nullifiers, executed.nullifiers);
+        let record = dispositions
+            .iter()
+            .find(|record| record.st_hash == rejected.st_hash())
+            .expect("the rejected disposition");
+        assert!(record.held_nullifiers.is_empty());
+        assert!(store.dispositions([0xC2; 32]).unwrap().is_empty());
+        vec![id.wallet_id]
+    }
+
+    /// Resolution leaves the spent flags alone, so the scan's `mark_spent`
+    /// still reports each input as newly spent. Acknowledging lifts the
+    /// exclusion, after which each note's own flag governs.
+    pub(crate) fn executed_hold_reports_spends_and_lifts_on_ack<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xCD; 32], 0);
+        let spent = [0xA6; 32];
+        let unmarked = [0xA7; 32];
+        let redrive = spend(0x1D, &[spent, unmarked]);
+        arm_reserved(store, id, &redrive);
+        store
+            .resolve_redrive(id, &redrive.activity_id, ShieldedSpendDisposition::Executed)
+            .unwrap();
+
+        assert!(
+            store.mark_spent(id, &spent).unwrap(),
+            "a held input is still reported as newly spent"
+        );
+        assert!(unspent(store, id).is_empty());
+
+        assert!(store.ack_disposition(id, &redrive.st_hash()).unwrap());
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([unmarked]),
+            "the acknowledgement lifts the hold; the spent flag governs"
+        );
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+        vec![id.wallet_id]
+    }
+
+    /// A note two unacknowledged dispositions hold stays excluded until both
+    /// are acknowledged. An ack naming another account, or an identical
+    /// second resolution, leaves a hold in place.
+    pub(crate) fn ack_lifts_only_its_own_hold<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xCE; 32], 1);
+        let shared = [0xB6; 32];
+        let first = spend(0x1E, &[shared, [0xB7; 32]]);
+        let second = spend(0x1F, &[shared]);
+        arm_reserved(store, id, &first);
+        store
+            .resolve_redrive(id, &first.activity_id, ShieldedSpendDisposition::Executed)
+            .unwrap();
+        arm_reserved(store, id, &second);
+        store
+            .resolve_redrive(id, &second.activity_id, ShieldedSpendDisposition::Executed)
+            .unwrap();
+        assert!(unspent(store, id).is_empty());
+
+        assert!(
+            !store
+                .ack_disposition(SubwalletId::new(id.wallet_id, 2), &first.st_hash())
+                .unwrap(),
+            "an ack naming another account acknowledges nothing"
+        );
+        let before = store.dispositions(id.wallet_id).unwrap();
+        arm_reserved(store, id, &first);
+        assert_eq!(
+            store
+                .resolve_redrive(id, &first.activity_id, ShieldedSpendDisposition::Executed)
+                .expect("an identical resolution completes"),
+            first
+        );
+        assert_eq!(store.dispositions(id.wallet_id).unwrap(), before);
+        assert!(
+            unspent(store, id).is_empty(),
+            "an identical resolution keeps the hold"
+        );
+
+        assert!(store.ack_disposition(id, &first.st_hash()).unwrap());
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0xB7; 32]]),
+            "a note the other disposition holds stays excluded"
+        );
+        assert!(store.ack_disposition(id, &second.st_hash()).unwrap());
+        assert_eq!(unspent(store, id), BTreeSet::from([shared, [0xB7; 32]]));
+        vec![id.wallet_id]
+    }
+
+    pub(crate) fn identical_second_write_is_noop_and_different_conflicts<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC3; 32], 0);
+        let st_hash = [0x21; 32];
+        let activity_id = [0x31; 32];
+        let rejected = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
+        let purged = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
+        assert!(store
+            .record_disposition(id, &st_hash, &activity_id, rejected)
+            .unwrap());
+        let before = store.dispositions(id.wallet_id).unwrap();
+
+        assert!(
+            !store
+                .record_disposition(id, &st_hash, &activity_id, rejected)
+                .unwrap(),
+            "an identical second write is a no-op"
+        );
+        assert_eq!(
+            refusal(store.record_disposition(id, &st_hash, &activity_id, purged)),
+            ShieldedDispositionRefusal::Conflict {
+                st_hash,
+                existing_account_index: 0,
+                existing_activity_id: activity_id,
+                existing: rejected,
+                attempted_account_index: 0,
+                attempted_activity_id: activity_id,
+                attempted: purged,
+            }
+        );
+        assert!(matches!(
+            refusal(store.record_disposition(id, &st_hash, &[0x32; 32], rejected)),
+            ShieldedDispositionRefusal::Conflict { .. }
+        ));
+        assert!(
+            matches!(
+                refusal(store.record_disposition(
+                    SubwalletId::new(id.wallet_id, 1),
+                    &st_hash,
+                    &activity_id,
+                    rejected
+                )),
+                ShieldedDispositionRefusal::Conflict {
+                    existing_account_index: 0,
+                    attempted_account_index: 1,
+                    ..
+                }
+            ),
+            "one transition has one piece of evidence across the wallet's accounts"
+        );
+        assert_eq!(
+            store.dispositions(id.wallet_id).unwrap(),
+            before,
+            "neither the no-op nor a conflict may touch the stored evidence"
+        );
+        assert!(
+            store
+                .record_disposition(
+                    SubwalletId::new([0xC2; 32], 0),
+                    &st_hash,
+                    &activity_id,
+                    purged
+                )
+                .unwrap(),
+            "another wallet keeps its own evidence"
+        );
+
+        // The same rule holds when the write comes from resolving a record.
+        let redrive = spend(0x12, &[[0xA3; 32]]);
+        assert!(store
+            .record_disposition(id, &redrive.st_hash(), &redrive.activity_id, rejected)
+            .unwrap());
+        let before = store.dispositions(id.wallet_id).unwrap();
+        arm_reserved(store, id, &redrive);
+        assert!(matches!(
+            refusal(store.resolve_redrive(
+                id,
+                &redrive.activity_id,
+                ShieldedSpendDisposition::Executed
+            )),
+            ShieldedDispositionRefusal::Conflict { .. }
+        ));
+        assert_eq!(
+            store.pending_redrives(id).unwrap(),
+            vec![redrive.clone()],
+            "a conflicting resolution leaves the record armed"
+        );
+        assert!(
+            unspent(store, id).is_empty(),
+            "and leaves its reservations in place"
+        );
+        assert_eq!(store.dispositions(id.wallet_id).unwrap(), before);
+
+        assert_eq!(
+            store
+                .resolve_redrive(id, &redrive.activity_id, rejected)
+                .expect("an identical resolution completes"),
+            redrive
+        );
+        assert!(store.pending_redrives(id).unwrap().is_empty());
+        assert_eq!(unspent(store, id), BTreeSet::from([[0xA3; 32]]));
+        assert_eq!(
+            store.dispositions(id.wallet_id).unwrap(),
+            before,
+            "the existing evidence is kept unchanged"
+        );
+
+        // A standalone disposition holds no notes; resolving a record of the
+        // same transition as `Executed` or `Unresolved` would, so it is
+        // different evidence.
+        for (tag, disposition) in [(0x1Bu8, ShieldedSpendDisposition::Executed), (0x22, purged)] {
+            let input = [tag.wrapping_add(0x8D); 32];
+            let redrive = spend(tag, &[input]);
+            assert!(store
+                .record_disposition(id, &redrive.st_hash(), &redrive.activity_id, disposition)
+                .unwrap());
+            let before = store.dispositions(id.wallet_id).unwrap();
+            arm_reserved(store, id, &redrive);
+            assert!(matches!(
+                refusal(store.resolve_redrive(id, &redrive.activity_id, disposition)),
+                ShieldedDispositionRefusal::Conflict { .. }
+            ));
+            assert!(
+                store.pending_redrives(id).unwrap().contains(&redrive),
+                "a conflicting resolution leaves the record armed"
+            );
+            assert!(!unspent(store, id).contains(&input));
+            assert_eq!(store.dispositions(id.wallet_id).unwrap(), before);
+        }
+        vec![id.wallet_id, [0xC2; 32]]
+    }
+
+    pub(crate) fn resolve_redrive_refuses_identity_debit_and_missing_activity<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC4; 32], 1);
+        let identity_debit = spend(0x13, &[]);
+        store.arm_redrive(id, identity_debit.clone()).unwrap();
+
+        assert_eq!(
+            refusal(store.resolve_redrive(
+                id,
+                &identity_debit.activity_id,
+                ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Abandoned)
+            )),
+            ShieldedDispositionRefusal::IdentityDebit {
+                activity_id: identity_debit.activity_id
+            }
+        );
+        assert_eq!(
+            store.pending_redrives(id).unwrap(),
+            vec![identity_debit],
+            "an identity debit keeps its own recovery model"
+        );
+        for (subwallet, activity_id) in [
+            (id, [0xEE; 32]),
+            (SubwalletId::new([0xC4; 32], 2), [0x13; 32]),
+        ] {
+            assert_eq!(
+                refusal(store.resolve_redrive(
+                    subwallet,
+                    &activity_id,
+                    ShieldedSpendDisposition::Executed
+                )),
+                ShieldedDispositionRefusal::RedriveNotFound { activity_id }
+            );
+        }
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+        vec![id.wallet_id]
+    }
+
+    pub(crate) fn record_disposition_refuses_while_redrive_armed<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC5; 32], 0);
+        let redrive = spend(0x14, &[[0xA4; 32]]);
+        arm_reserved(store, id, &redrive);
+        let executed = ShieldedSpendDisposition::Executed;
+
+        for (subwallet, st_hash, activity_id) in [
+            (id, redrive.st_hash(), [0x99; 32]),
+            (id, [0x98; 32], redrive.activity_id),
+            (
+                SubwalletId::new(id.wallet_id, 1),
+                redrive.st_hash(),
+                redrive.activity_id,
+            ),
+        ] {
+            assert_eq!(
+                refusal(store.record_disposition(subwallet, &st_hash, &activity_id, executed)),
+                ShieldedDispositionRefusal::RedriveArmed {
+                    activity_id: redrive.activity_id
+                }
+            );
+        }
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![redrive.clone()]);
+        assert!(unspent(store, id).is_empty());
+
+        let other_wallet = SubwalletId::new([0xCC; 32], 0);
+        assert!(
+            store
+                .record_disposition(
+                    other_wallet,
+                    &redrive.st_hash(),
+                    &redrive.activity_id,
+                    executed
+                )
+                .unwrap(),
+            "the armed-record check is scoped to its own wallet"
+        );
+        vec![id.wallet_id, other_wallet.wallet_id]
+    }
+
+    pub(crate) fn ack_removes_only_that_hash<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
+        let wallet_id = [0xC6; 32];
+        let a = SubwalletId::new(wallet_id, 0);
+        let b = SubwalletId::new(wallet_id, 1);
+        let other = SubwalletId::new([0xC7; 32], 0);
+        let rejected = ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Rejected);
+        for (id, st_hash) in [
+            (a, [0x41; 32]),
+            (a, [0x42; 32]),
+            (b, [0x43; 32]),
+            (other, [0x41; 32]),
+        ] {
+            assert!(store
+                .record_disposition(id, &st_hash, &[0x50; 32], rejected)
+                .unwrap());
+        }
+
+        assert!(store.ack_disposition(a, &[0x41; 32]).unwrap());
+
+        let left: Vec<_> = store
+            .dispositions(wallet_id)
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.subwallet, record.st_hash))
+            .collect();
+        assert_eq!(left, vec![(a, [0x42; 32]), (b, [0x43; 32])]);
+        assert_eq!(store.dispositions(other.wallet_id).unwrap().len(), 1);
+        assert!(!store.ack_disposition(a, &[0x41; 32]).unwrap());
+        assert!(
+            !store.ack_disposition(a, &[0x43; 32]).unwrap(),
+            "an ack names its account; another account's evidence stays"
+        );
+        assert_eq!(store.dispositions(wallet_id).unwrap().len(), 2);
+        vec![wallet_id, other.wallet_id]
+    }
+
+    pub(crate) fn purges_leave_dispositions<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
+        let first = SubwalletId::new([0xC8; 32], 0);
+        let second = SubwalletId::new([0xC8; 32], 1);
+        let other = SubwalletId::new([0xC9; 32], 0);
+        for (tag, id) in [(0x15, first), (0x16, second), (0x17, other)] {
+            let redrive = spend(tag, &[[tag.wrapping_add(0x80); 32]]);
+            arm_reserved(store, id, &redrive);
+            store
+                .resolve_redrive(
+                    id,
+                    &redrive.activity_id,
+                    ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Pruned),
+                )
+                .unwrap();
+            assert!(store
+                .record_disposition(
+                    id,
+                    &[tag; 32],
+                    &[tag; 32],
+                    ShieldedSpendDisposition::Unresolved(UnresolvedReason::DeserializeDropped)
+                )
+                .unwrap());
+        }
+        let executed = spend(0x1A, &[[0x9A; 32]]);
+        arm_reserved(store, first, &executed);
+        store
+            .resolve_redrive(
+                first,
+                &executed.activity_id,
+                ShieldedSpendDisposition::Executed,
+            )
+            .unwrap();
+        let before = (
+            store.dispositions(first.wallet_id).unwrap(),
+            store.dispositions(other.wallet_id).unwrap(),
+        );
+        assert_eq!(before.0.len(), 5);
+        assert_eq!(before.1.len(), 2);
+
+        store.purge_subwallet(first).unwrap();
+        store.purge_all_subwallets().unwrap();
+
+        let after = || {
+            (
+                store.dispositions(first.wallet_id).unwrap(),
+                store.dispositions(other.wallet_id).unwrap(),
+            )
+        };
+        assert_eq!(
+            after(),
+            before,
+            "purges must leave every unacknowledged disposition"
+        );
+        store
+            .save_note(first, &note(executed.nullifiers[0]))
+            .unwrap();
+        assert!(
+            unspent(store, first).is_empty(),
+            "and an account or all-subwallet purge leaves the notes an Executed disposition holds"
+        );
+
+        store.purge_wallet(first.wallet_id).unwrap();
+        assert_eq!(
+            (
+                store.dispositions(first.wallet_id).unwrap(),
+                store.dispositions(other.wallet_id).unwrap(),
+            ),
+            before,
+            "a wallet purge keeps the dispositions and their held lists until a scan"
+        );
+        store
+            .save_note(first, &note(executed.nullifiers[0]))
+            .unwrap();
+        assert!(
+            unspent(store, first).is_empty(),
+            "a wallet purge alone lifts no hold"
+        );
+        vec![first.wallet_id, other.wallet_id]
+    }
+
+    /// Removing a wallet leaves its holds until the subwallet's next
+    /// completed scan, durably, and keeps its dispositions. Added again under
+    /// the same id from an older snapshot in which the held inputs are
+    /// unspent, they stay out of selection and balance, also beside a healthy
+    /// note. The re-added subwallet's first pass applies the spent nullifiers
+    /// it scanned and marks its holds as scanned, which lifts nothing: no
+    /// later pass marks them again, and only lifting the keys that pass
+    /// returned makes an input selectable, and only if the scan found it
+    /// unspent. A `Purged` row is never marked, so it holds its input until
+    /// acknowledged. The same wallet's other account and another wallet keep
+    /// their holds until their own scan.
+    pub(crate) fn purge_wallet_releases_its_holds<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC0; 32], 1);
+        let sibling = SubwalletId::new([0xC0; 32], 2);
+        let other = SubwalletId::new([0xBC; 32], 0);
+        let executed = spend(0x26, &[[0x96; 32]]);
+        let cancelled = spend(0x27, &[[0x97; 32], [0x98; 32]]);
+        let purged = spend(0x2B, &[[0x9D; 32]]);
+        let kept = spend(0x28, &[[0x99; 32]]);
+        let sibling_spend = spend(0x2A, &[[0x9B; 32]]);
+        let healthy = [0x9C; 32];
+        let purged_disposition = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
+        arm_reserved(store, id, &executed);
+        arm_reserved(store, id, &cancelled);
+        arm_reserved(store, id, &purged);
+        arm_reserved(store, other, &kept);
+        arm_reserved(store, sibling, &sibling_spend);
+        for (subwallet, redrive, disposition) in [
+            (id, &executed, ShieldedSpendDisposition::Executed),
+            (
+                id,
+                &cancelled,
+                ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled),
+            ),
+            (id, &purged, purged_disposition),
+            (other, &kept, ShieldedSpendDisposition::Executed),
+            (sibling, &sibling_spend, ShieldedSpendDisposition::Executed),
+        ] {
+            store
+                .resolve_redrive(subwallet, &redrive.activity_id, disposition)
+                .unwrap();
+        }
+        let before = store.dispositions(id.wallet_id).unwrap();
+
+        store.purge_wallet(id.wallet_id).unwrap();
+        assert_eq!(
+            store.dispositions(id.wallet_id).unwrap(),
+            before,
+            "a wallet purge keeps its dispositions and their holds"
+        );
+        // Added again: the host restores an older snapshot in which every
+        // input is unspent.
+        for nullifier in [[0x96; 32], [0x97; 32], [0x98; 32], [0x9D; 32], healthy] {
+            store.save_note(id, &note(nullifier)).unwrap();
+        }
+        store.save_note(sibling, &note([0x9B; 32])).unwrap();
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([healthy]),
+            "before a scan the held inputs stay out of selection"
+        );
+        assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
+
+        // Its first pass scans the executed input spent and marks the holds.
+        let mut changeset = crate::changeset::ShieldedChangeSet::default();
+        let (_, scanned) =
+            crate::wallet::shielded::sync::commit_scan(store, &[id], &[[0x96; 32]], &mut changeset)
+                .unwrap();
+        let mut marked = scanned[&id].clone();
+        marked.sort_unstable();
+        let mut expected = vec![executed.st_hash(), cancelled.st_hash()];
+        expected.sort_unstable();
+        assert_eq!(
+            marked, expected,
+            "the scan marks exactly the removal's holds, a Purged one excepted"
+        );
+        assert_eq!(scanned.len(), 1, "only the scanned subwallet's holds");
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([healthy]),
+            "a scan alone lifts no hold"
+        );
+        let (_, again) =
+            crate::wallet::shielded::sync::commit_scan(store, &[id], &[], &mut changeset).unwrap();
+        assert!(again.is_empty(), "a later pass marks nothing again");
+        assert_eq!(unspent(store, id), BTreeSet::from([healthy]));
+
+        store.lift_scanned_holds(id, &scanned[&id]).unwrap();
+        store.lift_scanned_holds(id, &[purged.st_hash()]).unwrap();
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0x97; 32], [0x98; 32], healthy]),
+            "the scan settles the held inputs, but not the Purged one, not even \
+             when its key is lifted"
+        );
+        assert_eq!(store.spendable_balance(id).unwrap(), 3_000);
+        let after = store.dispositions(id.wallet_id).unwrap();
+        assert_eq!(after.len(), before.len(), "its dispositions stay");
+        for (after, before) in after.iter().zip(&before) {
+            assert_eq!(
+                (after.st_hash, after.activity_id, after.disposition),
+                (before.st_hash, before.activity_id, before.disposition)
+            );
+            assert_eq!(
+                after.held_nullifiers.is_empty(),
+                after.subwallet == id && after.disposition != purged_disposition
+            );
+        }
+
+        assert!(store.ack_disposition(id, &purged.st_hash()).unwrap());
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0x97; 32], [0x98; 32], [0x9D; 32], healthy]),
+            "only an acknowledgement lifts a Purged hold"
+        );
+        assert!(
+            unspent(store, sibling).is_empty(),
+            "the same wallet's unscanned account keeps its hold"
+        );
+        store.save_note(other, &note([0x99; 32])).unwrap();
+        assert!(
+            unspent(store, other).is_empty(),
+            "another wallet's hold stays"
+        );
+        vec![id.wallet_id, other.wallet_id]
+    }
+
+    pub(crate) fn resolve_keeps_reservations_another_redrive_holds<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xCA; 32], 0);
+        let shared = [0xB1; 32];
+        let first = spend(0x18, &[shared, [0xB2; 32]]);
+        let second = PendingRedrive {
+            anchor: [0x5B; 32],
+            ..spend(0x19, &[shared, [0xB3; 32]])
+        };
+        arm_reserved(store, id, &first);
+        arm_reserved(store, id, &second);
+
+        assert_eq!(
+            refusal(store.resolve_redrive(
+                id,
+                &first.activity_id,
+                ShieldedSpendDisposition::Executed
+            )),
+            ShieldedDispositionRefusal::ReservationShared {
+                activity_id: first.activity_id,
+                other_activity_id: second.activity_id,
+            },
+            "a spent shared nullifier cannot show which record executed"
+        );
+        assert_eq!(store.pending_redrives(id).unwrap().len(), 2);
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+
+        // The shared reservation was last attached to `second`; resolving it
+        // must hand the reservation back to `first`, not leave it on `second`.
+        store
+            .resolve_redrive(
+                id,
+                &second.activity_id,
+                ShieldedSpendDisposition::NotExecuted(NotExecutedReason::Pruned),
+            )
+            .unwrap();
+
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![first.clone()]);
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0xB3; 32]]),
+            "a note another armed record carries stays reserved"
+        );
+        let mut stale = store.stale_pending_spends(id).unwrap();
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                (shared, first.anchor, Some(first.activity_id)),
+                ([0xB2; 32], first.anchor, Some(first.activity_id)),
+            ],
+            "the kept reservation now describes the surviving record"
+        );
+
+        store
+            .resolve_redrive(id, &first.activity_id, ShieldedSpendDisposition::Executed)
+            .expect("with no other record on its notes, Executed is allowed");
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([[0xB3; 32]]),
+            "the executed record's notes, the shared one included, stay held"
+        );
+        vec![id.wallet_id]
+    }
+
+    /// A record refused `Executed` because another armed record shares one
+    /// of its notes resolves honestly as `Unattributable`. That holds the
+    /// record's notes until it is acknowledged and leaves the shared
+    /// reservation with the other record.
+    pub(crate) fn shared_note_resolves_unattributable<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xCF; 32], 0);
+        let shared = [0xB8; 32];
+        let first = spend(0x20, &[shared, [0xB9; 32]]);
+        let second = PendingRedrive {
+            anchor: [0x5C; 32],
+            ..spend(0x21, &[shared, [0xBA; 32]])
+        };
+        arm_reserved(store, id, &first);
+        arm_reserved(store, id, &second);
+        assert!(matches!(
+            refusal(store.resolve_redrive(
+                id,
+                &first.activity_id,
+                ShieldedSpendDisposition::Executed
+            )),
+            ShieldedDispositionRefusal::ReservationShared { .. }
+        ));
+
+        let unattributable = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable);
+        assert_eq!(
+            store
+                .resolve_redrive(id, &first.activity_id, unattributable)
+                .unwrap(),
+            first
+        );
+        assert_eq!(store.pending_redrives(id).unwrap(), vec![second.clone()]);
+        assert!(unspent(store, id).is_empty(), "the record's notes are held");
+        let mut stale = store.stale_pending_spends(id).unwrap();
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![
+                (shared, second.anchor, Some(second.activity_id)),
+                ([0xBA; 32], second.anchor, Some(second.activity_id)),
+            ]
+        );
+        let dispositions = store.dispositions(id.wallet_id).unwrap();
+        assert_eq!(dispositions.len(), 1);
+        assert_eq!(dispositions[0].st_hash, first.st_hash());
+        assert_eq!(dispositions[0].disposition, unattributable);
+        assert_eq!(dispositions[0].held_nullifiers, first.nullifiers);
+        vec![id.wallet_id]
+    }
+
+    /// Every `Unresolved` resolution holds the record's notes out of
+    /// selection until it is acknowledged, without marking them spent, and
+    /// the acknowledgement by its key lifts exactly that hold.
+    pub(crate) fn unresolved_resolutions_hold_until_ack<S: ShieldedStore>(
+        store: &mut S,
+    ) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xC6; 32], 1);
+        let healthy = [0xB0; 32];
+        store.save_note(id, &note(healthy)).unwrap();
+        let resolved: Vec<_> = [
+            (0x23u8, UnresolvedReason::DeserializeDropped),
+            (0x24, UnresolvedReason::Purged),
+            (0x25, UnresolvedReason::Unattributable),
+            (0x29, UnresolvedReason::Cancelled),
+        ]
+        .into_iter()
+        .map(|(tag, reason)| {
+            let inputs = [[tag.wrapping_add(0x9A); 32], [tag.wrapping_add(0xAA); 32]];
+            let redrive = spend(tag, &inputs);
+            arm_reserved(store, id, &redrive);
+            let disposition = ShieldedSpendDisposition::Unresolved(reason);
+            assert_eq!(
+                store
+                    .resolve_redrive(id, &redrive.activity_id, disposition)
+                    .unwrap(),
+                redrive
+            );
+            (redrive, disposition)
+        })
+        .collect();
+
+        assert_eq!(
+            unspent(store, id),
+            BTreeSet::from([healthy]),
+            "every Unresolved resolution holds its notes"
+        );
+        assert_eq!(store.spendable_balance(id).unwrap(), 1_000);
+        assert!(store.stale_pending_spends(id).unwrap().is_empty());
+        let dispositions = store.dispositions(id.wallet_id).unwrap();
+        for (redrive, disposition) in &resolved {
+            let record = dispositions
+                .iter()
+                .find(|record| record.st_hash == redrive.st_hash())
+                .expect("the disposition");
+            assert_eq!(record.disposition, *disposition);
+            assert_eq!(record.held_nullifiers, redrive.nullifiers);
+        }
+
+        let mut selectable = BTreeSet::from([healthy]);
+        for (redrive, disposition) in &resolved {
+            assert!(
+                store.ack_disposition(id, &redrive.st_hash()).unwrap(),
+                "{disposition:?} is acknowledged by its key"
+            );
+            selectable.extend(redrive.nullifiers.iter().copied());
+            assert_eq!(
+                unspent(store, id),
+                selectable,
+                "acknowledging {disposition:?} lifts exactly its hold"
+            );
+        }
+        assert!(store.dispositions(id.wallet_id).unwrap().is_empty());
+        vec![id.wallet_id]
+    }
+
+    pub(crate) fn unresolved_roundtrips<S: ShieldedStore>(store: &mut S) -> Vec<WalletId> {
+        let id = SubwalletId::new([0xCB; 32], 2);
+        let dropped = spend(0x1A, &[[0xB4; 32]]);
+        arm_reserved(store, id, &dropped);
+        let deserialize_dropped =
+            ShieldedSpendDisposition::Unresolved(UnresolvedReason::DeserializeDropped);
+        let purged = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
+        let unattributable = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Unattributable);
+        let cancelled = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Cancelled);
+        store
+            .resolve_redrive(id, &dropped.activity_id, deserialize_dropped)
+            .unwrap();
+        assert!(store
+            .record_disposition(id, &[0x1D; 32], &[0x1D; 32], cancelled)
+            .unwrap());
+        assert!(store
+            .record_disposition(id, &[0x1B; 32], &[0x1B; 32], purged)
+            .unwrap());
+        assert!(store
+            .record_disposition(id, &[0x1C; 32], &[0x1C; 32], unattributable)
+            .unwrap());
+
+        let got: Vec<_> = store
+            .dispositions(id.wallet_id)
+            .unwrap()
+            .into_iter()
+            .map(|record| (record.st_hash, record.activity_id, record.disposition))
+            .collect();
+        let mut expected = vec![
+            (dropped.st_hash(), dropped.activity_id, deserialize_dropped),
+            ([0x1B; 32], [0x1B; 32], purged),
+            ([0x1C; 32], [0x1C; 32], unattributable),
+            ([0x1D; 32], [0x1D; 32], cancelled),
+        ];
+        expected.sort_by_key(|(st_hash, _, _)| *st_hash);
+        assert_eq!(got, expected);
+        vec![id.wallet_id]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,21 +3226,34 @@ mod tests {
         state.mark_pending(&[2; 32]);
         state.mark_spent(&[3; 32]);
 
-        let borrowed: Vec<_> = state.unspent_notes_iter().collect();
+        let none = BTreeSet::new();
+        let borrowed: Vec<_> = state.unspent_notes_iter(&none).collect();
         assert_eq!(borrowed.len(), 2);
         assert!(std::ptr::eq(borrowed[0], &state.notes[0]));
         assert!(std::ptr::eq(borrowed[1], &state.notes[3]));
-        assert_eq!(state.spendable_balance(), Some(500));
+        assert_eq!(state.spendable_balance(&none), Some(500));
         assert_eq!(
             state
-                .unspent_notes()
+                .unspent_notes(&none)
                 .iter()
                 .map(|note| note.value)
                 .collect::<Vec<_>>(),
             vec![100, 400]
         );
+        let held = BTreeSet::from([[4; 32]]);
+        assert_eq!(
+            state
+                .unspent_notes(&held)
+                .iter()
+                .map(|note| note.value)
+                .collect::<Vec<_>>(),
+            vec![100],
+            "a held note is excluded like a reserved one"
+        );
+        assert_eq!(state.spendable_balance(&held), Some(100));
         state.clear_pending(&[2; 32]);
-        assert_eq!(state.spendable_balance(), Some(700));
+        assert_eq!(state.spendable_balance(&none), Some(700));
+        assert_eq!(state.spendable_balance(&held), Some(300));
     }
 
     #[test]
@@ -1699,5 +3769,200 @@ mod tests {
             vec![(id, identity_guard)],
             "the retained guard must remain visible to wallet-wide admission and redrive"
         );
+    }
+
+    #[test]
+    fn st_hash_equals_transaction_id() {
+        use dpp::serialization::PlatformSerializable;
+        use dpp::state_transition::shielded_transfer_transition::v0::ShieldedTransferTransitionV0;
+        use dpp::state_transition::unshield_transition::v0::UnshieldTransitionV0;
+        use dpp::state_transition::StateTransition;
+
+        let transfer: StateTransition = ShieldedTransferTransitionV0 {
+            actions: vec![],
+            value_balance: 1_000,
+            anchor: [0x51; 32],
+            proof: vec![0x07; 40],
+            binding_signature: [0x09; 64],
+        }
+        .into();
+        let unshield: StateTransition = UnshieldTransitionV0 {
+            output_address: dpp::address_funds::PlatformAddress::P2pkh([0x0C; 20]),
+            actions: vec![],
+            unshielding_amount: 2_000,
+            anchor: [0x52; 32],
+            proof: vec![0x08; 40],
+            binding_signature: [0x0A; 64],
+        }
+        .into();
+        for transition in [transfer, unshield] {
+            let redrive = PendingRedrive {
+                activity_id: [0x01; 32],
+                anchor: [0x02; 32],
+                nullifiers: vec![[0x03; 32]],
+                st_bytes: transition.serialize_to_bytes().unwrap(),
+                attempts: 0,
+                identity_nonce_finalized: false,
+                identity_user_abandoned: false,
+            };
+            assert_eq!(redrive.st_hash(), transition.transaction_id().unwrap());
+        }
+    }
+
+    #[test]
+    fn disposition_strings_are_stable_and_unknown_values_fail_closed() {
+        use ShieldedSpendDisposition::{Executed, NotExecuted, Unresolved};
+        let table = [
+            (Executed, "executed", None),
+            (
+                NotExecuted(NotExecutedReason::Refused),
+                "not_executed",
+                Some("refused"),
+            ),
+            (
+                NotExecuted(NotExecutedReason::Abandoned),
+                "not_executed",
+                Some("abandoned"),
+            ),
+            (
+                NotExecuted(NotExecutedReason::Rejected),
+                "not_executed",
+                Some("rejected"),
+            ),
+            (
+                NotExecuted(NotExecutedReason::Pruned),
+                "not_executed",
+                Some("pruned"),
+            ),
+            (
+                Unresolved(UnresolvedReason::DeserializeDropped),
+                "unresolved",
+                Some("deserialize_dropped"),
+            ),
+            (
+                Unresolved(UnresolvedReason::Purged),
+                "unresolved",
+                Some("purged"),
+            ),
+            (
+                Unresolved(UnresolvedReason::Unattributable),
+                "unresolved",
+                Some("unattributable"),
+            ),
+            (
+                Unresolved(UnresolvedReason::Cancelled),
+                "unresolved",
+                Some("cancelled"),
+            ),
+        ];
+        for (disposition, kind, reason) in table {
+            assert_eq!(disposition.kind_str(), kind);
+            assert_eq!(disposition.reason_str(), reason);
+            assert_eq!(
+                ShieldedSpendDisposition::from_stored(kind, reason),
+                Ok(disposition)
+            );
+        }
+        for (kind, reason) in [
+            ("executed", Some("refused")),
+            ("not_executed", None),
+            ("not_executed", Some("purged")),
+            ("not_executed", Some("unattributable")),
+            ("not_executed", Some("cancelled")),
+            ("unresolved", None),
+            ("unresolved", Some("refused")),
+            ("unresolved", Some("a_later_reason")),
+            ("Executed", None),
+            ("pending", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                ShieldedSpendDisposition::from_stored(kind, reason),
+                Err(UnknownDispositionValue {
+                    kind: kind.to_owned(),
+                    reason: reason.map(str::to_owned),
+                }),
+                "{kind:?}/{reason:?} must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn in_memory_resolve_records_removes_and_releases() {
+        disposition_contract::resolve_records_removes_and_releases(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_identical_second_write_is_noop_and_different_conflicts() {
+        disposition_contract::identical_second_write_is_noop_and_different_conflicts(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_resolve_redrive_refuses_identity_debit_and_missing_activity() {
+        disposition_contract::resolve_redrive_refuses_identity_debit_and_missing_activity(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_record_disposition_refuses_while_redrive_armed() {
+        disposition_contract::record_disposition_refuses_while_redrive_armed(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_ack_removes_only_that_hash() {
+        disposition_contract::ack_removes_only_that_hash(&mut InMemoryShieldedStore::new());
+    }
+
+    #[test]
+    fn in_memory_purges_leave_dispositions() {
+        disposition_contract::purges_leave_dispositions(&mut InMemoryShieldedStore::new());
+    }
+
+    #[test]
+    fn in_memory_resolve_keeps_reservations_another_redrive_holds() {
+        disposition_contract::resolve_keeps_reservations_another_redrive_holds(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_executed_hold_reports_spends_and_lifts_on_ack() {
+        disposition_contract::executed_hold_reports_spends_and_lifts_on_ack(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_ack_lifts_only_its_own_hold() {
+        disposition_contract::ack_lifts_only_its_own_hold(&mut InMemoryShieldedStore::new());
+    }
+
+    #[test]
+    fn in_memory_shared_note_resolves_unattributable() {
+        disposition_contract::shared_note_resolves_unattributable(&mut InMemoryShieldedStore::new());
+    }
+
+    #[test]
+    fn in_memory_unresolved_resolutions_hold_until_ack() {
+        disposition_contract::unresolved_resolutions_hold_until_ack(
+            &mut InMemoryShieldedStore::new(),
+        );
+    }
+
+    #[test]
+    fn in_memory_purge_wallet_releases_its_holds() {
+        disposition_contract::purge_wallet_releases_its_holds(&mut InMemoryShieldedStore::new());
+    }
+
+    #[test]
+    fn in_memory_unresolved_roundtrips() {
+        disposition_contract::unresolved_roundtrips(&mut InMemoryShieldedStore::new());
     }
 }

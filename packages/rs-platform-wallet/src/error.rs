@@ -952,6 +952,16 @@ pub enum PlatformWalletError {
         reason: String,
     },
 
+    /// A shielded spend was not broadcast by this call: the host's dispatch
+    /// hook refused it, it was resolved (for example abandoned) before its
+    /// first broadcast, or the hook was set while it was being built. A
+    /// refusal is normally recorded as not executed, which frees its notes,
+    /// but check the spend's disposition before building it again: if the
+    /// refusal couldn't be recorded the spend stays armed and may still be
+    /// sent.
+    #[error("Shielded spend was not sent: {reason}")]
+    ShieldedDispatchRefused { reason: String },
+
     /// A masternode (evonode) identity credit withdrawal was **broadcast and
     /// accepted**, but its execution result could not be confirmed (the
     /// result-proof fetch/verify failed — transient DAPI/proof error or
@@ -995,6 +1005,15 @@ pub enum PlatformWalletError {
 
     #[error("Shielded store error: {0}")]
     ShieldedStoreError(String),
+
+    /// The shielded store refused a spend-disposition write, redrive
+    /// resolution or read, and changed nothing. The refusal stays typed so a
+    /// caller can match it, for example to acknowledge an
+    /// [`Unreadable`](crate::wallet::shielded::ShieldedDispositionRefusal::Unreadable)
+    /// row by its key.
+    #[cfg(feature = "shielded")]
+    #[error("Shielded spend disposition refused: {0}")]
+    ShieldedDispositionRefused(crate::wallet::shielded::ShieldedDispositionRefusal),
 
     #[error("Shielded Merkle witness unavailable: {0}")]
     ShieldedMerkleWitnessUnavailable(String),

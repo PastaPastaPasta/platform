@@ -749,6 +749,28 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
             .map(Arc::clone)
     }
 
+    /// Set the host's dispatch hook on the shielded coordinator (see
+    /// [`NetworkShieldedCoordinator::set_shielded_dispatch`]): every
+    /// shielded note spend of this manager's wallets is registered through it
+    /// before its first broadcast, and spend dispositions are recorded from
+    /// then on. Call it after [`Self::configure_shielded`] and before the
+    /// first shielded spend or sync. It can be set only once.
+    ///
+    /// [`NetworkShieldedCoordinator::set_shielded_dispatch`]:
+    ///     crate::wallet::shielded::NetworkShieldedCoordinator::set_shielded_dispatch
+    #[cfg(feature = "shielded")]
+    pub async fn set_shielded_dispatch(
+        &self,
+        hook: Arc<dyn crate::wallet::shielded::ShieldedDispatch>,
+    ) -> Result<(), crate::error::PlatformWalletError> {
+        let coordinator = self.shielded_coordinator().await.ok_or_else(|| {
+            crate::error::PlatformWalletError::ShieldedStoreError(
+                "shielded is not configured: call configure_shielded first".to_owned(),
+            )
+        })?;
+        coordinator.set_shielded_dispatch(hook).await
+    }
+
     /// Tear down shielded sync state for a Clear / wipe flow.
     ///
     /// Single library entry point so the FFI stays a one-call bridge:
