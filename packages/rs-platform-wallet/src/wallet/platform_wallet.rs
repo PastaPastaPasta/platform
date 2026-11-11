@@ -1329,18 +1329,7 @@ impl PlatformWallet {
         account: u32,
     ) -> Result<super::shielded::OrchardKeySet, PlatformWalletError> {
         use super::shielded::OrchardKeySet;
-        let bound_fvk = {
-            let guard = self.shielded_keys.read().await;
-            let keys = guard
-                .as_ref()
-                .ok_or(PlatformWalletError::ShieldedNotBound)?;
-            let views = keys.get(&account).ok_or_else(|| {
-                PlatformWalletError::ShieldedKeyDerivation(format!(
-                    "shielded account {account} not bound"
-                ))
-            })?;
-            views.full_viewing_key.to_bytes()
-        };
+        let bound_fvk = self.bound_full_viewing_key(account).await?;
         let keyset = OrchardKeySet::from_seed(seed, self.sdk.network, account)?;
         if keyset.full_viewing_key.to_bytes() != bound_fvk {
             return Err(PlatformWalletError::ShieldedKeyDerivation(format!(
@@ -1348,6 +1337,54 @@ impl PlatformWallet {
             )));
         }
         Ok(keyset)
+    }
+
+    /// The raw full viewing key bound for `account`: `ShieldedNotBound`
+    /// with no shielded sub-wallet, "account not bound" without `account`.
+    #[cfg(feature = "shielded")]
+    async fn bound_full_viewing_key(&self, account: u32) -> Result<[u8; 96], PlatformWalletError> {
+        let guard = self.shielded_keys.read().await;
+        let keys = guard
+            .as_ref()
+            .ok_or(PlatformWalletError::ShieldedNotBound)?;
+        let views = keys.get(&account).ok_or_else(|| {
+            PlatformWalletError::ShieldedKeyDerivation(format!(
+                "shielded account {account} not bound"
+            ))
+        })?;
+        Ok(views.full_viewing_key.to_bytes())
+    }
+
+    /// Refuse a caller-held `keyset` that isn't `account`'s spend authority:
+    /// `account` must be bound (the errors of
+    /// [`derive_spend_keyset`](Self::derive_spend_keyset)), and the keyset's
+    /// full viewing key must equal the bound one. Every other field the
+    /// spend reads must be the one that FVK determines, as
+    /// [`OrchardKeySet::from_seed`](super::shielded::OrchardKeySet::from_seed)
+    /// derives it: the spend-authorizing key's validating key is the FVK's,
+    /// and the incoming and outgoing viewing keys and the default (change)
+    /// address are the FVK's external-scope ones at index 0. Any mismatch is
+    /// [`PlatformWalletError::ShieldedKeysetMismatch`].
+    #[cfg(feature = "shielded")]
+    async fn check_spend_keyset(
+        &self,
+        keyset: &super::shielded::OrchardKeySet,
+        account: u32,
+    ) -> Result<(), PlatformWalletError> {
+        use grovedb_commitment_tree::{Scope, SpendValidatingKey};
+        let bound_fvk = self.bound_full_viewing_key(account).await?;
+        let fvk = &keyset.full_viewing_key;
+        let consistent = fvk.to_bytes() == bound_fvk
+            && SpendValidatingKey::from(&keyset.spend_auth_key)
+                == SpendValidatingKey::from(fvk.clone())
+            && keyset.incoming_viewing_key.to_bytes() == fvk.to_ivk(Scope::External).to_bytes()
+            && keyset.outgoing_viewing_key.as_ref() == fvk.to_ovk(Scope::External).as_ref()
+            && keyset.default_address.to_raw_address_bytes()
+                == fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        if !consistent {
+            return Err(PlatformWalletError::ShieldedKeysetMismatch { account });
+        }
+        Ok(())
     }
 
     /// Send a private shielded → shielded transfer from `account`'s
@@ -1358,8 +1395,10 @@ impl PlatformWallet {
     /// commitment-tree store; `seed` supplies the spend authority —
     /// the full `OrchardKeySet` (with the `SpendAuthorizingKey`) is
     /// re-derived from it for this call only and dropped on return.
-    /// Privilege separation: the ASK never crosses to the
-    /// coordinator — the spend free function takes the keyset by
+    /// The spend then runs exactly as
+    /// [`shielded_transfer_to_with_keyset`](Self::shielded_transfer_to_with_keyset)
+    /// with that keyset. Privilege separation: the ASK never crosses to
+    /// the coordinator — the spend free function takes the keyset by
     /// reference at call time.
     ///
     /// The prover is consumed by value rather than borrowed
@@ -1381,6 +1420,47 @@ impl PlatformWallet {
         prover: P,
     ) -> Result<(), PlatformWalletError> {
         let keyset = self.derive_spend_keyset(seed, account).await?;
+        self.shielded_transfer_to_with_keyset(
+            coordinator,
+            &keyset,
+            account,
+            recipient_raw_43,
+            amount,
+            memo,
+            prover,
+        )
+        .await
+    }
+
+    /// [`shielded_transfer_to`](Self::shielded_transfer_to) with the spend
+    /// authority supplied as `account`'s full `OrchardKeySet` instead of the
+    /// wallet seed, for a caller that holds the keyset but not the seed.
+    ///
+    /// The caller needs to hold the keyset only for this call: the wallet
+    /// borrows it for the spend and keeps no copy. Privilege separation: the
+    /// ASK never crosses to the coordinator — the spend free function takes
+    /// the keyset by reference at call time. Before
+    /// anything is parsed, built, proven or stored, `account` must be bound
+    /// (`ShieldedNotBound` / "account not bound" otherwise), the keyset's
+    /// full viewing key must equal the bound one, and its spend-authorizing
+    /// key, incoming and outgoing viewing keys and default (change) address
+    /// must be the ones that FVK determines; any other keyset is refused
+    /// with [`PlatformWalletError::ShieldedKeysetMismatch`]. The
+    /// spend then goes through the coordinator's dispatch hook when one is
+    /// set, as the seed path's does.
+    #[cfg(feature = "shielded")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn shielded_transfer_to_with_keyset<P: dpp::shielded::builder::OrchardProver>(
+        &self,
+        coordinator: &Arc<crate::wallet::shielded::NetworkShieldedCoordinator>,
+        keyset: &super::shielded::OrchardKeySet,
+        account: u32,
+        recipient_raw_43: &[u8; 43],
+        amount: u64,
+        memo: [u8; 36],
+        prover: P,
+    ) -> Result<(), PlatformWalletError> {
+        self.check_spend_keyset(keyset, account).await?;
         let recipient = Option::<grovedb_commitment_tree::PaymentAddress>::from(
             grovedb_commitment_tree::PaymentAddress::from_raw_address_bytes(recipient_raw_43),
         )
@@ -1394,7 +1474,7 @@ impl PlatformWallet {
             coordinator.store(),
             Some(&self.persister),
             self.wallet_id,
-            &keyset,
+            keyset,
             account,
             &recipient,
             amount,
@@ -1510,7 +1590,10 @@ impl PlatformWallet {
     /// (Base58Check string). `core_fee_per_byte` is the L1 fee
     /// rate (duffs/byte). `seed` supplies the transient spend
     /// authority (see
-    /// [`shielded_transfer_to`](Self::shielded_transfer_to)).
+    /// [`shielded_transfer_to`](Self::shielded_transfer_to)); the
+    /// spend then runs exactly as
+    /// [`shielded_withdraw_to_with_keyset`](Self::shielded_withdraw_to_with_keyset)
+    /// with the derived keyset.
     #[cfg(feature = "shielded")]
     #[allow(clippy::too_many_arguments)]
     pub async fn shielded_withdraw_to<P: dpp::shielded::builder::OrchardProver>(
@@ -1524,6 +1607,38 @@ impl PlatformWallet {
         prover: P,
     ) -> Result<(), PlatformWalletError> {
         let keyset = self.derive_spend_keyset(seed, account).await?;
+        self.shielded_withdraw_to_with_keyset(
+            coordinator,
+            &keyset,
+            account,
+            to_core_address,
+            amount,
+            core_fee_per_byte,
+            prover,
+        )
+        .await
+    }
+
+    /// [`shielded_withdraw_to`](Self::shielded_withdraw_to) with the spend
+    /// authority supplied as `account`'s full `OrchardKeySet` instead of the
+    /// wallet seed. The caller needs to hold the keyset only for this call:
+    /// the wallet borrows it and keeps no copy, the ASK never crosses to the
+    /// coordinator, and the keyset is checked against the bound viewing key,
+    /// field by field, before anything else, as in
+    /// [`shielded_transfer_to_with_keyset`](Self::shielded_transfer_to_with_keyset).
+    #[cfg(feature = "shielded")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn shielded_withdraw_to_with_keyset<P: dpp::shielded::builder::OrchardProver>(
+        &self,
+        coordinator: &Arc<crate::wallet::shielded::NetworkShieldedCoordinator>,
+        keyset: &super::shielded::OrchardKeySet,
+        account: u32,
+        to_core_address: &str,
+        amount: u64,
+        core_fee_per_byte: u32,
+        prover: P,
+    ) -> Result<(), PlatformWalletError> {
+        self.check_spend_keyset(keyset, account).await?;
         let network = self.sdk.network;
         let parsed = to_core_address
             .parse::<dashcore::Address<dashcore::address::NetworkUnchecked>>()
@@ -1541,7 +1656,7 @@ impl PlatformWallet {
             coordinator.store(),
             Some(&self.persister),
             self.wallet_id,
-            &keyset,
+            keyset,
             account,
             &parsed,
             amount,

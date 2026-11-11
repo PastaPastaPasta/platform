@@ -41,6 +41,8 @@ pub mod dispatch;
 pub mod file_store;
 pub mod fund_from_asset_lock;
 pub mod keys;
+#[cfg(test)]
+mod keyset_spend_tests;
 pub mod note_selection;
 pub mod operations;
 pub mod prover;
