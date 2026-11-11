@@ -1358,7 +1358,12 @@ impl PlatformWallet {
     /// Refuse a caller-held `keyset` that isn't `account`'s spend authority:
     /// `account` must be bound (the errors of
     /// [`derive_spend_keyset`](Self::derive_spend_keyset)), and the keyset's
-    /// full viewing key must equal the bound one, else
+    /// full viewing key must equal the bound one. Every other field the
+    /// spend reads must be the one that FVK determines, as
+    /// [`OrchardKeySet::from_seed`](super::shielded::OrchardKeySet::from_seed)
+    /// derives it: the spend-authorizing key's validating key is the FVK's,
+    /// and the incoming and outgoing viewing keys and the default (change)
+    /// address are the FVK's external-scope ones at index 0. Any mismatch is
     /// [`PlatformWalletError::ShieldedKeysetMismatch`].
     #[cfg(feature = "shielded")]
     async fn check_spend_keyset(
@@ -1366,8 +1371,17 @@ impl PlatformWallet {
         keyset: &super::shielded::OrchardKeySet,
         account: u32,
     ) -> Result<(), PlatformWalletError> {
+        use grovedb_commitment_tree::{Scope, SpendValidatingKey};
         let bound_fvk = self.bound_full_viewing_key(account).await?;
-        if keyset.full_viewing_key.to_bytes() != bound_fvk {
+        let fvk = &keyset.full_viewing_key;
+        let consistent = fvk.to_bytes() == bound_fvk
+            && SpendValidatingKey::from(&keyset.spend_auth_key)
+                == SpendValidatingKey::from(fvk.clone())
+            && keyset.incoming_viewing_key.to_bytes() == fvk.to_ivk(Scope::External).to_bytes()
+            && keyset.outgoing_viewing_key.as_ref() == fvk.to_ovk(Scope::External).as_ref()
+            && keyset.default_address.to_raw_address_bytes()
+                == fvk.address_at(0u32, Scope::External).to_raw_address_bytes();
+        if !consistent {
             return Err(PlatformWalletError::ShieldedKeysetMismatch { account });
         }
         Ok(())
@@ -1427,9 +1441,11 @@ impl PlatformWallet {
     /// ASK never crosses to the coordinator — the spend free function takes
     /// the keyset by reference at call time. Before
     /// anything is parsed, built, proven or stored, `account` must be bound
-    /// (`ShieldedNotBound` / "account not bound" otherwise) and the keyset's
-    /// full viewing key must equal the bound one; any other keyset is
-    /// refused with [`PlatformWalletError::ShieldedKeysetMismatch`]. The
+    /// (`ShieldedNotBound` / "account not bound" otherwise), the keyset's
+    /// full viewing key must equal the bound one, and its spend-authorizing
+    /// key, incoming and outgoing viewing keys and default (change) address
+    /// must be the ones that FVK determines; any other keyset is refused
+    /// with [`PlatformWalletError::ShieldedKeysetMismatch`]. The
     /// spend then goes through the coordinator's dispatch hook when one is
     /// set, as the seed path's does.
     #[cfg(feature = "shielded")]
@@ -1607,8 +1623,8 @@ impl PlatformWallet {
     /// authority supplied as `account`'s full `OrchardKeySet` instead of the
     /// wallet seed. The caller needs to hold the keyset only for this call:
     /// the wallet borrows it and keeps no copy, the ASK never crosses to the
-    /// coordinator, and the keyset is checked against the bound viewing key
-    /// before anything else, as in
+    /// coordinator, and the keyset is checked against the bound viewing key,
+    /// field by field, before anything else, as in
     /// [`shielded_transfer_to_with_keyset`](Self::shielded_transfer_to_with_keyset).
     #[cfg(feature = "shielded")]
     #[allow(clippy::too_many_arguments)]
