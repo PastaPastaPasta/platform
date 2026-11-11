@@ -3862,6 +3862,14 @@ mod tests {
             remove_store_files(&path);
         }
 
+        /// The damaging assignments [`arm_damaged_while_recording`] applies:
+        /// an attempt count that doesn't load, and a mark that is neither 0
+        /// nor 1.
+        const DAMAGES: [(&str, &str); 2] = [
+            ("attempts", "attempts = -1"),
+            ("mark", "armed_recording = 2"),
+        ];
+
         /// Arm `redrive` with its notes reserved while dispositions are
         /// recorded, then damage its durable row with the assignment `damage`
         /// so that the next open retains it but can't load it.
@@ -3903,10 +3911,7 @@ mod tests {
         /// itself is damaged counts as armed while it was on.
         #[test]
         fn a_hookless_clear_redrive_keeps_a_damaged_row_armed_while_recording() {
-            for (case, damage) in [
-                ("attempts", "attempts = -1"),
-                ("mark", "armed_recording = 2"),
-            ] {
+            for (case, damage) in DAMAGES {
                 let path = temp_tree_path(&format!("damaged_mark_clear_redrive_{case}"));
                 let id = SubwalletId::new([0xE6; 32], 0);
                 let damaged = disposition_contract::spend_with_actions(0x72, &[[0xF1; 32]]);
@@ -3939,32 +3944,36 @@ mod tests {
 
         /// With the switch off, a clear by a nullifier that a damaged row
         /// armed while it was on shares with a record armed while it was off
-        /// releases that record and deletes its row only.
+        /// releases that record and deletes its row only. A row whose mark
+        /// itself is damaged counts as armed while it was on.
         #[test]
         fn a_hookless_clear_pending_keeps_a_damaged_row_armed_while_recording() {
-            let path = temp_tree_path("damaged_mark_clear_pending");
-            let id = SubwalletId::new([0xE8; 32], 0);
-            let input = [0xF5; 32];
-            let damaged = disposition_contract::spend_with_actions(0x77, &[input]);
-            let unrecorded = disposition_contract::spend_with_actions(0x78, &[input]);
-            arm_damaged_while_recording(&path, id, &damaged, "attempts = -1");
-            let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-            arm_reserved(&mut store, id, &unrecorded);
-            assert!(store.clear_pending(id, &input).unwrap());
-            assert!(store.pending_redrives(id).unwrap().is_empty());
-            assert_eq!(
-                durable_activities(&path),
-                vec![damaged.activity_id],
-                "only the released record's row goes"
-            );
-            drop(store);
-            remove_store_files(&path);
+            for (case, damage) in DAMAGES {
+                let path = temp_tree_path(&format!("damaged_mark_clear_pending_{case}"));
+                let id = SubwalletId::new([0xE8; 32], 0);
+                let input = [0xF5; 32];
+                let damaged = disposition_contract::spend_with_actions(0x77, &[input]);
+                let unrecorded = disposition_contract::spend_with_actions(0x78, &[input]);
+                arm_damaged_while_recording(&path, id, &damaged, damage);
+                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                arm_reserved(&mut store, id, &unrecorded);
+                assert!(store.clear_pending(id, &input).unwrap(), "{case}");
+                assert!(store.pending_redrives(id).unwrap().is_empty(), "{case}");
+                assert_eq!(
+                    durable_activities(&path),
+                    vec![damaged.activity_id],
+                    "{case}: only the released record's row goes"
+                );
+                drop(store);
+                remove_store_files(&path);
+            }
         }
 
         /// With the switch off, each purge keeps a damaged row armed while it
         /// was on and purges the rest of its scope: a record armed while it
         /// was on is resolved Purged, one armed while it was off goes. A
-        /// reopen skips the kept row again.
+        /// reopen skips the kept row again. A row whose mark itself is
+        /// damaged counts as armed while it was on.
         #[test]
         fn hookless_purges_keep_a_damaged_row_armed_while_recording() {
             assert_purges_keep_a_damaged_row_armed_while_recording(false);
@@ -3980,54 +3989,68 @@ mod tests {
         /// The body of the two purge tests above, with the switch at
         /// `recording` for the purge.
         fn assert_purges_keep_a_damaged_row_armed_while_recording(recording: bool) {
-            for scope in ["wallet", "account", "all"] {
-                let path = temp_tree_path(&format!("damaged_mark_purge_{scope}_{recording}"));
-                let id = SubwalletId::new([0xE7; 32], 0);
-                let damaged = disposition_contract::spend_with_actions(0x74, &[[0xF2; 32]]);
-                let marked = disposition_contract::spend_with_actions(0x75, &[[0xF3; 32]]);
-                let unrecorded = disposition_contract::spend_with_actions(0x76, &[[0xF4; 32]]);
-                arm_damaged_while_recording(&path, id, &damaged, "attempts = -1");
-                {
-                    let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("open");
-                    store.set_records_spend_dispositions(true);
-                    arm_reserved(&mut store, id, &marked);
+            for (case, damage) in DAMAGES {
+                for scope in ["wallet", "account", "all"] {
+                    let path =
+                        temp_tree_path(&format!("damaged_mark_purge_{case}_{scope}_{recording}"));
+                    let id = SubwalletId::new([0xE7; 32], 0);
+                    let damaged = disposition_contract::spend_with_actions(0x74, &[[0xF2; 32]]);
+                    let marked = disposition_contract::spend_with_actions(0x75, &[[0xF3; 32]]);
+                    let unrecorded = disposition_contract::spend_with_actions(0x76, &[[0xF4; 32]]);
+                    arm_damaged_while_recording(&path, id, &damaged, damage);
+                    {
+                        let mut store =
+                            FileBackedShieldedStore::open_path(&path, 100).expect("open");
+                        store.set_records_spend_dispositions(true);
+                        arm_reserved(&mut store, id, &marked);
+                    }
+                    let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                    arm_reserved(&mut store, id, &unrecorded);
+                    store.set_records_spend_dispositions(recording);
+                    assert_eq!(store.pending_redrives(id).unwrap().len(), 2);
+                    match scope {
+                        "wallet" => store.purge_wallet(id.wallet_id),
+                        "account" => store.purge_subwallet(id),
+                        _ => store.purge_all_subwallets(),
+                    }
+                    .unwrap_or_else(|e| panic!("{case}: {scope} purge: {e}"));
+                    assert!(
+                        store.pending_redrives(id).unwrap().is_empty(),
+                        "{case}: {scope}"
+                    );
+                    assert_eq!(
+                        durable_activities(&path),
+                        vec![damaged.activity_id],
+                        "{case}: {scope} purge keeps the damaged row only"
+                    );
+                    let purged = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
+                    let mut expected = vec![(marked.st_hash(), purged)];
+                    if recording {
+                        expected.push((unrecorded.st_hash(), purged));
+                    }
+                    expected.sort_by_key(|(st_hash, _)| *st_hash);
+                    let mut dispositions = store
+                        .dispositions(id.wallet_id)
+                        .unwrap()
+                        .into_iter()
+                        .map(|record| (record.st_hash, record.disposition))
+                        .collect::<Vec<_>>();
+                    dispositions.sort_by_key(|(st_hash, _)| *st_hash);
+                    assert_eq!(dispositions, expected, "{case}: {scope}");
+                    drop(store);
+                    let store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
+                    assert!(
+                        store.pending_redrives(id).unwrap().is_empty(),
+                        "{case}: {scope}"
+                    );
+                    assert_eq!(
+                        durable_activities(&path),
+                        vec![damaged.activity_id],
+                        "{case}: {scope}"
+                    );
+                    drop(store);
+                    remove_store_files(&path);
                 }
-                let mut store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-                arm_reserved(&mut store, id, &unrecorded);
-                store.set_records_spend_dispositions(recording);
-                assert_eq!(store.pending_redrives(id).unwrap().len(), 2);
-                match scope {
-                    "wallet" => store.purge_wallet(id.wallet_id),
-                    "account" => store.purge_subwallet(id),
-                    _ => store.purge_all_subwallets(),
-                }
-                .unwrap_or_else(|e| panic!("{scope} purge: {e}"));
-                assert!(store.pending_redrives(id).unwrap().is_empty(), "{scope}");
-                assert_eq!(
-                    durable_activities(&path),
-                    vec![damaged.activity_id],
-                    "{scope} purge keeps the damaged row only"
-                );
-                let purged = ShieldedSpendDisposition::Unresolved(UnresolvedReason::Purged);
-                let mut expected = vec![(marked.st_hash(), purged)];
-                if recording {
-                    expected.push((unrecorded.st_hash(), purged));
-                }
-                expected.sort_by_key(|(st_hash, _)| *st_hash);
-                let mut dispositions = store
-                    .dispositions(id.wallet_id)
-                    .unwrap()
-                    .into_iter()
-                    .map(|record| (record.st_hash, record.disposition))
-                    .collect::<Vec<_>>();
-                dispositions.sort_by_key(|(st_hash, _)| *st_hash);
-                assert_eq!(dispositions, expected, "{scope}");
-                drop(store);
-                let store = FileBackedShieldedStore::open_path(&path, 100).expect("reopen");
-                assert!(store.pending_redrives(id).unwrap().is_empty(), "{scope}");
-                assert_eq!(durable_activities(&path), vec![damaged.activity_id]);
-                drop(store);
-                remove_store_files(&path);
             }
         }
 
