@@ -3802,7 +3802,8 @@ where
 /// Whether a record was armed while dispositions were recorded is read with
 /// the pass's records. A pass without a hook never sends such a record, even
 /// if it is armed again before its turn. No pass sends a record that is no
-/// longer armed at its turn.
+/// longer armed at its turn, nor one whose armed record then holds another
+/// transition (that record waits for the next pass).
 async fn redrive_pending_spends_gated<S: ShieldedStore, F>(
     store: &Arc<RwLock<S>>,
     persister: Option<&WalletPersister>,
@@ -3907,7 +3908,8 @@ where
         // A record armed before its first send becomes possibly sent here,
         // durably, before anything goes out. A record resolved or removed
         // since it was read (for example abandoned, or purged with its
-        // wallet) is not sent. A record armed while dispositions were
+        // wallet) is not sent, nor one armed again under its activity id
+        // with another transition. A record armed while dispositions were
         // recorded is sent only once the hook admitted it in this pass, while
         // they still are: a send while they are not would settle it without
         // the hook. Any other record is marked sent first, and a failed mark
@@ -3923,6 +3925,28 @@ where
                      it waits for a pass whose dispatch hook admits it"
                 );
                 continue;
+            }
+            let rearmed = guard.pending_redrives(id).map(|current| {
+                current.iter().any(|record| {
+                    record.activity_id == redrive.activity_id && record.st_bytes != redrive.st_bytes
+                })
+            });
+            match rearmed {
+                Ok(false) => {}
+                Ok(true) => {
+                    debug!(
+                        "redrive: the record was armed again with another transition; \
+                         it waits for the next pass"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, "redrive: could not read the armed record; skipping it");
+                    if recording_now {
+                        failure = Some(PlatformWalletError::ShieldedStoreError(e.to_string()));
+                    }
+                    continue;
+                }
             }
             let in_flight = match dispatch {
                 Some(dispatch) => match dispatch.in_flight.claim(redrive.st_hash()) {
@@ -6431,6 +6455,56 @@ mod release_tests {
         );
     }
 
+    /// A pass without a hook doesn't send the bytes it read for a record
+    /// that is armed again under the same activity id with another
+    /// transition before its turn; the new record waits for the next pass.
+    #[tokio::test]
+    async fn a_hookless_pass_never_sends_a_record_armed_again_with_other_bytes() {
+        let test = TestStore::open("rearmed_other_bytes", false);
+        let id = SubwalletId::new([0xD5; 32], 0);
+        let first = spend_with_actions(0x8D, &[N1]);
+        let replaced = spend_with_actions(0x8E, &[N2]);
+        let replacement = PendingRedrive {
+            st_bytes: spend_with_actions(0x8F, &[N2]).st_bytes,
+            ..replaced.clone()
+        };
+        assert_ne!(replacement.st_hash(), replaced.st_hash());
+        {
+            let mut store = test.store.write().await;
+            arm_reserved(&mut *store, id, &first);
+            arm_reserved(&mut *store, id, &replaced);
+        }
+        let recorded = [first.anchor].into_iter().collect();
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            if sent.len() == 1 {
+                test.store
+                    .try_write()
+                    .expect("the pass holds no store guard while it sends")
+                    .arm_redrive(id, replacement.clone())
+                    .unwrap();
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![first.st_bytes.clone()],
+            "the replaced bytes are not sent"
+        );
+        let armed = test.store.read().await.pending_redrives(id).unwrap();
+        assert_eq!(
+            armed
+                .into_iter()
+                .find(|redrive| redrive.activity_id == replaced.activity_id),
+            Some(replacement),
+            "the replacement stays armed, with no attempt counted"
+        );
+    }
+
     /// A record armed while dispositions were recorded is sent only by a pass
     /// with a hook while they still are: not by a pass without one while the
     /// switch is on, nor after it turns on during the pass, nor by a pass
@@ -7979,6 +8053,87 @@ mod dispatch_tests {
             .await
             .redrive_armed_recording(ID, &rearmed.activity_id));
         assert_eq!(fixture.durable_unsent(&rearmed.activity_id), Some(true));
+    }
+
+    /// A hooked pass doesn't send the bytes it read for a record armed while
+    /// dispositions were recorded once it is abandoned and armed again under
+    /// the same activity id with another transition before its turn: the new
+    /// record waits for the next pass, still durably never sent.
+    #[tokio::test]
+    async fn a_hooked_pass_never_sends_a_record_armed_again_with_other_bytes() {
+        let fixture = Fixture::new("rearmed_other_bytes", &[N1, N2]);
+        let first = spend_with_actions(0x46, &[N1]);
+        let replaced = spend_with_actions(0x47, &[N2]);
+        let replacement = PendingRedrive {
+            st_bytes: spend_with_actions(0x48, &[N2]).st_bytes,
+            ..replaced.clone()
+        };
+        assert_ne!(replacement.st_hash(), replaced.st_hash());
+        {
+            let mut store = fixture.store.write().await;
+            for redrive in [&first, &replaced] {
+                store
+                    .set_pending_spend(
+                        ID,
+                        &redrive.nullifiers[0],
+                        redrive.anchor,
+                        redrive.activity_id,
+                    )
+                    .unwrap();
+                store.arm_unsent_redrive(ID, redrive.clone()).unwrap();
+            }
+        }
+        let hook = TestHook::new(&fixture, Answer::Accept, true);
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_gated(
+            &fixture.store,
+            None,
+            ID.wallet_id,
+            ID,
+            &recorded(),
+            Some(&context(&hook)),
+            |st| {
+                sent.push(st.serialize_to_bytes().unwrap());
+                if sent.len() == 1 {
+                    let mut store = fixture
+                        .store
+                        .try_write()
+                        .expect("the pass holds no store guard while it sends");
+                    store
+                        .resolve_unsent_redrive(
+                            ID,
+                            &replaced.activity_id,
+                            NotExecutedReason::Abandoned,
+                        )
+                        .unwrap();
+                    store.mark_pending(ID, &N2).unwrap();
+                    store
+                        .set_pending_spend(ID, &N2, replacement.anchor, replacement.activity_id)
+                        .unwrap();
+                    store.arm_unsent_redrive(ID, replacement.clone()).unwrap();
+                }
+                async { Ok(()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![first.st_bytes.clone()],
+            "the replaced bytes are not sent"
+        );
+        assert_eq!(
+            *hook.admitted.lock().unwrap(),
+            vec![first.st_hash(), replaced.st_hash()],
+            "the hook admitted the replaced bytes before the record was skipped"
+        );
+        assert!(fixture.redrives().await.contains(&replacement));
+        assert_eq!(
+            fixture.durable_unsent(&replacement.activity_id),
+            Some(true),
+            "the replacement is still durably never sent"
+        );
     }
 
     /// A record whose transition is in flight is skipped by the redrive
