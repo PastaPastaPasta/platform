@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use dash_sdk::platform::shielded::try_decrypt_note_with_memo;
+use dpp::identity::core_script::CoreScript;
 use dpp::serialization::PlatformDeserializableTrusted;
 use dpp::state_transition::shielded_transfer_transition::ShieldedTransferTransition;
 use dpp::state_transition::shielded_withdrawal_transition::ShieldedWithdrawalTransition;
 use dpp::state_transition::StateTransition;
+use dpp::withdrawal::Pooling;
 use drive_proof_verifier::types::ShieldedEncryptedNote;
 use futures::FutureExt;
 use grovedb_commitment_tree::{ExtractedNoteCommitment, Note, NoteValue, RandomSeed, Rho};
@@ -38,7 +40,20 @@ const OTHER_SEED: [u8; 64] = [0x43; 64];
 const ACCOUNT: u32 = 0;
 const NOTE_VALUE: u64 = 1_000_000_000_000;
 const AMOUNT: u64 = 100_000_000;
-const MEMO: [u8; 36] = [0; 36];
+/// A text memo (kind 1, little-endian, then a zero-padded UTF-8 payload).
+/// It is non-zero, so a path that drops or zeroes the caller's memo is told
+/// apart from one that carries it.
+const MEMO: [u8; 36] = {
+    let text = b"keyset spend memo";
+    let mut memo = [0u8; 36];
+    memo[0] = 1;
+    let mut i = 0;
+    while i < text.len() {
+        memo[4 + i] = text[i];
+        i += 1;
+    }
+    memo
+};
 const CORE_FEE_PER_BYTE: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -924,15 +939,17 @@ fn decrypted_outputs(
 }
 
 /// `st_bytes` pays exactly what was asked: a transfer's one output to the
-/// recipient carries `AMOUNT` and `MEMO`, and the one output the bound
-/// account can decrypt is the change, at its default address, worth the
-/// note less everything taken out of the pool.
+/// recipient carries `AMOUNT` and `MEMO`; a withdrawal takes exactly
+/// `AMOUNT` plus the withdrawal fee for its action count out of the pool,
+/// to the requested Core address. The one output the bound account can
+/// decrypt is the change, at its default address, worth the note less the
+/// payment and everything taken out of the pool.
 fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
     let own = keyset(&SEED, ACCOUNT);
     let (actions, outflow) = actions_and_outflow(kind, st_bytes);
     let to_recipient = decrypted_outputs(&actions, &keyset(&OTHER_SEED, 0));
     let to_self = decrypted_outputs(&actions, &own);
-    let paid = match kind {
+    let (paid, taken) = match kind {
         Kind::Transfer => {
             assert!(outflow > 0, "{kind:?} {path}: a fee leaves the pool");
             assert_eq!(
@@ -940,18 +957,25 @@ fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
                 vec![(AMOUNT, recipient(), MEMO)],
                 "{kind:?} {path}: the recipient's output"
             );
-            AMOUNT
+            (AMOUNT, outflow)
         }
         Kind::Withdraw => {
             assert!(
                 to_recipient.is_empty(),
                 "{kind:?} {path}: no shielded output to anyone else"
             );
-            assert!(
-                outflow > AMOUNT,
-                "{kind:?} {path}: the amount and a fee leave the pool"
+            assert_withdrawal_request(st_bytes, path);
+            let fee = dpp::shielded::compute_shielded_withdrawal_fee(
+                actions.len(),
+                dpp::version::PlatformVersion::latest(),
+            )
+            .expect("withdrawal fee");
+            assert_eq!(
+                outflow,
+                AMOUNT + fee,
+                "{kind:?} {path}: exactly the amount and the withdrawal fee leave the pool"
             );
-            0
+            (0, AMOUNT + fee)
         }
     };
     assert_eq!(to_self.len(), 1, "{kind:?} {path}: one change output");
@@ -963,8 +987,36 @@ fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
     );
     assert_eq!(
         change,
-        NOTE_VALUE - paid - outflow,
+        NOTE_VALUE - paid - taken,
         "{kind:?} {path}: change is the rest of the note"
+    );
+}
+
+/// `st_bytes`, a withdrawal, pays the requested Core address at the
+/// requested fee rate, with the only pooling the entry point requests.
+fn assert_withdrawal_request(st_bytes: &[u8], path: &str) {
+    let st = StateTransition::deserialize_from_bytes_trusted(st_bytes).expect("decode transition");
+    let StateTransition::ShieldedWithdrawal(ShieldedWithdrawalTransition::V0(v0)) = st else {
+        panic!("{path}: not a shielded withdrawal: {st:?}");
+    };
+    let requested = core_address()
+        .parse::<dashcore::Address<dashcore::address::NetworkUnchecked>>()
+        .expect("the requested core address parses")
+        .require_network(dash_sdk::Sdk::new_mock().network)
+        .expect("the requested core address is on the mock network");
+    assert_eq!(
+        v0.output_script,
+        CoreScript::from_bytes(requested.script_pubkey().to_bytes()),
+        "Withdraw {path}: pays the requested Core address"
+    );
+    assert_eq!(
+        v0.core_fee_per_byte, CORE_FEE_PER_BYTE,
+        "Withdraw {path}: the requested Core fee rate"
+    );
+    assert_eq!(
+        v0.pooling,
+        Pooling::Never,
+        "Withdraw {path}: the requested pooling"
     );
 }
 
