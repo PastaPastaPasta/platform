@@ -404,7 +404,7 @@ async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
 }
 
 /// The keyset check runs before the recipient is parsed: a mismatched
-/// keyset with an unparseable recipient is still refused as a mismatch.
+/// keyset with an unparsable recipient is still refused as a mismatch.
 #[tokio::test]
 async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     let own = keyset(&SEED, ACCOUNT);
@@ -453,7 +453,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
         &hook,
         &persister,
         stored_before,
-        "unparseable recipient",
+        "unparsable recipient",
     )
     .await;
 
@@ -483,7 +483,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     for result in [transfer, withdraw] {
         assert!(
             matches!(result, Err(PlatformWalletError::ShieldedBuildError(_))),
-            "an unparseable recipient fails to parse, got {result:?}"
+            "an unparsable recipient fails to parse, got {result:?}"
         );
     }
 }
