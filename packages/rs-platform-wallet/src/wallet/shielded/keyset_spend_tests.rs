@@ -7,13 +7,17 @@
 //! recorded anchor from the (mock) SDK, a real Halo 2 proof, the
 //! coordinator's dispatch hook, then the broadcast.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use dash_sdk::platform::shielded::try_decrypt_note_with_memo;
 use dpp::serialization::PlatformDeserializableTrusted;
 use dpp::state_transition::shielded_transfer_transition::ShieldedTransferTransition;
 use dpp::state_transition::shielded_withdrawal_transition::ShieldedWithdrawalTransition;
 use dpp::state_transition::StateTransition;
+use drive_proof_verifier::types::ShieldedEncryptedNote;
+use futures::FutureExt;
 use grovedb_commitment_tree::{ExtractedNoteCommitment, Note, NoteValue, RandomSeed, Rho};
 
 use super::dispatch::{
@@ -125,6 +129,85 @@ fn pending_spend_rows(path: &Path) -> i64 {
         row.get(0)
     })
     .expect("count pending spends")
+}
+
+/// Counts every row a connection inserts, updates or deletes in the
+/// database at `path` from [`Self::install`] on, through triggers on each of
+/// the tables it has then.
+struct WriteCounter {
+    path: PathBuf,
+}
+
+impl WriteCounter {
+    fn install(path: &Path) -> Self {
+        let conn = rusqlite::Connection::open(path).expect("raw connection");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS test_write_count (n INTEGER NOT NULL); \
+             DELETE FROM test_write_count; \
+             INSERT INTO test_write_count (n) VALUES (0);",
+        )
+        .expect("write count table");
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' AND name != 'test_write_count'",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .expect("list tables");
+        assert!(!tables.is_empty(), "the store's tables exist");
+        for table in &tables {
+            for op in ["INSERT", "UPDATE", "DELETE"] {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER IF NOT EXISTS \"test_write_count_{table}_{op}\" \
+                     AFTER {op} ON \"{table}\" \
+                     BEGIN UPDATE test_write_count SET n = n + 1; END;"
+                ))
+                .expect("write count trigger");
+            }
+        }
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn count(&self) -> i64 {
+        let conn = rusqlite::Connection::open(&self.path).expect("raw connection");
+        conn.query_row("SELECT n FROM test_write_count", [], |row| row.get(0))
+            .expect("read the write count")
+    }
+}
+
+/// Run `spend` while holding a shared guard on `coordinator`'s store and
+/// counting writes to its database. Every change to the store, the
+/// in-memory note reservation included, needs its write lock, so a call
+/// that would change it can't finish on its first poll; it must finish
+/// there, with no row written. The poll runs outside the task's cooperative
+/// budget, so only a lock that is held makes it wait.
+async fn without_writes<F>(
+    coordinator: &NetworkShieldedCoordinator,
+    spend: F,
+    context: &str,
+) -> Result<(), PlatformWalletError>
+where
+    F: Future<Output = Result<(), PlatformWalletError>>,
+{
+    let writes = WriteCounter::install(coordinator.db_path());
+    let result = {
+        let _shared = coordinator.store().read().await;
+        tokio::task::unconstrained(spend).now_or_never()
+    };
+    let result =
+        result.unwrap_or_else(|| panic!("{context}: the call waited for the store's write lock"));
+    assert_eq!(
+        writes.count(),
+        0,
+        "{context}: no row written to the store's database during the call"
+    );
+    result
 }
 
 fn keyset(seed: &[u8], account: u32) -> OrchardKeySet {
@@ -363,16 +446,52 @@ async fn assert_nothing_written(
     );
 }
 
-/// Another seed's keyset for the same account, or the same seed's keyset
-/// for another account, is refused with the typed mismatch on both kinds,
+/// Keysets that aren't `SEED`'s `ACCOUNT` spend authority: another seed's or
+/// another account's, whole, and the account's own with one field replaced
+/// by one its full viewing key doesn't determine.
+fn mismatched_keysets() -> Vec<(&'static str, OrchardKeySet)> {
+    let own = keyset(&SEED, ACCOUNT);
+    let other = keyset(&OTHER_SEED, ACCOUNT);
+
+    let mut foreign_spend_key = keyset(&OTHER_SEED, ACCOUNT);
+    foreign_spend_key.full_viewing_key = own.full_viewing_key.clone();
+    foreign_spend_key.incoming_viewing_key = own.incoming_viewing_key.clone();
+    foreign_spend_key.outgoing_viewing_key = own.outgoing_viewing_key.clone();
+    foreign_spend_key.default_address = own.default_address;
+
+    let mut foreign_address = keyset(&SEED, ACCOUNT);
+    foreign_address.default_address = other.default_address;
+
+    let mut second_address = keyset(&SEED, ACCOUNT);
+    second_address.default_address = second_address.address_at(1);
+
+    let mut foreign_ivk = keyset(&SEED, ACCOUNT);
+    foreign_ivk.incoming_viewing_key = other.incoming_viewing_key.clone();
+
+    let mut foreign_ovk = keyset(&SEED, ACCOUNT);
+    foreign_ovk.outgoing_viewing_key = other.outgoing_viewing_key.clone();
+
+    vec![
+        ("another seed", keyset(&OTHER_SEED, ACCOUNT)),
+        ("another account", keyset(&SEED, ACCOUNT + 1)),
+        (
+            "the bound FVK over another seed's spend key",
+            foreign_spend_key,
+        ),
+        ("another seed's default address", foreign_address),
+        ("the bound account's address at index 1", second_address),
+        ("another seed's IVK", foreign_ivk),
+        ("another seed's OVK", foreign_ovk),
+    ]
+}
+
+/// A keyset that isn't the account's spend authority, whole or in any one
+/// field the spend reads, is refused with the typed mismatch on both kinds,
 /// before anything is reserved, armed, stored or handed to the hook.
 #[tokio::test]
 async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
     for kind in KINDS {
-        for (what, wrong) in [
-            ("another seed", keyset(&OTHER_SEED, ACCOUNT)),
-            ("another account", keyset(&SEED, ACCOUNT + 1)),
-        ] {
+        for (what, wrong) in mismatched_keysets() {
             let own = keyset(&SEED, ACCOUNT);
             let note = owned_note(&own);
             let (coordinator, hook, anchor) =
@@ -381,7 +500,12 @@ async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
                 bound_wallet(&coordinator, anchor, &note, &[&coordinator]).await;
             let stored_before = persister.stored_count();
 
-            let result = spend_with_keyset(&wallet, &coordinator, &wrong, ACCOUNT, kind).await;
+            let result = without_writes(
+                &coordinator,
+                spend_with_keyset(&wallet, &coordinator, &wrong, ACCOUNT, kind),
+                &format!("{kind:?} {what}"),
+            )
+            .await;
 
             assert!(
                 matches!(
@@ -415,8 +539,9 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     let other = keyset(&OTHER_SEED, ACCOUNT);
     let prover = CachedOrchardProver::new();
 
-    let transfer = wallet
-        .shielded_transfer_to_with_keyset(
+    let transfer = without_writes(
+        &coordinator,
+        wallet.shielded_transfer_to_with_keyset(
             &coordinator,
             &other,
             ACCOUNT,
@@ -424,10 +549,13 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
             AMOUNT,
             MEMO,
             &prover,
-        )
-        .await;
-    let withdraw = wallet
-        .shielded_withdraw_to_with_keyset(
+        ),
+        "unparsable recipient, transfer",
+    )
+    .await;
+    let withdraw = without_writes(
+        &coordinator,
+        wallet.shielded_withdraw_to_with_keyset(
             &coordinator,
             &other,
             ACCOUNT,
@@ -435,8 +563,10 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
             AMOUNT,
             CORE_FEE_PER_BYTE,
             &prover,
-        )
-        .await;
+        ),
+        "unparsable recipient, withdraw",
+    )
+    .await;
 
     for result in [transfer, withdraw] {
         assert!(
@@ -501,10 +631,12 @@ async fn a_wrong_seed_keeps_its_error_on_the_seed_path() {
         let stored_before = persister.stored_count();
         let prover = CachedOrchardProver::new();
 
+        let context = format!("{kind:?} wrong seed");
         let result = match kind {
             Kind::Transfer => {
-                wallet
-                    .shielded_transfer_to(
+                without_writes(
+                    &coordinator,
+                    wallet.shielded_transfer_to(
                         &coordinator,
                         &OTHER_SEED,
                         ACCOUNT,
@@ -512,12 +644,15 @@ async fn a_wrong_seed_keeps_its_error_on_the_seed_path() {
                         AMOUNT,
                         MEMO,
                         &prover,
-                    )
-                    .await
+                    ),
+                    &context,
+                )
+                .await
             }
             Kind::Withdraw => {
-                wallet
-                    .shielded_withdraw_to(
+                without_writes(
+                    &coordinator,
+                    wallet.shielded_withdraw_to(
                         &coordinator,
                         &OTHER_SEED,
                         ACCOUNT,
@@ -525,8 +660,10 @@ async fn a_wrong_seed_keeps_its_error_on_the_seed_path() {
                         AMOUNT,
                         CORE_FEE_PER_BYTE,
                         &prover,
-                    )
-                    .await
+                    ),
+                    &context,
+                )
+                .await
             }
         };
         assert!(
@@ -543,7 +680,7 @@ async fn a_wrong_seed_keeps_its_error_on_the_seed_path() {
             &hook,
             &persister,
             stored_before,
-            &format!("{kind:?} wrong seed"),
+            &context,
         )
         .await;
     }
@@ -561,7 +698,12 @@ async fn an_unbound_account_is_refused_on_the_keyset_path() {
         let (wallet, persister) = bound_wallet(&coordinator, anchor, &note, &[&coordinator]).await;
         let stored_before = persister.stored_count();
 
-        let result = spend_with_keyset(&wallet, &coordinator, &keyset(&SEED, 5), 5, kind).await;
+        let result = without_writes(
+            &coordinator,
+            spend_with_keyset(&wallet, &coordinator, &keyset(&SEED, 5), 5, kind),
+            &format!("{kind:?} unbound account"),
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -580,17 +722,37 @@ async fn an_unbound_account_is_refused_on_the_keyset_path() {
         )
         .await;
 
+        let unbound_persister = Arc::new(CapturingPersistence::default());
         let unbound = platform_wallet_on(
-            Arc::new(CapturingPersistence::default()),
+            Arc::clone(&unbound_persister),
             Arc::new(dash_sdk::Sdk::new_mock()),
         )
         .await;
-        let result = spend_with_keyset(&unbound, &coordinator, &own, ACCOUNT, kind).await;
+        let unbound_stored_before = unbound_persister.stored_count();
+        let result = without_writes(
+            &coordinator,
+            spend_with_keyset(&unbound, &coordinator, &own, ACCOUNT, kind),
+            &format!("{kind:?} unbound wallet"),
+        )
+        .await;
         assert!(
             matches!(result, Err(PlatformWalletError::ShieldedNotBound)),
             "{kind:?}: unbound wallet refused, got {result:?}"
         );
-        assert!(hook.seen().is_empty(), "{kind:?}: dispatch never called");
+        assert_nothing_written(
+            &wallet,
+            &coordinator,
+            &hook,
+            &unbound_persister,
+            unbound_stored_before,
+            &format!("{kind:?} unbound wallet, the bound wallet's note untouched"),
+        )
+        .await;
+        assert_eq!(
+            persister.stored_count(),
+            stored_before,
+            "{kind:?} unbound wallet: nothing handed to the bound wallet's persister"
+        );
     }
 }
 
@@ -646,8 +808,28 @@ async fn a_matching_keyset_reaches_the_hook_before_the_send() {
             hooked_coordinator(&format!("match_{kind:?}"), &note, true).await;
         let (wallet, _persister) = bound_wallet(&coordinator, anchor, &note, &[&coordinator]).await;
 
+        // Controls for `without_writes`: a spend that gets past the check
+        // waits for the store's write lock, and its rows are counted.
+        {
+            let _shared = coordinator.store().read().await;
+            assert!(
+                tokio::task::unconstrained(spend_with_keyset(
+                    &wallet,
+                    &coordinator,
+                    &own,
+                    ACCOUNT,
+                    kind
+                ))
+                .now_or_never()
+                .is_none(),
+                "{kind:?}: a matching keyset's spend waits for the store's write lock"
+            );
+        }
+        let writes = WriteCounter::install(coordinator.db_path());
+
         let result = spend_with_keyset(&wallet, &coordinator, &own, ACCOUNT, kind).await;
 
+        assert!(writes.count() > 0, "{kind:?}: the spend's rows are counted");
         let seen = hook.seen();
         assert_eq!(seen.len(), 1, "{kind:?}: one dispatch");
         assert_artifact(&seen[0], kind, &wallet, &note, anchor);
@@ -701,11 +883,97 @@ fn deterministic_fields(kind: Kind, st_bytes: &[u8]) -> String {
     }
 }
 
+/// The actions of a transition of `kind`, and the credits it takes out of
+/// the shielded pool: the fee of a transfer, the whole unshielded amount of
+/// a withdrawal.
+fn actions_and_outflow(kind: Kind, st_bytes: &[u8]) -> (Vec<dpp::shielded::SerializedAction>, u64) {
+    let st = StateTransition::deserialize_from_bytes_trusted(st_bytes).expect("decode transition");
+    match (kind, st) {
+        (Kind::Transfer, StateTransition::ShieldedTransfer(ShieldedTransferTransition::V0(v0))) => {
+            (v0.actions, v0.value_balance)
+        }
+        (
+            Kind::Withdraw,
+            StateTransition::ShieldedWithdrawal(ShieldedWithdrawalTransition::V0(v0)),
+        ) => (v0.actions, v0.unshielding_amount),
+        (kind, st) => panic!("{kind:?}: unexpected transition {st:?}"),
+    }
+}
+
+/// The output notes of `actions` that decrypt under `viewer`'s incoming
+/// viewing key, as (value, raw recipient address, memo).
+fn decrypted_outputs(
+    actions: &[dpp::shielded::SerializedAction],
+    viewer: &OrchardKeySet,
+) -> Vec<(u64, [u8; 43], [u8; 36])> {
+    let ivk = viewer.prepared_ivk();
+    actions
+        .iter()
+        .filter_map(|action| {
+            let wire = ShieldedEncryptedNote {
+                cmx: action.cmx.to_vec(),
+                nullifier: action.nullifier.to_vec(),
+                cv_net: action.cv_net.to_vec(),
+                encrypted_note: action.encrypted_note.clone(),
+            };
+            try_decrypt_note_with_memo(&ivk, &wire).map(|(note, address, memo)| {
+                (note.value().inner(), address.to_raw_address_bytes(), memo)
+            })
+        })
+        .collect()
+}
+
+/// `st_bytes` pays exactly what was asked: a transfer's one output to the
+/// recipient carries `AMOUNT` and `MEMO`, and the one output the bound
+/// account can decrypt is the change, at its default address, worth the
+/// note less everything taken out of the pool.
+fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
+    let own = keyset(&SEED, ACCOUNT);
+    let (actions, outflow) = actions_and_outflow(kind, st_bytes);
+    let to_recipient = decrypted_outputs(&actions, &keyset(&OTHER_SEED, 0));
+    let to_self = decrypted_outputs(&actions, &own);
+    let paid = match kind {
+        Kind::Transfer => {
+            assert!(outflow > 0, "{kind:?} {path}: a fee leaves the pool");
+            assert_eq!(
+                to_recipient,
+                vec![(AMOUNT, recipient(), MEMO)],
+                "{kind:?} {path}: the recipient's output"
+            );
+            AMOUNT
+        }
+        Kind::Withdraw => {
+            assert!(
+                to_recipient.is_empty(),
+                "{kind:?} {path}: no shielded output to anyone else"
+            );
+            assert!(
+                outflow > AMOUNT,
+                "{kind:?} {path}: the amount and a fee leave the pool"
+            );
+            0
+        }
+    };
+    assert_eq!(to_self.len(), 1, "{kind:?} {path}: one change output");
+    let (change, address, _memo) = to_self[0];
+    assert_eq!(
+        address,
+        own.default_address.to_raw_address_bytes(),
+        "{kind:?} {path}: change to the bound account's default address"
+    );
+    assert_eq!(
+        change,
+        NOTE_VALUE - paid - outflow,
+        "{kind:?} {path}: change is the rest of the note"
+    );
+}
+
 /// For the same wallet, account, note, anchor and arguments, the seed
 /// wrapper and the keyset path hand the hook the same artifact. The proof,
 /// binding signature and output notes are randomized per build, so
 /// `st_bytes`, `st_hash`, `activity_id` and the padding nullifier differ;
-/// every other payload field and every deterministic transition field match.
+/// every other payload field and every deterministic transition field match,
+/// and the outputs of both decrypt to the same payment and change.
 #[tokio::test]
 async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
     for kind in KINDS {
@@ -763,5 +1031,7 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
             deterministic_fields(kind, &keyset.st_bytes),
             "{kind:?}: deterministic transition fields"
         );
+        assert_outputs(kind, &seed.st_bytes, "seed");
+        assert_outputs(kind, &keyset.st_bytes, "keyset");
     }
 }
