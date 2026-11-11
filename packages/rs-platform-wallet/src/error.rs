@@ -47,6 +47,16 @@ pub enum PlatformWalletError {
     #[error("Wallet not found: {0}")]
     WalletNotFound(String),
 
+    /// A payment refused before anything reached the network: its wallet
+    /// was removed or re-created after the handle it came through was
+    /// taken. An asset-lock build refused this way had signed its lock but
+    /// had not tracked or broadcast it; its input fence was released, and so
+    /// was its own reservation wherever that still stands. Distinct from
+    /// [`Self::WalletNotFound`] so a host can tell the user nothing was sent
+    /// without trusting where a lookup failed.
+    #[error("wallet {0} was removed or re-created before the payment was sent; nothing was sent")]
+    WalletRemovedBeforeSend(String),
+
     #[error("Wallet already exists: {0}")]
     WalletAlreadyExists(String),
 
@@ -589,6 +599,19 @@ pub enum PlatformWalletError {
          required {required} duffs"
     )]
     AssetLockInsufficientFunds { available: u64, required: u64 },
+
+    /// An asset lock, whole-balance or of a fixed amount, needs more inputs
+    /// than an asset lock may carry (`max_asset_lock_transaction_inputs`, 100:
+    /// Dash Core relay policy and Platform consensus alike). Nothing new was
+    /// sent: a funded build refuses the lock before tracking it and releases
+    /// its reservation, and a resume of a tracked `Built` / `Broadcast` row
+    /// over the cap is refused instead of re-sent, leaving the row tracked and
+    /// releasing nothing (an earlier attempt may still have reached peers).
+    /// Reservations do not survive a restart, so after one the row's inputs
+    /// are not held and may be spent elsewhere. Consolidating the coins lets a
+    /// new lock fit, once the inputs of a refused resume are no longer held.
+    #[error("Asset lock requires {count} inputs, exceeding the limit of {max}")]
+    AssetLockTooManyInputs { count: usize, max: usize },
 
     #[error("SDK error: {0}")]
     Sdk(#[from] dash_sdk::Error),

@@ -3,11 +3,13 @@
 use crate::broadcaster::TransactionBroadcaster;
 use dashcore::OutPoint;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::changeset::changeset::AssetLockChangeSet;
 use crate::changeset::changeset::PlatformWalletChangeSet;
 use crate::changeset::PersistenceCapabilities;
 use crate::error::PlatformWalletError;
+use crate::wallet::core::WalletGeneration;
 
 use super::super::manager::AssetLockManager;
 use super::super::tracked::{AssetLockStatus, TrackedAssetLock};
@@ -121,19 +123,32 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
             .map(|lock| (lock.funding_type, lock.identity_index, lock.status.clone()))
     }
 
-    /// Track a new asset lock in memory, returning a changeset describing
-    /// the inserted entry.
+    /// Track a new asset lock in memory on the wallet generation `generation`,
+    /// returning a changeset describing the inserted entry.
+    ///
+    /// The row is inserted only while the wallet registered under this
+    /// manager's id is still `generation`. `None` says it is not: the wallet
+    /// was removed, or removed and re-created under the same id as a new
+    /// generation, and nothing was inserted. A lookup by id alone would put the
+    /// row into the re-created generation, which never built this lock, or
+    /// report the removal as an empty changeset that reads like "nothing to
+    /// persist".
     ///
     /// If an entry already exists at `out_point`, it is overwritten.
-    pub(crate) async fn track_asset_lock(&self, lock: TrackedAssetLock) -> AssetLockChangeSet {
+    pub(crate) async fn track_asset_lock_in(
+        &self,
+        lock: TrackedAssetLock,
+        generation: &Arc<WalletGeneration>,
+    ) -> Option<AssetLockChangeSet> {
         let mut wm = self.wallet_manager.write().await;
+        let info = wm
+            .get_wallet_info_mut(&self.wallet_id)
+            .filter(|info| Arc::ptr_eq(&info.generation, generation))?;
+        let out_point = lock.out_point;
         let mut cs = AssetLockChangeSet::default();
-        if let Some(info) = wm.get_wallet_info_mut(&self.wallet_id) {
-            let out_point = lock.out_point;
-            cs.asset_locks.insert(out_point, (&lock).into());
-            info.tracked_asset_locks.insert(out_point, lock);
-        }
-        cs
+        cs.asset_locks.insert(out_point, (&lock).into());
+        info.tracked_asset_locks.insert(out_point, lock);
+        Some(cs)
     }
 
     /// Remove a tracked asset lock whose funding transaction was
@@ -243,7 +258,7 @@ impl<B: TransactionBroadcaster + ?Sized> AssetLockManager<B> {
     /// - `Err(WalletNotFound)` — the wallet id is unknown to the
     ///   manager. Always a programmer error / stale handle.
     ///
-    /// **Why queue internally** (unlike `track_asset_lock` /
+    /// **Why queue internally** (unlike `track_asset_lock_in` /
     /// `advance_asset_lock_status`, which return a changeset and let
     /// the caller queue it): `queue_asset_lock_changeset` is
     /// `pub(super)` to the `asset_lock` module, so the only callers

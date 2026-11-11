@@ -267,6 +267,10 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
             // so a concurrent loader can't slip between them (TOCTOU).
             {
                 let mut wm = self.wallet_manager.write().await;
+                // A failed load's rollback can still be waiting on lifecycle
+                // gates for this id (as long as a broadcast in flight). A load
+                // that skips it here may return `Ok`, and that rollback then
+                // removes the wallet until the next load.
                 if wm.get_wallet(&wallet_id).is_some() {
                     continue 'load;
                 }
@@ -404,76 +408,8 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
         }
 
         if let Some(err) = load_error {
-            // Walk back every wallet committed in this call so the
-            // manager state matches what it was before. Order:
-            // remove from `self.wallets` first (UI surface), then
-            // from the inner `wallet_manager`.
-            // Generation-checked, exactly like `remove_wallet`'s own removal:
-            // a concurrent removal frees an id and a registration can publish
-            // a DIFFERENT generation under it before this rollback runs.
-            // Removing by id alone would delete that live wallet — one this
-            // call never created and whose owner is still using it.
-            let rolled_back = std::cell::RefCell::new(Vec::<WalletId>::new());
-            if !inserted_in_wallets.is_empty() {
-                self.wallets.rcu(|wallets| {
-                    // `rcu` may retry, so this is rebuilt per attempt rather
-                    // than accumulated across them.
-                    let ours = rollback_targets(&inserted_in_wallets, wallets);
-                    let mut next = std::collections::BTreeMap::clone(wallets);
-                    for id in &ours {
-                        next.remove(id);
-                    }
-                    *rolled_back.borrow_mut() = ours;
-                    next
-                });
-            }
-            let rolled_back = rolled_back.into_inner();
-            // Wait-free, purely for the diagnostics below: an id still in the
-            // map after the rollback is one a same-id re-registration owns.
-            let still_mapped = self.wallets.load();
-            if !inserted_in_manager.is_empty() {
-                let mut wm = self.wallet_manager.write().await;
-                for id in &inserted_in_manager {
-                    // A published id whose generation is no longer ours belongs
-                    // to a newer registration; taking it out of the inner
-                    // manager would strip a live wallet of its backing. An id
-                    // that never reached `self.wallets` (this call failed
-                    // between the two inserts) has no such owner and is unwound
-                    // as before.
-                    let published = inserted_in_wallets.iter().any(|(w, _)| w == id);
-                    if published && !rolled_back.contains(id) {
-                        // Two distinct states reach here, and saying the wrong
-                        // one sends whoever reads this after a
-                        // wallet-disappeared report chasing the wrong
-                        // generation: either something else already removed
-                        // the entry (a completed concurrent `remove_wallet`),
-                        // or a same-id re-registration published a generation
-                        // that is not ours. Only the second leaves anything in
-                        // place.
-                        if still_mapped.contains_key(id) {
-                            tracing::warn!(
-                                wallet_id = %hex::encode(id),
-                                "rollback after load failure: a new generation was registered \
-                                 under this id, leaving the new registration in place"
-                            );
-                        } else {
-                            tracing::warn!(
-                                wallet_id = %hex::encode(id),
-                                "rollback after load failure: this id was already removed by \
-                                 something else; nothing left to roll back"
-                            );
-                        }
-                        continue;
-                    }
-                    if let Err(e) = wm.remove_wallet(id) {
-                        tracing::warn!(
-                            wallet_id = %hex::encode(id),
-                            error = %e,
-                            "rollback after load failure: remove_wallet failed"
-                        );
-                    }
-                }
-            }
+            self.roll_back_failed_load(&inserted_in_manager, &inserted_in_wallets)
+                .await;
             return Err(err);
         }
 
@@ -555,6 +491,111 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
         }
 
         Ok(())
+    }
+
+    /// Walk back every wallet a failed [`load_from_persistor`](Self::load_from_persistor)
+    /// committed, so the manager state matches what it was before the call:
+    /// out of `self.wallets` first (the UI surface), then out of the inner
+    /// `wallet_manager`.
+    ///
+    /// A published wallet may already be in use. A funded asset-lock build can
+    /// be between its tracking write and its broadcast, so the rollback removes
+    /// each generation this call published under that generation's lifecycle
+    /// gate, taking the exclusive side that
+    /// [`remove_wallet_with_teardown`](Self::remove_wallet_with_teardown) takes.
+    /// Only the gate is shared with that method; none of its registry teardown
+    /// runs here. The rollback waits for a payment operation already inside the
+    /// gate to return, and one that enters after it finds its wallet gone. The
+    /// gates are taken one after another, before the manager lock, and each is
+    /// kept while the next is awaited, so the rollback holds earlier
+    /// generations' gates while it waits for a later one. That cannot deadlock:
+    /// every other user of a gate takes one wallet generation's gate and
+    /// nothing else while it waits, so no waiter holds a gate this rollback
+    /// still needs, and nothing waits on one it holds while holding another. A
+    /// wallet that never
+    /// reached `self.wallets` has no handle anyone could operate on, and is
+    /// removed from the inner manager without a gate.
+    ///
+    /// The wait can last as long as a broadcast in flight. A load cancelled
+    /// during it leaves the wallets it published registered in both maps, as a
+    /// successful load would have.
+    ///
+    /// Generation-checked, exactly like `remove_wallet`'s own removal: a
+    /// concurrent removal frees an id and a registration can publish a
+    /// DIFFERENT generation under it before this rollback runs. Removing by id
+    /// alone would delete that live wallet — one this call never created and
+    /// whose owner is still using it.
+    pub(crate) async fn roll_back_failed_load(
+        &self,
+        inserted_in_manager: &[WalletId],
+        inserted_in_wallets: &[(WalletId, Arc<WalletGeneration>)],
+    ) {
+        let mut teardown_guards = Vec::with_capacity(inserted_in_wallets.len());
+        for (_, generation) in inserted_in_wallets {
+            teardown_guards.push(generation.teardown_guard().await);
+        }
+        let rolled_back = std::cell::RefCell::new(Vec::<WalletId>::new());
+        if !inserted_in_wallets.is_empty() {
+            self.wallets.rcu(|wallets| {
+                // `rcu` may retry, so this is rebuilt per attempt rather
+                // than accumulated across them.
+                let ours = rollback_targets(inserted_in_wallets, wallets);
+                let mut next = std::collections::BTreeMap::clone(wallets);
+                for id in &ours {
+                    next.remove(id);
+                }
+                *rolled_back.borrow_mut() = ours;
+                next
+            });
+        }
+        let rolled_back = rolled_back.into_inner();
+        // Wait-free, purely for the diagnostics below: an id still in the
+        // map after the rollback is one a same-id re-registration owns.
+        let still_mapped = self.wallets.load();
+        if !inserted_in_manager.is_empty() {
+            let mut wm = self.wallet_manager.write().await;
+            for id in inserted_in_manager {
+                // A published id whose generation is no longer ours belongs
+                // to a newer registration; taking it out of the inner
+                // manager would strip a live wallet of its backing. An id
+                // that never reached `self.wallets` (this call failed
+                // between the two inserts) has no such owner and is unwound
+                // as before.
+                let published = inserted_in_wallets.iter().any(|(w, _)| w == id);
+                if published && !rolled_back.contains(id) {
+                    // Two distinct states reach here, and saying the wrong
+                    // one sends whoever reads this after a
+                    // wallet-disappeared report chasing the wrong
+                    // generation: either something else already removed
+                    // the entry (a completed concurrent `remove_wallet`),
+                    // or a same-id re-registration published a generation
+                    // that is not ours. Only the second leaves anything in
+                    // place.
+                    if still_mapped.contains_key(id) {
+                        tracing::warn!(
+                            wallet_id = %hex::encode(id),
+                            "rollback after load failure: a new generation was registered \
+                             under this id, leaving the new registration in place"
+                        );
+                    } else {
+                        tracing::warn!(
+                            wallet_id = %hex::encode(id),
+                            "rollback after load failure: this id was already removed by \
+                             something else; nothing left to roll back"
+                        );
+                    }
+                    continue;
+                }
+                if let Err(e) = wm.remove_wallet(id) {
+                    tracing::warn!(
+                        wallet_id = %hex::encode(id),
+                        error = %e,
+                        "rollback after load failure: remove_wallet failed"
+                    );
+                }
+            }
+        }
+        drop(teardown_guards);
     }
 }
 

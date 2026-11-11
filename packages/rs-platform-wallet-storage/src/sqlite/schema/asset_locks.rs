@@ -348,7 +348,7 @@ pub fn status_of(
     ctx: &LoadCtx,
 ) -> Result<Option<AssetLockStatus>, WalletStorageError> {
     let op_bytes = blob::encode_outpoint(outpoint)?;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT length(outpoint), outpoint, account_index, length(lifecycle_blob), lifecycle_blob, status \
          FROM asset_locks WHERE wallet_id = ?1 AND outpoint = ?2",
     )?;

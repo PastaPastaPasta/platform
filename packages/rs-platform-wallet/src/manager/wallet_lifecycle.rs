@@ -745,10 +745,12 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
     /// `bind_shielded` yet, so it holds no coordinator entry to detach.
     ///
     /// The inner-manager removal needs no such check: G1 can only leave
-    /// `wallet_manager` through this method (which requires G1's gate, held here)
-    /// or through a registration/load rollback for an insert that could not have
-    /// happened while G1 occupied the id — so while the gate is held and before
-    /// the removal below, the inner entry is still G1 by construction.
+    /// `wallet_manager` through this method (which requires G1's gate, held here),
+    /// through the rollback of the failed load that published G1 (which takes the
+    /// same gate first; see `roll_back_failed_load`), or through a
+    /// registration/load rollback for an insert that could not have happened
+    /// while G1 occupied the id — so while the gate is held and before the
+    /// removal below, the inner entry is still G1 by construction.
     pub async fn remove_wallet_with_teardown<F>(
         &self,
         wallet_id: &WalletId,

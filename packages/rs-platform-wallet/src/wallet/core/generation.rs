@@ -444,6 +444,11 @@ impl WalletGeneration {
     /// Returns an *owned* guard so it can outlive the `Arc<WalletGeneration>`
     /// binding it was taken from — the remover resolves the current generation in
     /// a retry loop and must carry the guard out of the iteration that found it.
+    ///
+    /// Taken by `remove_wallet_with_teardown` and by a failed load's rollback.
+    /// Writing to the public inner `WalletManager` directly bypasses the gate and
+    /// is not supported while a payment operation, such as a funded asset-lock
+    /// build, is in flight on this generation.
     pub async fn teardown_guard(&self) -> OwnedRwLockWriteGuard<()> {
         Arc::clone(&self.lifecycle).write_owned().await
     }
@@ -833,6 +838,14 @@ pub(crate) struct InBroadcastPin {
 }
 
 impl InBroadcastPin {
+    /// Whether this pin was taken on `generation`. A cleanup that re-acquires
+    /// the manager guard after the build's own guard ended checks it before
+    /// touching wallet state: the wallet may since have been removed and
+    /// re-created from the same seed as a new generation.
+    pub(crate) fn is_on(&self, generation: &Arc<WalletGeneration>) -> bool {
+        Arc::ptr_eq(&self.generation, generation)
+    }
+
     /// End the dispatching phase and open the pending-spend fence, which then
     /// waits for [`WalletGeneration::observe_spent`] and for nothing else — it
     /// carries no deadline.
