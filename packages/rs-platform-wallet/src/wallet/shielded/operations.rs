@@ -3801,8 +3801,8 @@ where
 ///
 /// Whether a record was armed while dispositions were recorded is read with
 /// the pass's records. A pass without a hook never sends such a record, even
-/// if it is resolved, removed or armed again before its turn, and no pass
-/// sends such a record once it is no longer armed.
+/// if it is armed again before its turn. No pass sends a record that is no
+/// longer armed at its turn.
 async fn redrive_pending_spends_gated<S: ShieldedStore, F>(
     store: &Arc<RwLock<S>>,
     persister: Option<&WalletPersister>,
@@ -3905,12 +3905,13 @@ where
             admitted = true;
         }
         // A record armed before its first send becomes possibly sent here,
-        // durably, before anything goes out. While dispositions are recorded,
-        // a record resolved since it was read (for example abandoned) is not
-        // sent. A record armed while dispositions were recorded is sent only
-        // once the hook admitted it in this pass, while they still are: a
-        // send while they are not would settle it without the hook. Any other
-        // record is marked sent first, and a failed mark skips the send.
+        // durably, before anything goes out. A record resolved or removed
+        // since it was read (for example abandoned, or purged with its
+        // wallet) is not sent. A record armed while dispositions were
+        // recorded is sent only once the hook admitted it in this pass, while
+        // they still are: a send while they are not would settle it without
+        // the hook. Any other record is marked sent first, and a failed mark
+        // skips the send.
         let (marked, recording_now, _in_flight) = {
             let mut guard = store.write().await;
             let recording_now = guard.records_spend_dispositions();
@@ -3940,15 +3941,11 @@ where
             )
         };
         match marked {
-            Ok(false) if armed_recording => {
-                debug!(
-                    "redrive: the record armed while spend dispositions were recorded is \
-                     no longer armed; not sending it"
-                );
+            Ok(false) => {
+                debug!("redrive: the record is no longer armed; not sending it");
                 continue;
             }
-            Ok(false) if recording_now => continue,
-            Ok(_) => {}
+            Ok(true) => {}
             Err(e) => {
                 warn!(error = %e, "redrive: could not record the send; skipping the record");
                 if recording_now {
@@ -6385,6 +6382,52 @@ mod release_tests {
             Some(ShieldedSpendDisposition::Unresolved(
                 UnresolvedReason::Purged
             ))
+        );
+    }
+
+    /// A pass without a hook doesn't send a record armed while dispositions
+    /// were not recorded once its wallet is purged while the pass sends an
+    /// earlier record.
+    #[tokio::test]
+    async fn a_hookless_pass_never_sends_a_record_once_its_wallet_is_purged() {
+        let test = TestStore::open("unmarked_purged_mid_pass", false);
+        let id = SubwalletId::new([0xD3; 32], 0);
+        let first = spend_with_actions(0x8D, &[N1]);
+        let purged = spend_with_actions(0x8E, &[N2]);
+        {
+            let mut store = test.store.write().await;
+            arm_reserved(&mut *store, id, &first);
+            arm_reserved(&mut *store, id, &purged);
+        }
+        let recorded = [first.anchor].into_iter().collect();
+        let mut sent = Vec::new();
+
+        redrive_pending_spends_with(&test.store, None, id.wallet_id, id, &recorded, |st| {
+            sent.push(dpp::serialization::PlatformSerializable::serialize_to_bytes(&st).unwrap());
+            if sent.len() == 1 {
+                test.store
+                    .try_write()
+                    .expect("the pass holds no store guard while it sends")
+                    .purge_wallet(id.wallet_id)
+                    .unwrap();
+            }
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sent,
+            vec![first.st_bytes.clone()],
+            "the purged record is not sent"
+        );
+        assert!(
+            test.store
+                .read()
+                .await
+                .pending_redrives(id)
+                .unwrap()
+                .is_empty(),
+            "the purge removed both records"
         );
     }
 
