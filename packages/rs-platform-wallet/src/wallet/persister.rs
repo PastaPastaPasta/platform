@@ -60,14 +60,6 @@ pub struct WalletPersister {
     wallet_id: WalletId,
     inner: Arc<dyn PlatformWalletPersistence>,
     contact_payment_gate: Arc<tokio::sync::Mutex<()>>,
-    /// Orders the raising of the hold on unrestored private payments
-    /// ([`Self::hold_until_private_payments_restored`]) against a held
-    /// public request's repeat broadcast ([`Self::held_request_dispatch`]):
-    /// the broadcast holds it shared from its check of the hold through its
-    /// dispatch, and the raise takes it alone. So a repeat broadcast is
-    /// either decided after the hold stands, and not made, or wholly made
-    /// before it. Shared by the clones the wallet and its views hold.
-    held_request_dispatch: Arc<tokio::sync::RwLock<()>>,
     /// Commitments of private contact request entries a private sync read
     /// back and recorded durably, whose records in the shielded store's
     /// private payment journal are to be discharged: the wallet's view
@@ -234,7 +226,6 @@ impl WalletPersister {
             wallet_id,
             inner,
             contact_payment_gate: Arc::new(tokio::sync::Mutex::new(())),
-            held_request_dispatch: Arc::default(),
             #[cfg(feature = "shielded")]
             read_back_private_entries: Arc::default(),
             #[cfg(feature = "shielded")]
@@ -593,49 +584,10 @@ impl WalletPersister {
     /// [`Self::private_payments_restored`]: its shielded store may hold an
     /// unconfirmed private payment from an earlier process whose pair no
     /// reservation holds yet.
-    ///
-    /// Raising it waits for any held public request's repeat broadcast that
-    /// is between its check of this hold and its dispatch
-    /// ([`Self::held_request_dispatch`]), so none is decided while the hold
-    /// is down and dispatched once it is up. A hold that already stands is
-    /// not raised again and waits for nothing. The caller holds no wallet
-    /// manager lock: the repeat broadcast takes one under the gate.
     #[cfg(feature = "shielded")]
-    pub(crate) async fn hold_until_private_payments_restored(&self) {
-        self.hold_until_private_payments_restored_while(|| Some(()))
-            .await;
-    }
-
-    /// [`Self::hold_until_private_payments_restored`], for a caller whose
-    /// reason to hold may be overtaken while the raise waits its turn: once
-    /// the raise may go ahead, `still_unrestored` answers with the caller's
-    /// lock on what could overtake it, kept until the hold is raised, or
-    /// with `None` when it was overtaken and nothing is raised. Whoever
-    /// releases the hold ([`Self::private_payments_restored`]) for that
-    /// reason does so under the same lock, so a raise and a release never
-    /// cross: the raise either sees the release or comes wholly before it.
-    #[cfg(feature = "shielded")]
-    pub(crate) async fn hold_until_private_payments_restored_while<G>(
-        &self,
-        still_unrestored: impl FnOnce() -> Option<G>,
-    ) {
-        if self.private_payments_unrestored() {
-            return;
-        }
-        let _no_repeat_broadcast = self.held_request_dispatch.write().await;
-        let Some(_not_overtaken) = still_unrestored() else {
-            return;
-        };
+    pub(crate) fn hold_until_private_payments_restored(&self) {
         self.private_payments_unrestored
             .store(true, Ordering::Release);
-    }
-
-    /// Held by a held public request's repeat broadcast from before it
-    /// checks [`Self::private_payments_unrestored`] until its bytes are
-    /// dispatched: the hold is not raised meanwhile
-    /// ([`Self::hold_until_private_payments_restored`]).
-    pub(crate) async fn held_request_dispatch(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.held_request_dispatch.read().await
     }
 
     /// The reservations of this wallet's unconfirmed private payments are

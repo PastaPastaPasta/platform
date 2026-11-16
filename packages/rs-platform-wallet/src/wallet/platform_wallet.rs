@@ -1921,7 +1921,8 @@ impl PlatformWallet {
     /// pairs restored.
     ///
     /// Fails closed, every hold staying and the wallet's raised if it was
-    /// not: for a coordinator of another network, a wallet removed or
+    /// not, unless this wallet already restored from the coordinator's
+    /// store: for a coordinator of another network, a wallet removed or
     /// re-created since this handle was taken, a journal record that does
     /// not read back, a saved spend whose transition does not decode and
     /// that no journal record accounts for, a private contact request
@@ -3091,12 +3092,6 @@ impl Drop for DeferredFinish {
 struct PrivatePaymentRestores {
     /// The store a restoration last succeeded from.
     restored_from: std::sync::Weak<RwLock<FileBackedShieldedStore>>,
-    /// How many restorations succeeded. A restoration that found the store
-    /// busy, or failed, reads it when it learns that and raises the wallet's
-    /// hold only if it is unchanged by the time the raise may go ahead: one
-    /// that succeeded from the same store meanwhile is the newer answer
-    /// ([`PrivatePaymentRestore::raise_hold`]).
-    restorations: u64,
     /// The store a deferred restoration is queued for.
     queued_for: std::sync::Weak<RwLock<FileBackedShieldedStore>>,
     /// How many deferred restorations were queued, for tests.
@@ -3107,9 +3102,10 @@ struct PrivatePaymentRestores {
 #[cfg(feature = "shielded")]
 impl PrivatePaymentRestore {
     /// Restore, and raise or release the wallet's hold as it went: released
-    /// once a restoration succeeds, raised when it fails, and when it cannot
-    /// run yet unless this generation already restored from this store.
-    /// `Ok(None)` when the store is busy and `wait` is false.
+    /// once a restoration succeeds, and raised when it fails or cannot run
+    /// yet, unless this generation already restored from this store
+    /// ([`Self::hold_unless_restored`]). `Ok(None)` when the store is busy
+    /// and `wait` is false.
     async fn restore_and_release(
         &self,
         wait: bool,
@@ -3119,50 +3115,36 @@ impl PrivatePaymentRestore {
             Ok(Some(_)) => {
                 self.persister.note_private_payment_restore(None);
                 // Released with the restorations locked, as a raise is made
-                // (`Self::raise_hold`): a raise that waited its turn either
-                // sees this restoration or comes wholly before it.
+                // (`Self::hold_unless_restored`): the two never cross.
                 let mut restores = self.restores_lock();
                 restores.restored_from = Arc::downgrade(self.coordinator.store());
-                restores.restorations += 1;
                 self.persister.private_payments_restored();
             }
-            Ok(None) if self.restored_from_this_store() => {}
-            Ok(None) => self.raise_hold().await,
+            Ok(None) => self.hold_unless_restored(),
             Err(error) => {
                 self.persister
                     .note_private_payment_restore(Some(error.to_string()));
-                self.raise_hold().await;
+                self.hold_unless_restored();
             }
         }
         restored
     }
 
-    /// Raise the wallet's hold for a restoration that just found the store
-    /// busy or failed, unless one from this store succeeds before the raise
-    /// may go ahead.
-    ///
-    /// Raising waits for a held request's repeat broadcast in flight
-    /// (`WalletPersister::hold_until_private_payments_restored`), and another
-    /// restoration may succeed and release the hold during that wait. What
-    /// this one learned is then the older answer: raising the hold after the
-    /// release would leave a restored wallet held until some later
-    /// restoration. So the count of restorations is read now, and the hold
-    /// is raised only if it is unchanged, or the one that succeeded since
-    /// was from another store, checked with the restorations locked as the
-    /// release is made.
-    async fn raise_hold(&self) {
-        let restorations = self.restores_lock().restorations;
-        self.persister
-            .hold_until_private_payments_restored_while(|| {
-                let restores = self.restores_lock();
-                let overtaken = restores.restorations != restorations
-                    && restores
-                        .restored_from
-                        .upgrade()
-                        .is_some_and(|store| Arc::ptr_eq(&store, self.coordinator.store()));
-                (!overtaken).then_some(restores)
-            })
-            .await;
+    /// Raise the wallet's hold for a restoration that found the store busy
+    /// or failed, unless this generation restored from this store, before or
+    /// since: that restoration put the wallet's reservations in place, and
+    /// one that learned nothing of the journal takes none away. Checked and
+    /// raised with the restorations locked, as the release is made, so
+    /// whichever order the two come in the wallet ends restored.
+    fn hold_unless_restored(&self) {
+        let restores = self.restores_lock();
+        let restored = restores
+            .restored_from
+            .upgrade()
+            .is_some_and(|store| Arc::ptr_eq(&store, self.coordinator.store()));
+        if !restored {
+            self.persister.hold_until_private_payments_restored();
+        }
     }
 
     /// Whether the requests the wallet tracks are durable now
@@ -3881,38 +3863,27 @@ mod private_contact_request_payment_tests {
         drop(store);
     }
 
-    /// A restoration that found the store busy, and waits its turn to raise
-    /// the wallet's hold behind a held request's repeat broadcast, does not
-    /// raise it once another restoration from the store has succeeded
-    /// meanwhile: the newer answer stands, and the wallet is not left held.
+    /// A restoration that found the store busy, or failed, holds the wallet,
+    /// but not once another restoration from the store has succeeded: the
+    /// one that succeeded stands, and the wallet is not left held.
     #[tokio::test]
     async fn should_not_raise_the_hold_over_a_restoration_that_succeeded_meanwhile() {
         let dir = tempfile::tempdir().expect("temporary shielded store");
         let (_manager, wallet) = manager_with_wallet().await;
         let coordinator = coordinator_on(dir.path(), wallet.sdk.network);
-        wallet.persister.private_payments_restored();
+        let unfinished = wallet.private_payment_restore(&coordinator);
 
-        // As a held request's repeat broadcast, mid-dispatch.
-        let dispatching = wallet.persister.held_request_dispatch().await;
-        let store = coordinator.store().write().await;
-        let mut busy = Box::pin(wallet.restore_private_payments_or_defer(&coordinator));
+        unfinished.hold_unless_restored();
         assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut busy)
-                .await
-                .is_err(),
-            "the raise waits for the dispatch in flight"
+            wallet.persister.private_payments_unrestored(),
+            "held while no restoration from the store has succeeded"
         );
-        drop(store);
 
         wallet
             .restore_private_contact_payments(&coordinator)
             .await
             .expect("restored meanwhile");
-        drop(dispatching);
-        assert!(
-            busy.await.is_none(),
-            "restored from this store, so nothing is queued"
-        );
+        unfinished.hold_unless_restored();
 
         assert!(
             !wallet.persister.private_payments_unrestored(),

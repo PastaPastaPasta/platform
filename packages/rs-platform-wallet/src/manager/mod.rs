@@ -1111,10 +1111,7 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
                 wallet.restore_private_payments_or_defer(&coordinator).await;
             }
             None if wallet.persister().persists_private_contact_scan_state() => {
-                wallet
-                    .persister()
-                    .hold_until_private_payments_restored()
-                    .await;
+                wallet.persister().hold_until_private_payments_restored();
             }
             None => {}
         }

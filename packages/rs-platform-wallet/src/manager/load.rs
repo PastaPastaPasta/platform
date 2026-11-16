@@ -597,8 +597,7 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
             {
                 platform_wallet
                     .persister()
-                    .hold_until_private_payments_restored()
-                    .await;
+                    .hold_until_private_payments_restored();
             }
 
             let platform_wallet = Arc::new(platform_wallet);

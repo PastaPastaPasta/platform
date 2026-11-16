@@ -7331,61 +7331,6 @@ mod tests {
         );
     }
 
-    /// A hold on unrestored private payments that is being raised while an
-    /// unconfirmed public request's repeat broadcast is in flight waits for
-    /// that broadcast, and a repeat broadcast that begins once the raise is
-    /// waiting waits for the hold and then finds it: its bytes do not go out.
-    /// So no repeat broadcast is decided while the hold is down and
-    /// dispatched once it is up.
-    #[cfg(feature = "shielded")]
-    #[tokio::test]
-    async fn should_not_broadcast_a_held_request_again_once_a_hold_being_raised_stands() {
-        let alice = identity(ALICE_PHRASE, ALICE);
-        let bob = identity(BOB_PHRASE, BOB);
-        let alice_crypto = SeedCryptoProvider::from_seed(seed(ALICE_PHRASE), Network::Testnet);
-        let alice_signer = signer(ALICE_PHRASE, &alice);
-        let (_manager, alice_wallet, transition, reference) =
-            unconfirmed_public_request(&alice, &bob, &alice_signer, &alice_crypto).await;
-        expect_sent_request(&alice_wallet, &alice, &bob, reference, None).await;
-        let view = alice_wallet.identity().dashpay();
-        let persister = alice_wallet.persister().clone();
-        persister.private_payments_restored();
-        let sent_once = broadcasts_of(&alice_wallet, &transition).await;
-
-        // As another held request's repeat broadcast, mid-dispatch.
-        let dispatching = persister.held_request_dispatch().await;
-        let mut raising = Box::pin(persister.hold_until_private_payments_restored());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut raising)
-                .await
-                .is_err(),
-            "the raise waits for the dispatch in flight"
-        );
-        assert!(!persister.private_payments_unrestored());
-
-        // A repeat broadcast that begins now is ordered after the raise.
-        let (alice_id, bob_id) = (alice.id(), bob.id());
-        let mut settling =
-            Box::pin(view.settle_unconfirmed_public_request(&alice_id, &bob_id, true));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), &mut settling)
-                .await
-                .is_err(),
-            "the settling waits for the hold being raised"
-        );
-        assert_eq!(broadcasts_of(&alice_wallet, &transition).await, sent_once);
-
-        drop(dispatching);
-        raising.await;
-        assert!(persister.private_payments_unrestored(), "the hold stands");
-        settling.await.expect("the reads");
-        assert_eq!(
-            broadcasts_of(&alice_wallet, &transition).await,
-            sent_once,
-            "nothing is broadcast once the hold stands"
-        );
-    }
-
     /// An accept whose wallet is removed and created again under its id
     /// while the accept derives its receiving key, after it adopted the
     /// request on its own generation, answers that its wallet is gone. It
@@ -13060,10 +13005,7 @@ mod tests {
             .expect("the shielded store is configured");
         let wallet = create_holding(&manager, ALICE_PHRASE, &alice).await;
         // As the registration's check before the store was configured left it.
-        wallet
-            .persister()
-            .hold_until_private_payments_restored()
-            .await;
+        wallet.persister().hold_until_private_payments_restored();
         manager
             .restore_private_payments_configured_since(&wallet)
             .await;
