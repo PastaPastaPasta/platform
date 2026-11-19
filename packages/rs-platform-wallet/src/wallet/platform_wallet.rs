@@ -1565,7 +1565,8 @@ impl PlatformWallet {
     /// [`shielded_transfer_to`](Self::shielded_transfer_to)); the spend then
     /// runs exactly as
     /// [`shielded_identity_top_up_from_pool_with_keyset`](Self::shielded_identity_top_up_from_pool_with_keyset)
-    /// with the derived keyset.
+    /// with the derived keyset, which is derived before the shield lock is
+    /// taken and held only for the call.
     #[cfg(feature = "shielded")]
     pub async fn shielded_identity_top_up_from_pool<P: dpp::shielded::builder::OrchardProver>(
         &self,

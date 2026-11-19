@@ -77,7 +77,8 @@ const CORE_FEE_PER_BYTE: u32 = 1;
 const TOP_UP_IDENTITY: [u8; 32] = [0x7A; 32];
 /// 0.1 DASH in credits, a member of the latest exit-denomination set.
 const DENOMINATION: u64 = 10_000_000_000;
-const IDENTITY_INDEX: u32 = 0;
+/// Not 0, so a registration at the default slot is told apart.
+const IDENTITY_INDEX: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -315,10 +316,17 @@ fn keyset(seed: &[u8], account: u32) -> OrchardKeySet {
 /// One real, spendable Orchard note of `keys`' default address, as the
 /// wallet stores it after a scan.
 fn owned_note(keys: &OrchardKeySet) -> ShieldedNote {
+    owned_note_at(keys, NOTE_VALUE, 0)
+}
+
+/// [`owned_note`] worth `value` at tree `position`, which also tells its
+/// rho apart from the other notes'.
+fn owned_note_at(keys: &OrchardKeySet, value: u64, position: u64) -> ShieldedNote {
     let rho = (1u16..=u16::MAX)
         .find_map(|n| {
             let mut b = [0u8; 32];
             b[0..2].copy_from_slice(&n.to_le_bytes());
+            b[4] = u8::try_from(position).expect("a small position");
             Rho::from_bytes(&b).into_option()
         })
         .expect("a canonical rho exists");
@@ -329,26 +337,21 @@ fn owned_note(keys: &OrchardKeySet) -> ShieldedNote {
             RandomSeed::from_bytes(b, &rho).into_option()
         })
         .expect("a canonical rseed exists");
-    let note = Note::from_parts(
-        keys.default_address,
-        NoteValue::from_raw(NOTE_VALUE),
-        rho,
-        rseed,
-    )
-    .into_option()
-    .expect("valid note parts");
+    let note = Note::from_parts(keys.default_address, NoteValue::from_raw(value), rho, rseed)
+        .into_option()
+        .expect("valid note parts");
     let mut note_data = Vec::with_capacity(115);
     note_data.extend_from_slice(&note.recipient().to_raw_address_bytes());
     note_data.extend_from_slice(&note.value().inner().to_le_bytes());
     note_data.extend_from_slice(&note.rho().to_bytes());
     note_data.extend_from_slice(note.rseed().as_bytes());
     ShieldedNote {
-        position: 0,
+        position,
         cmx: ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
         nullifier: note.nullifier(&keys.full_viewing_key).to_bytes(),
         block_height: 1,
         is_spent: false,
-        value: NOTE_VALUE,
+        value,
         note_data,
     }
 }
@@ -360,10 +363,21 @@ async fn hooked_coordinator(
     note: &ShieldedNote,
     hook_accepts: bool,
 ) -> (Arc<NetworkShieldedCoordinator>, Arc<TestHook>, [u8; 32]) {
+    hooked_coordinator_holding(tag, std::slice::from_ref(note), hook_accepts).await
+}
+
+/// [`hooked_coordinator`] whose tree holds `notes`, in position order.
+async fn hooked_coordinator_holding(
+    tag: &str,
+    notes: &[ShieldedNote],
+    hook_accepts: bool,
+) -> (Arc<NetworkShieldedCoordinator>, Arc<TestHook>, [u8; 32]) {
     let coordinator = coordinator_at(&temp_dir(&format!("keyset_spend_{tag}")));
     let anchor = {
         let mut store = coordinator.store().write().await;
-        store.append_commitment(&note.cmx, true).unwrap();
+        for note in notes {
+            store.append_commitment(&note.cmx, true).unwrap();
+        }
         store.checkpoint_tree(1).unwrap();
         store.tree_anchor().unwrap()
     };
@@ -387,7 +401,27 @@ async fn bound_wallet(
     note: &ShieldedNote,
     stores: &[&Arc<NetworkShieldedCoordinator>],
 ) -> (PlatformWallet, Arc<CapturingPersistence>) {
+    bound_wallet_holding(
+        coordinator,
+        anchor,
+        std::slice::from_ref(note),
+        stores,
+        None,
+    )
+    .await
+}
+
+/// [`bound_wallet`] holding `notes`, whose SDK also serves `identity` when
+/// it is fetched by its id.
+async fn bound_wallet_holding(
+    coordinator: &Arc<NetworkShieldedCoordinator>,
+    anchor: [u8; 32],
+    notes: &[ShieldedNote],
+    stores: &[&Arc<NetworkShieldedCoordinator>],
+    identity: Option<dpp::identity::Identity>,
+) -> (PlatformWallet, Arc<CapturingPersistence>) {
     use dash_sdk::query_types::{NoParamQuery, ShieldedAnchors};
+    use dpp::identity::accessors::IdentityGettersV0;
     // Pinned, so the anchor response can't move the protocol version between
     // the fee the spend reserves and the fee its builder applies.
     let mut sdk = dash_sdk::SdkBuilder::new_mock()
@@ -398,6 +432,12 @@ async fn bound_wallet(
         .expect_fetch(NoParamQuery {}, Some(ShieldedAnchors(vec![anchor])))
         .await
         .expect("anchor expectation");
+    if let Some(identity) = identity {
+        sdk.mock()
+            .expect_fetch(identity.id(), Some(identity))
+            .await
+            .expect("identity expectation");
+    }
     let persister = Arc::new(CapturingPersistence::default());
     let wallet = platform_wallet_on(Arc::clone(&persister), Arc::new(sdk)).await;
     wallet
@@ -406,12 +446,10 @@ async fn bound_wallet(
         .expect("seed bind");
     let id = SubwalletId::new(wallet.wallet_id(), ACCOUNT);
     for holder in stores {
-        holder
-            .store()
-            .write()
-            .await
-            .save_note(id, note)
-            .expect("save the note");
+        let mut store = holder.store().write().await;
+        for note in notes {
+            store.save_note(id, note).expect("save the note");
+        }
     }
     (wallet, persister)
 }
@@ -658,7 +696,7 @@ fn mismatched_keysets() -> Vec<(&'static str, OrchardKeySet)> {
 }
 
 /// A keyset that isn't the account's spend authority, whole or in any one
-/// field the spend reads, is refused with the typed mismatch on both kinds,
+/// field the spend reads, is refused with the typed mismatch on every kind,
 /// before anything is reserved, armed, stored or handed to the hook.
 #[tokio::test]
 async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
@@ -1006,7 +1044,7 @@ fn assert_artifact(
     );
 }
 
-/// A matching keyset reaches the hook on both kinds: `dispatch` sees the
+/// A matching keyset reaches the hook on every kind: `dispatch` sees the
 /// spend's artifact while it is armed and unsent, and only once it returns
 /// `Ok` is the record claimed for broadcast and the transition sent.
 #[tokio::test]
@@ -1437,4 +1475,88 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
         assert_outputs(kind, &seed.st_bytes, "seed");
         assert_outputs(kind, &keyset.st_bytes, "keyset");
     }
+}
+
+/// A create on the keyset path that Platform confirms registers the new
+/// identity locally, at the requested slot. The mock can't answer the
+/// broadcast or its result wait, so the confirmation is the create's own
+/// fallback: the identity is found by the id its nullifiers derive. Two
+/// notes that each fall short of the denomination are both spent, so the
+/// bundle has no padding action and that id is known before the call.
+#[tokio::test]
+async fn a_confirmed_keyset_create_registers_the_identity_at_its_slot() {
+    use dpp::identity::identity_public_key::accessors::v0::IdentityPublicKeyGettersV0;
+    use dpp::state_transition::identity_create_from_shielded_pool_transition::identity_id_from_nullifiers;
+
+    let own = keyset(&SEED, ACCOUNT);
+    let notes = [
+        owned_note_at(&own, DENOMINATION * 3 / 5, 0),
+        owned_note_at(&own, DENOMINATION * 3 / 5, 1),
+    ];
+    let expected_id = identity_id_from_nullifiers(&[notes[0].nullifier, notes[1].nullifier]);
+    let created = dpp::identity::Identity::new_with_id_and_keys(
+        expected_id,
+        identity_keys()
+            .into_iter()
+            .map(|(key, _)| (key.id(), key))
+            .collect(),
+        dpp::version::PlatformVersion::latest(),
+    )
+    .expect("the created identity");
+    let (coordinator, hook, anchor) =
+        hooked_coordinator_holding("create_registers", &notes, true).await;
+    let (wallet, _persister) =
+        bound_wallet_holding(&coordinator, anchor, &notes, &[&coordinator], Some(created)).await;
+    let wallet_id = wallet.wallet_id();
+    {
+        let manager = wallet.wallet_manager().read().await;
+        let info = manager.get_wallet_info(&wallet_id).expect("wallet info");
+        assert!(
+            info.identity_manager
+                .wallet_identity_ids(&wallet_id)
+                .is_empty(),
+            "no identity before the create"
+        );
+    }
+
+    let identity_id = wallet
+        .shielded_identity_create_from_pool_with_keyset(
+            &coordinator,
+            &own,
+            ACCOUNT,
+            IDENTITY_INDEX,
+            identity_keys(),
+            DENOMINATION,
+            creation_failure_address(),
+            &FixedSigner,
+            &CachedOrchardProver::new(),
+        )
+        .await
+        .expect("the create is confirmed");
+
+    assert_eq!(identity_id, expected_id, "the id the nullifiers derive");
+    let seen = hook.seen();
+    assert_eq!(seen.len(), 1, "one dispatch");
+    assert_eq!(
+        seen[0].payload.kind,
+        ShieldedDispatchKind::IdentityCreate {
+            identity_id: expected_id.to_buffer(),
+        },
+        "the dispatched create is the confirmed one"
+    );
+    let manager = wallet.wallet_manager().read().await;
+    let identities = &manager
+        .get_wallet_info(&wallet_id)
+        .expect("wallet info")
+        .identity_manager;
+    assert_eq!(
+        identities.wallet_identity_ids(&wallet_id),
+        vec![identity_id],
+        "the created identity is the wallet's one identity"
+    );
+    assert_eq!(
+        identities.identity_index(&identity_id),
+        Some(IDENTITY_INDEX),
+        "registered at the requested slot"
+    );
 }
