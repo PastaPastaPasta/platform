@@ -1,10 +1,13 @@
-//! The keyset entry points of the shielded transfer and withdrawal.
+//! The keyset entry points of the hooked shielded spends.
 //!
 //! A caller that holds only an account's `OrchardKeySet` (never the seed)
-//! spends through [`PlatformWallet::shielded_transfer_to_with_keyset`] and
-//! [`PlatformWallet::shielded_withdraw_to_with_keyset`]. Each drives the
-//! real path: a bound wallet, a spendable note in a commitment tree, the
-//! recorded anchor from the (mock) SDK, a real Halo 2 proof, the
+//! spends through [`PlatformWallet::shielded_transfer_to_with_keyset`],
+//! [`PlatformWallet::shielded_withdraw_to_with_keyset`],
+//! [`PlatformWallet::shielded_unshield_to_with_keyset`],
+//! [`PlatformWallet::shielded_identity_top_up_from_pool_with_keyset`] and
+//! [`PlatformWallet::shielded_identity_create_from_pool_with_keyset`]. Each
+//! drives the real path: a bound wallet, a spendable note in a commitment
+//! tree, the recorded anchor from the (mock) SDK, a real Halo 2 proof, the
 //! coordinator's dispatch hook, then the broadcast.
 
 use std::future::Future;
@@ -12,12 +15,26 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use dash_sdk::platform::shielded::try_decrypt_note_with_memo;
+use dpp::address_funds::{AddressWitness, PlatformAddress};
 use dpp::identity::core_script::CoreScript;
+use dpp::identity::identity_public_key::v0::IdentityPublicKeyV0;
+use dpp::identity::signer::Signer;
+use dpp::identity::{IdentityPublicKey, KeyType, Purpose, SecurityLevel};
+use dpp::platform_value::BinaryData;
+use dpp::prelude::Identifier;
 use dpp::serialization::PlatformDeserializableTrusted;
+use dpp::state_transition::identity_create_from_shielded_pool_transition::{
+    derive_identity_id_from_actions, IdentityCreateFromShieldedPoolTransition,
+};
+use dpp::state_transition::identity_top_up_from_shielded_pool_transition::IdentityTopUpFromShieldedPoolTransition;
+use dpp::state_transition::public_key_in_creation::accessors::IdentityPublicKeyInCreationV0Setters;
+use dpp::state_transition::public_key_in_creation::IdentityPublicKeyInCreation;
 use dpp::state_transition::shielded_transfer_transition::ShieldedTransferTransition;
 use dpp::state_transition::shielded_withdrawal_transition::ShieldedWithdrawalTransition;
+use dpp::state_transition::unshield_transition::UnshieldTransition;
 use dpp::state_transition::StateTransition;
 use dpp::withdrawal::Pooling;
+use dpp::ProtocolError;
 use drive_proof_verifier::types::ShieldedEncryptedNote;
 use futures::FutureExt;
 use grovedb_commitment_tree::{ExtractedNoteCommitment, Note, NoteValue, RandomSeed, Rho};
@@ -55,22 +72,88 @@ const MEMO: [u8; 36] = {
     memo
 };
 const CORE_FEE_PER_BYTE: u32 = 1;
+/// The identity a top-up credits. It need not exist for the spend to be
+/// built and handed to the hook.
+const TOP_UP_IDENTITY: [u8; 32] = [0x7A; 32];
+/// 0.1 DASH in credits, a member of the latest exit-denomination set.
+const DENOMINATION: u64 = 10_000_000_000;
+/// Not 0, so a registration at the default slot is told apart.
+const IDENTITY_INDEX: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Transfer,
     Withdraw,
+    Unshield,
+    TopUp,
+    Create,
 }
 
-const KINDS: [Kind; 2] = [Kind::Transfer, Kind::Withdraw];
+const KINDS: [Kind; 5] = [
+    Kind::Transfer,
+    Kind::Withdraw,
+    Kind::Unshield,
+    Kind::TopUp,
+    Kind::Create,
+];
 
-impl Kind {
-    fn dispatch_kind(self) -> ShieldedDispatchKind {
-        match self {
-            Kind::Transfer => ShieldedDispatchKind::Transfer,
-            Kind::Withdraw => ShieldedDispatchKind::Withdraw,
-        }
+/// A proof-of-possession signer with a fixed signature: the builder fills
+/// the signatures without verifying them.
+#[derive(Debug)]
+struct FixedSigner;
+
+#[async_trait::async_trait]
+impl Signer<IdentityPublicKey> for FixedSigner {
+    async fn sign(
+        &self,
+        _key: &IdentityPublicKey,
+        _data: &[u8],
+    ) -> Result<BinaryData, ProtocolError> {
+        Ok(BinaryData::new(vec![0x5A; 65]))
     }
+
+    async fn sign_create_witness(
+        &self,
+        _key: &IdentityPublicKey,
+        _data: &[u8],
+    ) -> Result<AddressWitness, ProtocolError> {
+        Err(ProtocolError::ShieldedBuildError(
+            "no address witnesses in these tests".to_string(),
+        ))
+    }
+
+    fn can_sign_with(&self, _key: &IdentityPublicKey) -> bool {
+        true
+    }
+}
+
+/// The new identity's one master key, in both forms the create takes.
+fn identity_keys() -> Vec<(IdentityPublicKey, IdentityPublicKeyInCreation)> {
+    let public = IdentityPublicKey::V0(IdentityPublicKeyV0 {
+        id: 0,
+        purpose: Purpose::AUTHENTICATION,
+        security_level: SecurityLevel::MASTER,
+        contract_bounds: None,
+        key_type: KeyType::ECDSA_SECP256K1,
+        read_only: false,
+        data: BinaryData::new(vec![0x02; 33]),
+        disabled_at: None,
+    });
+    let in_creation = IdentityPublicKeyInCreation::from(&public);
+    vec![(public, in_creation)]
+}
+
+fn platform_recipient() -> PlatformAddress {
+    PlatformAddress::P2pkh([0x11; 20])
+}
+
+fn platform_recipient_bech32m() -> String {
+    platform_recipient().to_bech32m_string(dash_sdk::Sdk::new_mock().network)
+}
+
+/// Where a failed identity creation credits the denomination.
+fn creation_failure_address() -> PlatformAddress {
+    PlatformAddress::P2pkh([0x22; 20])
 }
 
 /// What the hook saw at one `dispatch`.
@@ -233,10 +316,17 @@ fn keyset(seed: &[u8], account: u32) -> OrchardKeySet {
 /// One real, spendable Orchard note of `keys`' default address, as the
 /// wallet stores it after a scan.
 fn owned_note(keys: &OrchardKeySet) -> ShieldedNote {
+    owned_note_at(keys, NOTE_VALUE, 0)
+}
+
+/// [`owned_note`] worth `value` at tree `position`, which also tells its
+/// rho apart from the other notes'.
+fn owned_note_at(keys: &OrchardKeySet, value: u64, position: u64) -> ShieldedNote {
     let rho = (1u16..=u16::MAX)
         .find_map(|n| {
             let mut b = [0u8; 32];
             b[0..2].copy_from_slice(&n.to_le_bytes());
+            b[4] = u8::try_from(position).expect("a small position");
             Rho::from_bytes(&b).into_option()
         })
         .expect("a canonical rho exists");
@@ -247,26 +337,21 @@ fn owned_note(keys: &OrchardKeySet) -> ShieldedNote {
             RandomSeed::from_bytes(b, &rho).into_option()
         })
         .expect("a canonical rseed exists");
-    let note = Note::from_parts(
-        keys.default_address,
-        NoteValue::from_raw(NOTE_VALUE),
-        rho,
-        rseed,
-    )
-    .into_option()
-    .expect("valid note parts");
+    let note = Note::from_parts(keys.default_address, NoteValue::from_raw(value), rho, rseed)
+        .into_option()
+        .expect("valid note parts");
     let mut note_data = Vec::with_capacity(115);
     note_data.extend_from_slice(&note.recipient().to_raw_address_bytes());
     note_data.extend_from_slice(&note.value().inner().to_le_bytes());
     note_data.extend_from_slice(&note.rho().to_bytes());
     note_data.extend_from_slice(note.rseed().as_bytes());
     ShieldedNote {
-        position: 0,
+        position,
         cmx: ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
         nullifier: note.nullifier(&keys.full_viewing_key).to_bytes(),
         block_height: 1,
         is_spent: false,
-        value: NOTE_VALUE,
+        value,
         note_data,
     }
 }
@@ -278,10 +363,21 @@ async fn hooked_coordinator(
     note: &ShieldedNote,
     hook_accepts: bool,
 ) -> (Arc<NetworkShieldedCoordinator>, Arc<TestHook>, [u8; 32]) {
+    hooked_coordinator_holding(tag, std::slice::from_ref(note), hook_accepts).await
+}
+
+/// [`hooked_coordinator`] whose tree holds `notes`, in position order.
+async fn hooked_coordinator_holding(
+    tag: &str,
+    notes: &[ShieldedNote],
+    hook_accepts: bool,
+) -> (Arc<NetworkShieldedCoordinator>, Arc<TestHook>, [u8; 32]) {
     let coordinator = coordinator_at(&temp_dir(&format!("keyset_spend_{tag}")));
     let anchor = {
         let mut store = coordinator.store().write().await;
-        store.append_commitment(&note.cmx, true).unwrap();
+        for note in notes {
+            store.append_commitment(&note.cmx, true).unwrap();
+        }
         store.checkpoint_tree(1).unwrap();
         store.tree_anchor().unwrap()
     };
@@ -305,7 +401,27 @@ async fn bound_wallet(
     note: &ShieldedNote,
     stores: &[&Arc<NetworkShieldedCoordinator>],
 ) -> (PlatformWallet, Arc<CapturingPersistence>) {
+    bound_wallet_holding(
+        coordinator,
+        anchor,
+        std::slice::from_ref(note),
+        stores,
+        None,
+    )
+    .await
+}
+
+/// [`bound_wallet`] holding `notes`, whose SDK also serves `identity` when
+/// it is fetched by its id.
+async fn bound_wallet_holding(
+    coordinator: &Arc<NetworkShieldedCoordinator>,
+    anchor: [u8; 32],
+    notes: &[ShieldedNote],
+    stores: &[&Arc<NetworkShieldedCoordinator>],
+    identity: Option<dpp::identity::Identity>,
+) -> (PlatformWallet, Arc<CapturingPersistence>) {
     use dash_sdk::query_types::{NoParamQuery, ShieldedAnchors};
+    use dpp::identity::accessors::IdentityGettersV0;
     // Pinned, so the anchor response can't move the protocol version between
     // the fee the spend reserves and the fee its builder applies.
     let mut sdk = dash_sdk::SdkBuilder::new_mock()
@@ -316,6 +432,12 @@ async fn bound_wallet(
         .expect_fetch(NoParamQuery {}, Some(ShieldedAnchors(vec![anchor])))
         .await
         .expect("anchor expectation");
+    if let Some(identity) = identity {
+        sdk.mock()
+            .expect_fetch(identity.id(), Some(identity))
+            .await
+            .expect("identity expectation");
+    }
     let persister = Arc::new(CapturingPersistence::default());
     let wallet = platform_wallet_on(Arc::clone(&persister), Arc::new(sdk)).await;
     wallet
@@ -324,12 +446,10 @@ async fn bound_wallet(
         .expect("seed bind");
     let id = SubwalletId::new(wallet.wallet_id(), ACCOUNT);
     for holder in stores {
-        holder
-            .store()
-            .write()
-            .await
-            .save_note(id, note)
-            .expect("save the note");
+        let mut store = holder.store().write().await;
+        for note in notes {
+            store.save_note(id, note).expect("save the note");
+        }
     }
     (wallet, persister)
 }
@@ -383,12 +503,50 @@ async fn spend_with_keyset(
                 )
                 .await
         }
+        Kind::Unshield => {
+            wallet
+                .shielded_unshield_to_with_keyset(
+                    coordinator,
+                    keys,
+                    account,
+                    &platform_recipient_bech32m(),
+                    AMOUNT,
+                    &prover,
+                )
+                .await
+        }
+        Kind::TopUp => wallet
+            .shielded_identity_top_up_from_pool_with_keyset(
+                coordinator,
+                keys,
+                account,
+                &Identifier::new(TOP_UP_IDENTITY),
+                AMOUNT,
+                &prover,
+            )
+            .await
+            .map(drop),
+        Kind::Create => wallet
+            .shielded_identity_create_from_pool_with_keyset(
+                coordinator,
+                keys,
+                account,
+                IDENTITY_INDEX,
+                identity_keys(),
+                DENOMINATION,
+                creation_failure_address(),
+                &FixedSigner,
+                &prover,
+            )
+            .await
+            .map(drop),
     }
 }
 
 async fn spend_with_seed(
     wallet: &PlatformWallet,
     coordinator: &Arc<NetworkShieldedCoordinator>,
+    seed: &[u8],
     kind: Kind,
 ) -> Result<(), PlatformWalletError> {
     let prover = CachedOrchardProver::new();
@@ -397,7 +555,7 @@ async fn spend_with_seed(
             wallet
                 .shielded_transfer_to(
                     coordinator,
-                    &SEED,
+                    seed,
                     ACCOUNT,
                     &recipient(),
                     AMOUNT,
@@ -410,7 +568,7 @@ async fn spend_with_seed(
             wallet
                 .shielded_withdraw_to(
                     coordinator,
-                    &SEED,
+                    seed,
                     ACCOUNT,
                     &core_address(),
                     AMOUNT,
@@ -419,6 +577,43 @@ async fn spend_with_seed(
                 )
                 .await
         }
+        Kind::Unshield => {
+            wallet
+                .shielded_unshield_to(
+                    coordinator,
+                    seed,
+                    ACCOUNT,
+                    &platform_recipient_bech32m(),
+                    AMOUNT,
+                    &prover,
+                )
+                .await
+        }
+        Kind::TopUp => wallet
+            .shielded_identity_top_up_from_pool(
+                coordinator,
+                seed,
+                ACCOUNT,
+                &Identifier::new(TOP_UP_IDENTITY),
+                AMOUNT,
+                &prover,
+            )
+            .await
+            .map(drop),
+        Kind::Create => wallet
+            .shielded_identity_create_from_pool(
+                coordinator,
+                seed,
+                ACCOUNT,
+                IDENTITY_INDEX,
+                identity_keys(),
+                DENOMINATION,
+                creation_failure_address(),
+                &FixedSigner,
+                &prover,
+            )
+            .await
+            .map(drop),
     }
 }
 
@@ -501,7 +696,7 @@ fn mismatched_keysets() -> Vec<(&'static str, OrchardKeySet)> {
 }
 
 /// A keyset that isn't the account's spend authority, whole or in any one
-/// field the spend reads, is refused with the typed mismatch on both kinds,
+/// field the spend reads, is refused with the typed mismatch on every kind,
 /// before anything is reserved, armed, stored or handed to the hook.
 #[tokio::test]
 async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
@@ -542,8 +737,9 @@ async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
     }
 }
 
-/// The keyset check runs before the recipient is parsed: a mismatched
-/// keyset with an unparsable recipient is still refused as a mismatch.
+/// The keyset check runs before the request is parsed: a mismatched
+/// keyset with an unparsable recipient, or an identity create with no key,
+/// is still refused as a mismatch.
 #[tokio::test]
 async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     let own = keyset(&SEED, ACCOUNT);
@@ -582,8 +778,39 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
         "unparsable recipient, withdraw",
     )
     .await;
+    let unshield = without_writes(
+        &coordinator,
+        wallet.shielded_unshield_to_with_keyset(
+            &coordinator,
+            &other,
+            ACCOUNT,
+            "not a platform address",
+            AMOUNT,
+            &prover,
+        ),
+        "unparsable recipient, unshield",
+    )
+    .await;
+    let create = without_writes(
+        &coordinator,
+        wallet
+            .shielded_identity_create_from_pool_with_keyset(
+                &coordinator,
+                &other,
+                ACCOUNT,
+                IDENTITY_INDEX,
+                Vec::new(),
+                DENOMINATION,
+                creation_failure_address(),
+                &FixedSigner,
+                &prover,
+            )
+            .map(|result| result.map(drop)),
+        "no identity key, create",
+    )
+    .await;
 
-    for result in [transfer, withdraw] {
+    for result in [transfer, withdraw, unshield, create] {
         assert!(
             matches!(
                 result,
@@ -602,7 +829,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     )
     .await;
 
-    // Control: with the matching keyset, the same recipients fail to parse.
+    // Control: with the matching keyset, the same requests fail to parse.
     let transfer = wallet
         .shielded_transfer_to_with_keyset(
             &coordinator,
@@ -625,10 +852,34 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
             &prover,
         )
         .await;
-    for result in [transfer, withdraw] {
+    let unshield = wallet
+        .shielded_unshield_to_with_keyset(
+            &coordinator,
+            &own,
+            ACCOUNT,
+            "not a platform address",
+            AMOUNT,
+            &prover,
+        )
+        .await;
+    let create = wallet
+        .shielded_identity_create_from_pool_with_keyset(
+            &coordinator,
+            &own,
+            ACCOUNT,
+            IDENTITY_INDEX,
+            Vec::new(),
+            DENOMINATION,
+            creation_failure_address(),
+            &FixedSigner,
+            &prover,
+        )
+        .await
+        .map(drop);
+    for result in [transfer, withdraw, unshield, create] {
         assert!(
             matches!(result, Err(PlatformWalletError::ShieldedBuildError(_))),
-            "an unparsable recipient fails to parse, got {result:?}"
+            "an unparsable request fails to parse, got {result:?}"
         );
     }
 }
@@ -644,43 +895,14 @@ async fn a_wrong_seed_keeps_its_error_on_the_seed_path() {
             hooked_coordinator(&format!("wrong_seed_{kind:?}"), &note, true).await;
         let (wallet, persister) = bound_wallet(&coordinator, anchor, &note, &[&coordinator]).await;
         let stored_before = persister.stored_count();
-        let prover = CachedOrchardProver::new();
 
         let context = format!("{kind:?} wrong seed");
-        let result = match kind {
-            Kind::Transfer => {
-                without_writes(
-                    &coordinator,
-                    wallet.shielded_transfer_to(
-                        &coordinator,
-                        &OTHER_SEED,
-                        ACCOUNT,
-                        &recipient(),
-                        AMOUNT,
-                        MEMO,
-                        &prover,
-                    ),
-                    &context,
-                )
-                .await
-            }
-            Kind::Withdraw => {
-                without_writes(
-                    &coordinator,
-                    wallet.shielded_withdraw_to(
-                        &coordinator,
-                        &OTHER_SEED,
-                        ACCOUNT,
-                        &core_address(),
-                        AMOUNT,
-                        CORE_FEE_PER_BYTE,
-                        &prover,
-                    ),
-                    &context,
-                )
-                .await
-            }
-        };
+        let result = without_writes(
+            &coordinator,
+            spend_with_seed(&wallet, &coordinator, &OTHER_SEED, kind),
+            &context,
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -781,7 +1003,18 @@ fn assert_artifact(
     anchor: [u8; 32],
 ) {
     let payload = &seen.payload;
-    assert_eq!(payload.kind, kind.dispatch_kind(), "{kind:?}: kind");
+    let expected_kind = match kind {
+        Kind::Transfer => ShieldedDispatchKind::Transfer,
+        Kind::Withdraw => ShieldedDispatchKind::Withdraw,
+        Kind::Unshield => ShieldedDispatchKind::Unshield,
+        Kind::TopUp => ShieldedDispatchKind::IdentityTopUp {
+            identity_id: TOP_UP_IDENTITY,
+        },
+        Kind::Create => ShieldedDispatchKind::IdentityCreate {
+            identity_id: created_identity_id(&payload.st_bytes),
+        },
+    };
+    assert_eq!(payload.kind, expected_kind, "{kind:?}: kind");
     assert_eq!(payload.wallet_id, wallet.wallet_id(), "{kind:?}: wallet");
     assert_eq!(payload.account_index, ACCOUNT, "{kind:?}: account");
     assert_eq!(payload.anchor, anchor, "{kind:?}: anchor");
@@ -811,7 +1044,7 @@ fn assert_artifact(
     );
 }
 
-/// A matching keyset reaches the hook on both kinds: `dispatch` sees the
+/// A matching keyset reaches the hook on every kind: `dispatch` sees the
 /// spend's artifact while it is armed and unsent, and only once it returns
 /// `Ok` is the record claimed for broadcast and the transition sent.
 #[tokio::test]
@@ -856,12 +1089,22 @@ async fn a_matching_keyset_reaches_the_hook_before_the_send() {
         );
         // The mock SDK has no broadcast expectation, so the send itself is
         // what fails, and it fails as an unconfirmed send.
+        let unconfirmed = match &result {
+            Err(PlatformWalletError::ShieldedSpendUnconfirmed { reason, .. }) => {
+                kind != Kind::Create && reason.contains("mock expectation not found")
+            }
+            Err(PlatformWalletError::ShieldedBroadcastUnconfirmed {
+                identity_id,
+                reason,
+            }) => {
+                kind == Kind::Create
+                    && identity_id.to_buffer() == created_identity_id(&seen[0].payload.st_bytes)
+                    && reason.contains("mock expectation not found")
+            }
+            _ => false,
+        };
         assert!(
-            matches!(
-                result,
-                Err(PlatformWalletError::ShieldedSpendUnconfirmed { ref reason, .. })
-                    if reason.contains("mock expectation not found")
-            ),
+            unconfirmed,
             "{kind:?}: the transition was sent after dispatch, got {result:?}"
         );
     }
@@ -894,13 +1137,63 @@ fn deterministic_fields(kind: Kind, st_bytes: &[u8]) -> String {
             v0.pooling,
             v0.output_script,
         ),
+        (Kind::Unshield, StateTransition::Unshield(UnshieldTransition::V0(v0))) => format!(
+            "unshield actions {} amount {} anchor {:?} output_address {:?}",
+            v0.actions.len(),
+            v0.unshielding_amount,
+            v0.anchor,
+            v0.output_address,
+        ),
+        (
+            Kind::TopUp,
+            StateTransition::IdentityTopUpFromShieldedPool(
+                IdentityTopUpFromShieldedPoolTransition::V0(v0),
+            ),
+        ) => format!(
+            "top up actions {} amount {} anchor {:?} identity {:?}",
+            v0.actions.len(),
+            v0.top_up_amount,
+            v0.anchor,
+            v0.identity_id,
+        ),
+        (
+            Kind::Create,
+            StateTransition::IdentityCreateFromShieldedPool(
+                IdentityCreateFromShieldedPoolTransition::V0(v0),
+            ),
+        ) => format!(
+            "create actions {} denomination {} anchor {:?} failure_address {:?} keys {:?}",
+            v0.actions.len(),
+            v0.denomination,
+            v0.anchor,
+            v0.send_to_address_on_creation_failure,
+            v0.public_keys,
+        ),
         (kind, st) => panic!("{kind:?}: unexpected transition {st:?}"),
     }
 }
 
+/// The id of the identity `st_bytes`, an identity create, creates: the one
+/// it carries, which must be the one its published nullifiers derive.
+fn created_identity_id(st_bytes: &[u8]) -> [u8; 32] {
+    let st = StateTransition::deserialize_from_bytes_trusted(st_bytes).expect("decode transition");
+    let StateTransition::IdentityCreateFromShieldedPool(
+        IdentityCreateFromShieldedPoolTransition::V0(v0),
+    ) = st
+    else {
+        panic!("not an identity create from the pool: {st:?}");
+    };
+    assert_eq!(
+        v0.identity_id,
+        derive_identity_id_from_actions(&v0.actions),
+        "the created id is the one the published nullifiers derive"
+    );
+    v0.identity_id.to_buffer()
+}
+
 /// The actions of a transition of `kind`, and the credits it takes out of
-/// the shielded pool: the fee of a transfer, the whole unshielded amount of
-/// a withdrawal.
+/// the shielded pool: the fee of a transfer, the whole amount leaving the
+/// pool otherwise.
 fn actions_and_outflow(kind: Kind, st_bytes: &[u8]) -> (Vec<dpp::shielded::SerializedAction>, u64) {
     let st = StateTransition::deserialize_from_bytes_trusted(st_bytes).expect("decode transition");
     match (kind, st) {
@@ -911,6 +1204,21 @@ fn actions_and_outflow(kind: Kind, st_bytes: &[u8]) -> (Vec<dpp::shielded::Seria
             Kind::Withdraw,
             StateTransition::ShieldedWithdrawal(ShieldedWithdrawalTransition::V0(v0)),
         ) => (v0.actions, v0.unshielding_amount),
+        (Kind::Unshield, StateTransition::Unshield(UnshieldTransition::V0(v0))) => {
+            (v0.actions, v0.unshielding_amount)
+        }
+        (
+            Kind::TopUp,
+            StateTransition::IdentityTopUpFromShieldedPool(
+                IdentityTopUpFromShieldedPoolTransition::V0(v0),
+            ),
+        ) => (v0.actions, v0.top_up_amount),
+        (
+            Kind::Create,
+            StateTransition::IdentityCreateFromShieldedPool(
+                IdentityCreateFromShieldedPoolTransition::V0(v0),
+            ),
+        ) => (v0.actions, v0.denomination),
         (kind, st) => panic!("{kind:?}: unexpected transition {st:?}"),
     }
 }
@@ -939,11 +1247,13 @@ fn decrypted_outputs(
 }
 
 /// `st_bytes` pays exactly what was asked: a transfer's one output to the
-/// recipient carries `AMOUNT` and `MEMO`; a withdrawal takes exactly
-/// `AMOUNT` plus the withdrawal fee for its action count out of the pool,
-/// to the requested Core address. The one output the bound account can
-/// decrypt is the change, at its default address, worth the note less the
-/// payment and everything taken out of the pool.
+/// recipient carries `AMOUNT` and `MEMO`; a withdrawal, an unshield and a
+/// top-up take exactly `AMOUNT` plus their fee for the action count out of
+/// the pool, to the requested Core address, Platform address or identity;
+/// an identity create takes exactly `DENOMINATION` out, with the requested
+/// keys and failure address. The one output the bound account can decrypt
+/// is the change, at its default address, worth the note less the payment
+/// and everything taken out of the pool.
 fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
     let own = keyset(&SEED, ACCOUNT);
     let (actions, outflow) = actions_and_outflow(kind, st_bytes);
@@ -977,6 +1287,18 @@ fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
             );
             (0, AMOUNT + fee)
         }
+        Kind::Unshield | Kind::TopUp | Kind::Create => {
+            assert!(
+                to_recipient.is_empty(),
+                "{kind:?} {path}: no shielded output to anyone else"
+            );
+            let taken = assert_pool_exit_request(kind, st_bytes, actions.len(), path);
+            assert_eq!(
+                outflow, taken,
+                "{kind:?} {path}: exactly the requested exit leaves the pool"
+            );
+            (0, taken)
+        }
     };
     assert_eq!(to_self.len(), 1, "{kind:?} {path}: one change output");
     let (change, address, _memo) = to_self[0];
@@ -990,6 +1312,67 @@ fn assert_outputs(kind: Kind, st_bytes: &[u8], path: &str) {
         NOTE_VALUE - paid - taken,
         "{kind:?} {path}: change is the rest of the note"
     );
+}
+
+/// `st_bytes`, an unshield, a top-up or an identity create, goes to the
+/// requested Platform address, identity or key set. Returns what it must
+/// take out of the pool: `AMOUNT` plus the fee for `action_count` actions,
+/// or the requested denomination.
+fn assert_pool_exit_request(kind: Kind, st_bytes: &[u8], action_count: usize, path: &str) -> u64 {
+    let version = dpp::version::PlatformVersion::latest();
+    let st = StateTransition::deserialize_from_bytes_trusted(st_bytes).expect("decode transition");
+    match (kind, st) {
+        (Kind::Unshield, StateTransition::Unshield(UnshieldTransition::V0(v0))) => {
+            assert_eq!(
+                v0.output_address,
+                platform_recipient(),
+                "Unshield {path}: pays the requested Platform address"
+            );
+            AMOUNT
+                + dpp::shielded::compute_shielded_unshield_fee(action_count, version)
+                    .expect("unshield fee")
+        }
+        (
+            Kind::TopUp,
+            StateTransition::IdentityTopUpFromShieldedPool(
+                IdentityTopUpFromShieldedPoolTransition::V0(v0),
+            ),
+        ) => {
+            assert_eq!(
+                v0.identity_id,
+                Identifier::new(TOP_UP_IDENTITY),
+                "TopUp {path}: credits the requested identity"
+            );
+            AMOUNT
+                + dpp::shielded::compute_shielded_identity_top_up_fee(action_count, version)
+                    .expect("top-up fee")
+        }
+        (
+            Kind::Create,
+            StateTransition::IdentityCreateFromShieldedPool(
+                IdentityCreateFromShieldedPoolTransition::V0(v0),
+            ),
+        ) => {
+            assert_eq!(
+                v0.send_to_address_on_creation_failure,
+                creation_failure_address(),
+                "Create {path}: the requested failure address"
+            );
+            let requested: Vec<IdentityPublicKeyInCreation> =
+                identity_keys().into_iter().map(|(_, key)| key).collect();
+            let mut carried = v0.public_keys.clone();
+            for key in &mut carried {
+                key.set_signature(BinaryData::default());
+            }
+            assert_eq!(carried, requested, "Create {path}: the requested keys");
+            assert_eq!(
+                v0.denomination, DENOMINATION,
+                "Create {path}: the requested denomination"
+            );
+            DENOMINATION
+        }
+        (kind, st) => panic!("{kind:?} {path}: unexpected transition {st:?}"),
+    }
 }
 
 /// `st_bytes`, a withdrawal, pays the requested Core address at the
@@ -1023,9 +1406,10 @@ fn assert_withdrawal_request(st_bytes: &[u8], path: &str) {
 /// For the same wallet, account, note, anchor and arguments, the seed
 /// wrapper and the keyset path hand the hook the same artifact. The proof,
 /// binding signature and output notes are randomized per build, so
-/// `st_bytes`, `st_hash`, `activity_id` and the padding nullifier differ;
-/// every other payload field and every deterministic transition field match,
-/// and the outputs of both decrypt to the same payment and change.
+/// `st_bytes`, `st_hash`, `activity_id`, the padding nullifier and so a
+/// created identity's id differ; every other payload field and every
+/// deterministic transition field match, and the outputs of both decrypt to
+/// the same payment and change.
 #[tokio::test]
 async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
     for kind in KINDS {
@@ -1039,7 +1423,7 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
         let (wallet, _persister) =
             bound_wallet(&by_seed, anchor, &note, &[&by_seed, &by_keyset]).await;
 
-        let seed_result = spend_with_seed(&wallet, &by_seed, kind).await;
+        let seed_result = spend_with_seed(&wallet, &by_seed, &SEED, kind).await;
         let keyset_result = spend_with_keyset(&wallet, &by_keyset, &own, ACCOUNT, kind).await;
 
         for (path, result) in [("seed", &seed_result), ("keyset", &keyset_result)] {
@@ -1062,7 +1446,12 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
         assert_artifact(&keyset_seen[0], kind, &wallet, &note, anchor);
 
         let (seed, keyset) = (&seed_seen[0].payload, &keyset_seen[0].payload);
-        assert_eq!(seed.kind, keyset.kind, "{kind:?}: kind");
+        // A create's id is derived from its published nullifiers, padding
+        // included, so it differs per build; each is pinned to its own
+        // nullifiers by `assert_artifact`.
+        if kind != Kind::Create {
+            assert_eq!(seed.kind, keyset.kind, "{kind:?}: kind");
+        }
         assert_eq!(seed.wallet_id, keyset.wallet_id, "{kind:?}: wallet");
         assert_eq!(
             seed.account_index, keyset.account_index,
@@ -1086,4 +1475,88 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
         assert_outputs(kind, &seed.st_bytes, "seed");
         assert_outputs(kind, &keyset.st_bytes, "keyset");
     }
+}
+
+/// A create on the keyset path that Platform confirms registers the new
+/// identity locally, at the requested slot. The mock can't answer the
+/// broadcast or its result wait, so the confirmation is the create's own
+/// fallback: the identity is found by the id its nullifiers derive. Two
+/// notes that each fall short of the denomination are both spent, so the
+/// bundle has no padding action and that id is known before the call.
+#[tokio::test]
+async fn a_confirmed_keyset_create_registers_the_identity_at_its_slot() {
+    use dpp::identity::identity_public_key::accessors::v0::IdentityPublicKeyGettersV0;
+    use dpp::state_transition::identity_create_from_shielded_pool_transition::identity_id_from_nullifiers;
+
+    let own = keyset(&SEED, ACCOUNT);
+    let notes = [
+        owned_note_at(&own, DENOMINATION * 3 / 5, 0),
+        owned_note_at(&own, DENOMINATION * 3 / 5, 1),
+    ];
+    let expected_id = identity_id_from_nullifiers(&[notes[0].nullifier, notes[1].nullifier]);
+    let created = dpp::identity::Identity::new_with_id_and_keys(
+        expected_id,
+        identity_keys()
+            .into_iter()
+            .map(|(key, _)| (key.id(), key))
+            .collect(),
+        dpp::version::PlatformVersion::latest(),
+    )
+    .expect("the created identity");
+    let (coordinator, hook, anchor) =
+        hooked_coordinator_holding("create_registers", &notes, true).await;
+    let (wallet, _persister) =
+        bound_wallet_holding(&coordinator, anchor, &notes, &[&coordinator], Some(created)).await;
+    let wallet_id = wallet.wallet_id();
+    {
+        let manager = wallet.wallet_manager().read().await;
+        let info = manager.get_wallet_info(&wallet_id).expect("wallet info");
+        assert!(
+            info.identity_manager
+                .wallet_identity_ids(&wallet_id)
+                .is_empty(),
+            "no identity before the create"
+        );
+    }
+
+    let identity_id = wallet
+        .shielded_identity_create_from_pool_with_keyset(
+            &coordinator,
+            &own,
+            ACCOUNT,
+            IDENTITY_INDEX,
+            identity_keys(),
+            DENOMINATION,
+            creation_failure_address(),
+            &FixedSigner,
+            &CachedOrchardProver::new(),
+        )
+        .await
+        .expect("the create is confirmed");
+
+    assert_eq!(identity_id, expected_id, "the id the nullifiers derive");
+    let seen = hook.seen();
+    assert_eq!(seen.len(), 1, "one dispatch");
+    assert_eq!(
+        seen[0].payload.kind,
+        ShieldedDispatchKind::IdentityCreate {
+            identity_id: expected_id.to_buffer(),
+        },
+        "the dispatched create is the confirmed one"
+    );
+    let manager = wallet.wallet_manager().read().await;
+    let identities = &manager
+        .get_wallet_info(&wallet_id)
+        .expect("wallet info")
+        .identity_manager;
+    assert_eq!(
+        identities.wallet_identity_ids(&wallet_id),
+        vec![identity_id],
+        "the created identity is the wallet's one identity"
+    );
+    assert_eq!(
+        identities.identity_index(&identity_id),
+        Some(IDENTITY_INDEX),
+        "registered at the requested slot"
+    );
 }
