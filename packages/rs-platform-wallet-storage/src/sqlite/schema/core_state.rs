@@ -1,6 +1,5 @@
 //! Writers + readers for the `core_*` tables.
 
-#[cfg(any(test, feature = "__test-helpers"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 
