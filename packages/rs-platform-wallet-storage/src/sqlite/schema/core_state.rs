@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use dashcore::ephemerealdata::chain_lock::ChainLock;
+use dashcore::ephemerealdata::instant_lock::InstantLock;
 use key_wallet::managed_account::transaction_record::TransactionRecord;
 use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::Utxo;
@@ -447,6 +448,7 @@ fn surviving_stored_input_claims(
 ) -> Result<HashSet<dashcore::OutPoint>, WalletStorageError> {
     use dashcore::hashes::Hash;
 
+    let locks = verified_instant_locks(tx, wallet_id)?;
     let mut stmt =
         tx.prepare_cached("SELECT txid, record_blob FROM core_transactions WHERE wallet_id = ?1 AND record_blob IS NOT NULL")?;
     let mut rows = stmt.query(params![wallet_id.as_slice()])?;
@@ -470,7 +472,10 @@ fn surviving_stored_input_claims(
             ));
         }
 
-        if matches!(record.context, TransactionContext::Mempool) {
+        if matches!(
+            effective_context(&record.context, locks.get(&key_txid)),
+            TransactionContext::Mempool
+        ) {
             continue;
         }
         claims.extend(
@@ -1019,32 +1024,10 @@ pub fn load_state(
         }
     }
 
-    {
-        // Same pre-read length gate as `record_blob` above. `txid` is a raw
-        // 32-byte hash, so its width is gated fixed before materializing —
-        // an oversize column raises `BlobTooLarge` ahead of the `Vec` alloc
-        // rather than materializing then failing in `Txid::from_slice`.
-        let mut stmt = conn.prepare(
-            "SELECT length(txid), txid, length(islock_blob), islock_blob \
-             FROM core_instant_locks WHERE wallet_id = ?1 AND verified = 1",
-        )?;
-        let mut rows = stmt.query(params![wallet_id.as_slice()])?;
-        while let Some(row) = rows.next()? {
-            use dashcore::hashes::Hash;
-            blob::check_fixed_width(row.get::<_, i64>(0)?, 32, "core_instant_locks.txid")?;
-            let txid_bytes: Vec<u8> = row.get(1)?;
-            blob::check_size(row.get::<_, i64>(2)?)?;
-            let blob_bytes: Vec<u8> = row.get(3)?;
-            let txid = dashcore::Txid::from_slice(&txid_bytes)?;
-            let islock: dashcore::ephemerealdata::instant_lock::InstantLock =
-                blob::decode(&blob_bytes)?;
-            cs.instant_locks_for_non_final_records.insert(txid, islock);
-        }
-    }
-
+    cs.instant_locks_for_non_final_records = verified_instant_locks(conn, wallet_id)?;
     for record in &mut cs.records {
         let verified = cs.instant_locks_for_non_final_records.get(&record.txid);
-        rest_instant_send_context_on(record, verified.cloned());
+        record.context = effective_context(&record.context, verified);
     }
 
     // Sync watermarks + persisted chain lock. Read `length()` first so an
@@ -1262,9 +1245,9 @@ pub fn get_tx_record(
     let mut record: TransactionRecord = blob::decode(&payload)?;
     drop(rows);
     drop(stmt);
-    if matches!(record.context, TransactionContext::InstantSend(_)) {
+    if record.block_info().is_none() {
         let verified = verified_instant_lock(conn, wallet_id, txid)?;
-        rest_instant_send_context_on(&mut record, verified);
+        record.context = effective_context(&record.context, verified.as_ref());
     }
     if let Err(mismatch) = ensure_transaction_record_matches_columns(txid, height, &record) {
         // Captured before `mismatch` moves: only a txid disagreement means
@@ -1281,17 +1264,61 @@ pub fn get_tx_record(
     Ok(Some(record))
 }
 
-/// A record's InstantSend context is a stored lock too: it stands only on
-/// `verified`, the lock row stored as verified for its transaction, and is
-/// otherwise back in the mempool.
-fn rest_instant_send_context_on(
-    record: &mut TransactionRecord,
-    verified: Option<dashcore::ephemerealdata::instant_lock::InstantLock>,
-) {
-    if matches!(record.context, TransactionContext::InstantSend(_)) {
-        record.context =
-            verified.map_or(TransactionContext::Mempool, TransactionContext::InstantSend);
+/// How final a stored transaction is, the one rule history, coin
+/// restoration and the sweep share: a mined record stands on its block; any
+/// other is InstantSend-locked on `verified`, its lock row stored as verified,
+/// and otherwise in the mempool, whatever context its blob was written with.
+fn effective_context(
+    context: &TransactionContext,
+    verified: Option<&InstantLock>,
+) -> TransactionContext {
+    if context.block_info().is_some() {
+        return context.clone();
     }
+    verified.map_or(TransactionContext::Mempool, |lock| {
+        TransactionContext::InstantSend(lock.clone())
+    })
+}
+
+/// A lock row stored as verified, decoded; `None` when its lock is for
+/// another transaction than the row's key.
+fn verified_lock_of_row(
+    txid: &dashcore::Txid,
+    blob_bytes: &[u8],
+) -> Result<Option<InstantLock>, WalletStorageError> {
+    let lock: InstantLock = blob::decode(blob_bytes)?;
+    if lock.txid != *txid {
+        tracing::warn!(%txid, lock_txid = %lock.txid, "a stored lock names another transaction; ignored");
+        return Ok(None);
+    }
+    Ok(Some(lock))
+}
+
+/// Every lock row of the wallet stored as verified, by transaction.
+fn verified_instant_locks(
+    conn: &Connection,
+    wallet_id: &WalletId,
+) -> Result<BTreeMap<dashcore::Txid, InstantLock>, WalletStorageError> {
+    // Same pre-read length gate as `record_blob`. `txid` is a raw 32-byte
+    // hash, so its width is gated fixed before materializing.
+    let mut stmt = conn.prepare_cached(
+        "SELECT length(txid), txid, length(islock_blob), islock_blob \
+         FROM core_instant_locks WHERE wallet_id = ?1 AND verified = 1",
+    )?;
+    let mut rows = stmt.query(params![wallet_id.as_slice()])?;
+    let mut locks = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        use dashcore::hashes::Hash;
+        blob::check_fixed_width(row.get::<_, i64>(0)?, 32, "core_instant_locks.txid")?;
+        let txid_bytes: Vec<u8> = row.get(1)?;
+        blob::check_size(row.get::<_, i64>(2)?)?;
+        let blob_bytes: Vec<u8> = row.get(3)?;
+        let txid = dashcore::Txid::from_slice(&txid_bytes)?;
+        if let Some(lock) = verified_lock_of_row(&txid, &blob_bytes)? {
+            locks.insert(txid, lock);
+        }
+    }
+    Ok(locks)
 }
 
 /// The lock row stored as verified for `txid`, if any.
@@ -1299,7 +1326,7 @@ fn verified_instant_lock(
     conn: &Connection,
     wallet_id: &WalletId,
     txid: &dashcore::Txid,
-) -> Result<Option<dashcore::ephemerealdata::instant_lock::InstantLock>, WalletStorageError> {
+) -> Result<Option<InstantLock>, WalletStorageError> {
     let mut stmt = conn.prepare_cached(
         "SELECT length(islock_blob), islock_blob FROM core_instant_locks \
          WHERE wallet_id = ?1 AND txid = ?2 AND verified = 1",
@@ -1310,7 +1337,7 @@ fn verified_instant_lock(
     };
     blob::check_size(row.get::<_, i64>(0)?)?;
     let blob_bytes: Vec<u8> = row.get(1)?;
-    Ok(Some(blob::decode(&blob_bytes)?))
+    verified_lock_of_row(txid, &blob_bytes)
 }
 
 /// Diagnose typed txid/height columns that disagree with the authoritative blob.
@@ -1538,6 +1565,170 @@ mod tests {
                 .expect("stored record");
             assert_eq!(&read.context, context, "a point read of {txid}");
         }
+    }
+
+    fn wallet_db(w: &[u8; 32]) -> rusqlite::Connection {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::sqlite::migrations::run(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO wallets (wallet_id, network, birth_height) VALUES (?1, 'testnet', 0)",
+            params![&w[..]],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn store(conn: &mut rusqlite::Connection, w: &[u8; 32], cs: &CoreChangeSet) {
+        let tx = conn.transaction().unwrap();
+        apply(&tx, w, cs).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// A payment received, flushed, then its verified lock, flushed, then a
+    /// restart before it is mined: its history reads it locked, and the lock
+    /// its coin is restored with is the same.
+    #[test]
+    fn a_lock_stored_after_its_payment_counts_for_history_and_coin_alike() {
+        use dashcore::ephemerealdata::instant_lock::InstantLock;
+        let w = [0xADu8; 32];
+        let mut conn = wallet_db(&w);
+        let txid = Txid::from_byte_array([0x44; 32]);
+        store(
+            &mut conn,
+            &w,
+            &CoreChangeSet {
+                records: vec![transaction_record(txid, TransactionContext::Mempool)],
+                new_utxos: vec![sample_utxo(txid, 0, false)],
+                ..Default::default()
+            },
+        );
+        let lock = InstantLock {
+            txid,
+            ..InstantLock::default()
+        };
+        let mut locked = CoreChangeSet::default();
+        locked
+            .instant_locks_for_non_final_records
+            .insert(txid, lock.clone());
+        store(&mut conn, &w, &locked);
+
+        let (loaded, _) =
+            load_state(&conn, &w, dashcore::Network::Testnet, &LoadCtx::strict()).unwrap();
+        let locked_context = TransactionContext::InstantSend(lock.clone());
+        assert_eq!(
+            loaded.records[0].context, locked_context,
+            "the history, loaded"
+        );
+        let read = get_tx_record(&conn, &w, &txid, &LoadCtx::strict())
+            .unwrap()
+            .expect("stored record");
+        assert_eq!(read.context, locked_context, "the history, read alone");
+        assert!(loaded.new_utxos.iter().any(|u| u.outpoint.txid == txid));
+        assert_eq!(
+            loaded.instant_locks_for_non_final_records,
+            BTreeMap::from([(txid, lock)]),
+            "the coin is restored with the same lock"
+        );
+    }
+
+    /// A lock row whose lock names another transaction proves nothing for
+    /// its key.
+    #[test]
+    fn a_stored_lock_naming_another_transaction_is_not_trusted() {
+        use dashcore::ephemerealdata::instant_lock::InstantLock;
+        let w = [0xAEu8; 32];
+        let mut conn = wallet_db(&w);
+        let txid = Txid::from_byte_array([0x45; 32]);
+        store(
+            &mut conn,
+            &w,
+            &CoreChangeSet {
+                records: vec![transaction_record(txid, TransactionContext::Mempool)],
+                ..Default::default()
+            },
+        );
+        let other = InstantLock {
+            txid: Txid::from_byte_array([0x46; 32]),
+            ..InstantLock::default()
+        };
+        conn.execute(
+            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob, verified) \
+             VALUES (?1, ?2, ?3, 1)",
+            params![
+                &w[..],
+                AsRef::<[u8]>::as_ref(&txid),
+                blob::encode(&other).unwrap()
+            ],
+        )
+        .unwrap();
+
+        let (loaded, _) =
+            load_state(&conn, &w, dashcore::Network::Testnet, &LoadCtx::strict()).unwrap();
+        assert!(loaded.instant_locks_for_non_final_records.is_empty());
+        assert_eq!(loaded.records[0].context, TransactionContext::Mempool);
+        let read = get_tx_record(&conn, &w, &txid, &LoadCtx::strict())
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.context, TransactionContext::Mempool);
+    }
+
+    /// The sweep's stored claims follow the same rule: an old InstantSend
+    /// label without a verified lock claims nothing, a mempool record whose
+    /// verified lock came later does, and so does a mined one.
+    #[test]
+    fn stored_claims_count_only_what_the_effective_context_makes_final() {
+        use dashcore::ephemerealdata::instant_lock::InstantLock;
+        let w = [0xAFu8; 32];
+        let mut conn = wallet_db(&w);
+        let spending = |byte: u8, context: TransactionContext| {
+            let mut record = transaction_record(Txid::from_byte_array([byte; 32]), context);
+            record.transaction.input = vec![dashcore::TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([byte ^ 0xFF; 32]), 0),
+                ..Default::default()
+            }];
+            record
+        };
+        let lock = |byte: u8| InstantLock {
+            txid: Txid::from_byte_array([byte; 32]),
+            ..InstantLock::default()
+        };
+        let mined = TransactionContext::InBlock(BlockInfo::new(
+            90,
+            BlockHash::from_byte_array([0x09; 32]),
+            1_700_000_000,
+        ));
+        let records = vec![
+            spending(0x51, TransactionContext::InstantSend(lock(0x51))),
+            spending(0x52, TransactionContext::Mempool),
+            spending(0x53, mined),
+        ];
+        let input_of = |r: &TransactionRecord| r.transaction.input[0].previous_output;
+        let (old_label, late_lock, in_block) = (
+            input_of(&records[0]),
+            input_of(&records[1]),
+            input_of(&records[2]),
+        );
+        let mut cs = CoreChangeSet {
+            records,
+            ..Default::default()
+        };
+        cs.instant_locks_for_non_final_records
+            .insert(lock(0x52).txid, lock(0x52));
+        store(&mut conn, &w, &cs);
+        conn.execute(
+            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob) VALUES (?1, ?2, ?3)",
+            params![
+                &w[..],
+                &[0x51u8; 32][..],
+                blob::encode(&lock(0x51)).unwrap()
+            ],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let claims = surviving_stored_input_claims(&tx, &w, &HashSet::new()).unwrap();
+        assert_eq!(claims, HashSet::from([late_lock, in_block]));
+        assert!(!claims.contains(&old_label));
     }
 
     #[test]
