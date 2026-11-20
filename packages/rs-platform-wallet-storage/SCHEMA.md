@@ -469,6 +469,13 @@ from it, so nothing here is payable.
 Instant-lock blobs for transactions that are broadcast but not yet
 finalized. Rows are removed when the transaction becomes confirmed.
 
+`verified` (fork V2) is 1 on a row written by a build that stores only
+verified locks, and only such a row is loaded. A row of unknown provenance
+(written before fork V2, or by a build without the column) reads 0 and does
+not make its coins final. A `core_transactions` record whose context is
+InstantSend loads that context only with such a row; otherwise it loads as
+in the mempool.
+
 - PK: `(wallet_id, txid)`.
 - FK: `wallet_id → wallets(wallet_id) ON DELETE CASCADE`.
 
@@ -924,3 +931,4 @@ back).
 | Fork version | File | Change | Notes |
 |---|---|---|---|
 | V1 | `migrations_fork/V1__dashpay_external_rotation.rs` | Adds `core_address_pool_retired` (a rotated DashPay contact's old pool, keyed by the old xpub) so a new-xpub registration no longer fails as a typed-key conflict on every retry, and `contacts.external_account_reference` to persist the established contact's built-from stamp. Additive; existing contacts read back NULL and are rebuilt once by the next sweep. | Builds before the fork history recorded it as upstream V019; the open moves that row (exact name and checksum only) into `dw_fork_schema_history`. |
+| V2 | `migrations_fork/V2__verified_instant_locks.rs` | Adds `core_instant_locks.verified` (`NOT NULL DEFAULT 0`). Rows already on disk read 0 and are no longer restored: a build before the verified-lock rule could have stored a lock that never verified. Every row written from here on carries 1. | Additive; an affected payment shows as unconfirmed until its lock is announced again or it is mined. |

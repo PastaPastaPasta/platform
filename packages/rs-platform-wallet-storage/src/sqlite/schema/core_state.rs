@@ -180,9 +180,10 @@ pub fn apply(
     }
     if !cs.instant_locks_for_non_final_records.is_empty() {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob) \
-             VALUES (?1, ?2, ?3) \
-             ON CONFLICT(wallet_id, txid) DO UPDATE SET islock_blob = excluded.islock_blob",
+            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob, verified) \
+             VALUES (?1, ?2, ?3, 1) \
+             ON CONFLICT(wallet_id, txid) DO UPDATE SET islock_blob = excluded.islock_blob, \
+             verified = 1",
         )?;
         for (txid, islock) in &cs.instant_locks_for_non_final_records {
             let payload = blob::encode(islock)?;
@@ -1025,7 +1026,7 @@ pub fn load_state(
         // rather than materializing then failing in `Txid::from_slice`.
         let mut stmt = conn.prepare(
             "SELECT length(txid), txid, length(islock_blob), islock_blob \
-             FROM core_instant_locks WHERE wallet_id = ?1",
+             FROM core_instant_locks WHERE wallet_id = ?1 AND verified = 1",
         )?;
         let mut rows = stmt.query(params![wallet_id.as_slice()])?;
         while let Some(row) = rows.next()? {
@@ -1038,6 +1039,17 @@ pub fn load_state(
             let islock: dashcore::ephemerealdata::instant_lock::InstantLock =
                 blob::decode(&blob_bytes)?;
             cs.instant_locks_for_non_final_records.insert(txid, islock);
+        }
+    }
+
+    // A record's InstantSend context is a stored lock too: it stands only on
+    // a lock row stored as verified, and is otherwise back in the mempool.
+    for record in &mut cs.records {
+        if matches!(record.context, TransactionContext::InstantSend(_)) {
+            record.context = match cs.instant_locks_for_non_final_records.get(&record.txid) {
+                Some(lock) => TransactionContext::InstantSend(lock.clone()),
+                None => TransactionContext::Mempool,
+            };
         }
     }
 
@@ -1420,7 +1432,8 @@ mod tests {
         // irrelevant — the txid gate fires before it is read.
         let oversize_txid = vec![0u8; crate::SIZE_LIMIT_BYTES + 1];
         conn.execute(
-            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob) VALUES (?1, ?2, ?3)",
+            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob, verified) \
+             VALUES (?1, ?2, ?3, 1)",
             params![&w[..], oversize_txid.as_slice(), &[0u8; 4][..]],
         )
         .unwrap();
@@ -1430,6 +1443,66 @@ mod tests {
         assert!(
             matches!(err, WalletStorageError::BlobTooLarge { .. }),
             "expected BlobTooLarge from the pre-materialization gate, got {err:?}"
+        );
+    }
+
+    /// A lock row of unknown provenance, as a build before the verified-lock
+    /// rule wrote it, is not restored and does not make its coins final; a
+    /// lock stored through `apply`, which only verified locks reach, is.
+    #[test]
+    fn load_state_trusts_only_locks_stored_as_verified() {
+        use dashcore::ephemerealdata::instant_lock::InstantLock;
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::sqlite::migrations::run(&mut conn).unwrap();
+        let w = [0xACu8; 32];
+        conn.execute(
+            "INSERT INTO wallets (wallet_id, network, birth_height) VALUES (?1, 'testnet', 0)",
+            params![&w[..]],
+        )
+        .unwrap();
+        let lock = |byte: u8| InstantLock {
+            txid: Txid::from_byte_array([byte; 32]),
+            ..InstantLock::default()
+        };
+        let legacy = lock(0x11);
+        conn.execute(
+            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob) VALUES (?1, ?2, ?3)",
+            params![
+                &w[..],
+                AsRef::<[u8]>::as_ref(&legacy.txid),
+                blob::encode(&legacy).unwrap()
+            ],
+        )
+        .unwrap();
+        let stored = lock(0x22);
+        let mut cs = CoreChangeSet::default();
+        cs.instant_locks_for_non_final_records
+            .insert(stored.txid, stored.clone());
+        let unbacked = lock(0x33);
+        cs.records = [&legacy, &stored, &unbacked]
+            .map(|l| transaction_record(l.txid, TransactionContext::InstantSend(l.clone())))
+            .to_vec();
+        let tx = conn.transaction().unwrap();
+        apply(&tx, &w, &cs).unwrap();
+        tx.commit().unwrap();
+
+        let (loaded, _) =
+            load_state(&conn, &w, dashcore::Network::Testnet, &LoadCtx::strict()).unwrap();
+        assert_eq!(
+            loaded.instant_locks_for_non_final_records,
+            BTreeMap::from([(stored.txid, stored.clone())])
+        );
+        let contexts: BTreeMap<Txid, TransactionContext> = (loaded.records.iter())
+            .map(|r| (r.txid, r.context.clone()))
+            .collect();
+        assert_eq!(
+            contexts,
+            BTreeMap::from([
+                (legacy.txid, TransactionContext::Mempool),
+                (stored.txid, TransactionContext::InstantSend(stored)),
+                (unbacked.txid, TransactionContext::Mempool),
+            ])
         );
     }
 

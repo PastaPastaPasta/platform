@@ -3893,6 +3893,7 @@ mod contact_watch_only_projection_tests {
             }],
             special_transaction_payload: None,
         };
+        let spend = ctx.signed(spend, &[]).await;
         let result = ctx
             .check_transaction(&spend, TransactionContext::Mempool)
             .await;
@@ -7381,7 +7382,9 @@ mod utxo_credit_verdict_tests {
                 .is_relevant
         );
         // A mempool child takes the coin.
-        let child = spend_to(coin, foreign_script(), 19_000);
+        let child = ctx
+            .signed(spend_to(coin, foreign_script(), 19_000), &[])
+            .await;
         assert!(
             ctx.check_transaction(&child, TransactionContext::Mempool)
                 .await
@@ -7809,5 +7812,82 @@ mod block_rescan_credit_tests {
                 .all(|u| block_100.contains(&u.outpoint.txid)),
             "a pass of block 100 sends no coin of another block"
         );
+    }
+}
+
+#[cfg(test)]
+mod instant_lock_storage_tests {
+    //! A verified InstantSend lock reaches `instant_locks_for_non_final_records`
+    //! (the `core_instant_locks` rows) in both delivery orders: the lock after
+    //! its transaction, and the lock dash-spv held until its transaction came
+    //! and handed over with it.
+
+    use super::*;
+    use dashcore::ephemerealdata::instant_lock::InstantLock;
+    use dashcore::hashes::Hash;
+    use dashcore::{ScriptBuf, Transaction, TxIn, Txid, Witness};
+    use key_wallet::wallet::initialization::WalletAccountCreationOptions;
+    use key_wallet_manager::WalletInterface;
+
+    const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                            abandon abandon abandon about";
+
+    /// The locks the bridge hands the persister for every event a payment to
+    /// the wallet and its lock produce, and the lock.
+    async fn stored_locks(lock_first: bool) -> (BTreeMap<Txid, InstantLock>, InstantLock) {
+        let mut manager = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
+        manager
+            .create_wallet_from_mnemonic(MNEMONIC, 0, WalletAccountCreationOptions::Default)
+            .expect("wallet");
+        let address = manager.monitored_addresses()[0].clone();
+        let tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([0x31; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: 100_000,
+                script_pubkey: address.script_pubkey(),
+            }],
+            special_transaction_payload: None,
+        };
+        let lock = InstantLock {
+            txid: tx.txid(),
+            ..InstantLock::default()
+        };
+        let mut events = manager.subscribe_events();
+        if lock_first {
+            manager
+                .process_mempool_transaction(&tx, Some(lock.clone()))
+                .await;
+        } else {
+            manager.process_mempool_transaction(&tx, None).await;
+            manager
+                .process_mempool_instant_send_lock(&tx, lock.clone())
+                .await;
+        }
+
+        let manager = Arc::new(RwLock::new(manager));
+        let mut stored = CoreChangeSet::default();
+        while let Ok(event) = events.try_recv() {
+            stored.merge(build_core_changeset(&manager, &event).await);
+        }
+        (stored.instant_locks_for_non_final_records, lock)
+    }
+
+    #[tokio::test]
+    async fn a_lock_that_arrives_before_its_transaction_is_stored() {
+        let (stored, lock) = stored_locks(true).await;
+        assert_eq!(stored, BTreeMap::from([(lock.txid, lock)]));
+    }
+
+    #[tokio::test]
+    async fn a_lock_that_arrives_after_its_transaction_is_stored() {
+        let (stored, lock) = stored_locks(false).await;
+        assert_eq!(stored, BTreeMap::from([(lock.txid, lock)]));
     }
 }

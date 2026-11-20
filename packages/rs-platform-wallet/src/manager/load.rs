@@ -1145,7 +1145,7 @@ mod idempotent_load_tests {
 
         // Without a replay this is what the restore alone would leave
         // standing, so it is also the failure the assertion below catches.
-        let spend = spend_to(funded_outpoint, 74_000);
+        let spend = ctx.signed(spend_to(funded_outpoint, 74_000), &[]).await;
         let manager = make_pending_manager(PendingSendPersister {
             wallet: ctx.wallet,
             managed: ctx.managed_wallet,

@@ -598,6 +598,7 @@ fn a_pre_fork_v1_database_migrates_with_no_stamp() {
         conn.execute_batch(&format!(
             "DROP TABLE core_address_pool_retired;
              ALTER TABLE contacts DROP COLUMN external_account_reference;
+             ALTER TABLE core_instant_locks DROP COLUMN verified;
              DROP TABLE {FORK_HISTORY_TABLE};"
         ))
         .unwrap();
@@ -624,8 +625,8 @@ fn a_pre_fork_v1_database_migrates_with_no_stamp() {
 }
 
 /// Rewinds the file at `path` to what builds before the fork history table
-/// recorded: fork migration 1 as upstream version 19. Returns its applied
-/// time.
+/// recorded: fork migration 1 as upstream version 19, and no later fork
+/// migration. Returns its applied time.
 fn as_an_old_fork_build_recorded_it(path: &std::path::Path) -> String {
     let conn = rusqlite::Connection::open(path).unwrap();
     let applied_on: String = conn
@@ -635,8 +636,11 @@ fn as_an_old_fork_build_recorded_it(path: &std::path::Path) -> String {
             |r| r.get(0),
         )
         .unwrap();
-    conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
-        .unwrap();
+    conn.execute_batch(&format!(
+        "DROP TABLE {FORK_HISTORY_TABLE};
+         ALTER TABLE core_instant_locks DROP COLUMN verified;"
+    ))
+    .unwrap();
     conn.execute(
         "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
          VALUES (19, 'dashpay_external_rotation', ?1, ?2)",
@@ -681,7 +685,7 @@ fn a_backup_from_a_build_that_recorded_v019_restores_and_opens() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(fork, 1);
+    assert_eq!(fork, 2);
 }
 
 /// A database an earlier fork build wrote recorded fork migration 1 in
@@ -723,7 +727,9 @@ fn a_database_from_a_build_that_recorded_v019_opens_intact() {
     assert_eq!(upstream_max, max_supported_version());
     let fork: (i64, String, String) = conn
         .query_row(
-            &format!("SELECT version, name, applied_on FROM {FORK_HISTORY_TABLE}"),
+            &format!(
+                "SELECT version, name, applied_on FROM {FORK_HISTORY_TABLE} WHERE version = 1"
+            ),
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -778,7 +784,7 @@ fn a_newer_fork_history_refuses_to_open() {
         conn.execute(
             &format!(
                 "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum)
-                 VALUES (2, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
+                 VALUES (3, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
             ),
             [],
         )
@@ -791,8 +797,8 @@ fn a_newer_fork_history_refuses_to_open() {
         matches!(
             err,
             WalletStorageError::ForkSchemaVersionUnsupported {
-                found: 2,
-                max_supported: 1
+                found: 3,
+                max_supported: 2
             }
         ),
         "{err:?}"
@@ -805,7 +811,7 @@ fn a_newer_fork_history_refuses_to_open() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rows, 2);
+    assert_eq!(rows, 3);
 }
 
 /// The history never blocks a live write: a retired generation whose xpub no

@@ -2887,6 +2887,19 @@ mod tests {
         /// relevance routing, record bookkeeping and all. `file_record`
         /// bypasses that machinery, so only this can exercise how the
         /// wallet reacts to an observation rather than to a record.
+        /// `tx` with the inputs that spend this wallet's coins signed, as
+        /// a sibling spend from another device would be.
+        async fn signed(&self, tx: Transaction) -> Transaction {
+            let wm = self.wallet_manager.read().await;
+            let wallet = wm
+                .get_wallet(&self.wallet_id)
+                .expect("wallet must remain registered");
+            let info = wm
+                .get_wallet_info(&self.wallet_id)
+                .expect("wallet must remain registered");
+            key_wallet::test_utils::sign_owned_inputs(wallet, &info.core_wallet, tx, &[]).await
+        }
+
         async fn observe(&self, tx: &Transaction, context: TransactionContext) {
             let mut wm = self.wallet_manager.write().await;
             wm.check_transaction_in_all_wallets(tx, context, true, true)
@@ -3918,7 +3931,9 @@ mod tests {
         // Unconfirmed when the screen looks: a competing candidate, not a
         // conflict, so the resume enters the wait with no caller-provided
         // bound and no conflict cap — the recovery backstop applies.
-        let spender = transaction_spending(fixture.funded_input());
+        let spender = fixture
+            .signed(transaction_spending(fixture.funded_input()))
+            .await;
         let spender_txid = spender.txid();
         fixture.observe(&spender, TransactionContext::Mempool).await;
 

@@ -55,6 +55,7 @@ const FORK_SCHEMA: &[(i32, ForkObject)] = &[
         1,
         ForkObject::Column("contacts", "external_account_reference"),
     ),
+    (2, ForkObject::Column("core_instant_locks", "verified")),
 ];
 
 /// A schema object a fork migration creates.
@@ -1031,11 +1032,14 @@ mod tests {
 
     /// Rewinds a migrated database to the history builds before the fork
     /// table wrote: fork migration 1 recorded as upstream version 19, with
-    /// `checksum`.
+    /// `checksum`, and no later fork migration.
     fn as_old_fork_build_left_it(conn: &Connection, checksum: &str) -> String {
         let (_, _, applied_on, _) = fork_history(conn).remove(0);
-        conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
-            .unwrap();
+        conn.execute_batch(&format!(
+            "DROP TABLE {FORK_HISTORY_TABLE};
+             ALTER TABLE core_instant_locks DROP COLUMN verified;"
+        ))
+        .unwrap();
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
              VALUES (19, 'dashpay_external_rotation', ?1, ?2)",
@@ -1078,10 +1082,14 @@ mod tests {
         run(&mut conn).unwrap();
         assert_eq!(upstream_versions(&conn), embedded_upstream());
         let fork = fork_history(&conn);
-        assert_eq!(fork.len(), 1);
+        assert_eq!(fork.len(), 2);
         assert_eq!(
             (fork[0].0, fork[0].1.as_str()),
             (1, "dashpay_external_rotation")
+        );
+        assert_eq!(
+            (fork[1].0, fork[1].1.as_str()),
+            (2, "verified_instant_locks")
         );
         assert!(has_fork_schema(&conn));
         assert_eq!(fork_pending(&conn).unwrap(), 0);
@@ -1124,13 +1132,23 @@ mod tests {
             .iter()
             .map(|m| m.version())
             .collect();
-        assert_eq!(applied, vec![19, 20, 21], "fork V1 does not re-run");
+        assert_eq!(
+            applied,
+            vec![19, 20, 21, 2],
+            "fork V1 does not re-run; fork V2 applies"
+        );
         assert_eq!(
             upstream_history(&conn).last().unwrap().1,
             "core_transaction_accounting"
         );
         assert!(table_exists(&conn, "sim_asset_lock_operation_id"));
-        assert_eq!(fork_history(&conn), fork);
+        let after = fork_history(&conn);
+        assert_eq!(after[..1], fork[..]);
+        assert_eq!(
+            (after[1].0, after[1].1.as_str()),
+            (2, "verified_instant_locks")
+        );
+        assert!(has_fork_schema(&conn));
     }
 
     /// Test 3: a database a later upstream build migrated (its own V019 to
@@ -1150,7 +1168,7 @@ mod tests {
             .run(&mut conn)
             .unwrap();
         assert_eq!(upstream_history(&conn), upstream);
-        assert_eq!(fork_history(&conn).len(), 1);
+        assert_eq!(fork_history(&conn).len(), 2);
         assert!(has_fork_schema(&conn));
     }
 
@@ -1193,7 +1211,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum)
-                 VALUES (2, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
+                 VALUES (3, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
             ),
             [],
         )
@@ -1201,8 +1219,8 @@ mod tests {
         assert!(matches!(
             assert_fork_schema_version_supported(&conn),
             Err(WalletStorageError::ForkSchemaVersionUnsupported {
-                found: 2,
-                max_supported: 1
+                found: 3,
+                max_supported: 2
             })
         ));
     }
@@ -1320,7 +1338,7 @@ mod tests {
             "a clear error: {err:?}"
         );
         assert_eq!(upstream_versions(&conn), embedded_upstream());
-        assert_eq!(fork_history(&conn).len(), 1);
+        assert_eq!(fork_history(&conn).len(), 2);
     }
 
     /// SQL that removes or reshapes a fork migration's schema, with what the
@@ -1344,6 +1362,10 @@ mod tests {
             "ALTER TABLE contacts DROP COLUMN external_account_reference;
              ALTER TABLE contacts ADD COLUMN external_account_reference TEXT;",
             "has another shape",
+        ),
+        (
+            "ALTER TABLE core_instant_locks DROP COLUMN verified;",
+            "is missing",
         ),
     ];
 
@@ -1416,6 +1438,7 @@ mod tests {
         assert!(table.contains("account_xpub BLOB NOT NULL"), "{table}");
         assert!(table.contains("index idx_core_address_pool_retired_script"));
         assert_eq!(shape[1], ["INTEGER notnull=0 default=NULL pk=0"]);
+        assert_eq!(shape[2], ["INTEGER notnull=1 default=0 pk=0"]);
     }
 
     /// The fork history is checked as refinery would read it: a row it cannot
@@ -1424,13 +1447,13 @@ mod tests {
     #[test]
     fn a_malformed_fork_history_is_refused() {
         for sql in [
-            "UPDATE dw_fork_schema_history SET checksum = 'not_a_u64'",
-            "UPDATE dw_fork_schema_history SET checksum = '1'",
-            "UPDATE dw_fork_schema_history SET checksum = NULL",
-            "UPDATE dw_fork_schema_history SET applied_on = 'yesterday'",
-            "UPDATE dw_fork_schema_history SET name = 'wrong_name'",
-            "UPDATE dw_fork_schema_history SET version = 'one'",
-            "UPDATE dw_fork_schema_history SET version = 0",
+            "UPDATE dw_fork_schema_history SET checksum = 'not_a_u64' WHERE version = 1",
+            "UPDATE dw_fork_schema_history SET checksum = '1' WHERE version = 1",
+            "UPDATE dw_fork_schema_history SET checksum = NULL WHERE version = 1",
+            "UPDATE dw_fork_schema_history SET applied_on = 'yesterday' WHERE version = 1",
+            "UPDATE dw_fork_schema_history SET name = 'wrong_name' WHERE version = 1",
+            "UPDATE dw_fork_schema_history SET version = 'one' WHERE version = 1",
+            "UPDATE dw_fork_schema_history SET version = 0 WHERE version = 1",
             "DROP TABLE dw_fork_schema_history;
              CREATE TABLE dw_fork_schema_history (version int4 PRIMARY KEY, name VARCHAR(255));",
         ] {

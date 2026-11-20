@@ -177,8 +177,9 @@ fn tc056_migrate_idempotent() {
 }
 
 /// migrate on a file an earlier fork build migrated (fork migration 1
-/// recorded as upstream version 19) reconciles it and prints `applied: 0`:
-/// moving the row between the histories applies nothing.
+/// recorded as upstream version 19) reconciles it, and moving the row between
+/// the histories applies nothing: only fork migration 2, which that build did
+/// not have, applies.
 #[test]
 fn migrate_reconciling_an_old_fork_file_applies_nothing() {
     use platform_wallet_storage::sqlite::migrations::{FORK_HISTORY_TABLE, OLD_FORK_V019_CHECKSUM};
@@ -187,8 +188,11 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
     assert!(migrate(&db).status.success());
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(&format!("DROP TABLE {FORK_HISTORY_TABLE}"))
-            .unwrap();
+        conn.execute_batch(&format!(
+            "DROP TABLE {FORK_HISTORY_TABLE};
+             ALTER TABLE core_instant_locks DROP COLUMN verified;"
+        ))
+        .unwrap();
         conn.execute(
             "INSERT INTO refinery_schema_history (version, name, applied_on, checksum)
              VALUES (19, 'dashpay_external_rotation', '2026-10-01T00:00:00Z', ?1)",
@@ -198,7 +202,7 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
     }
     let out = migrate(&db);
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "applied: 0");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "applied: 1");
     let conn = rusqlite::Connection::open(&db).unwrap();
     let fork: i64 = conn
         .query_row(
@@ -207,7 +211,7 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(fork, 1);
+    assert_eq!(fork, 2);
 }
 
 /// Sol's DP3-04b r2 schedules, run through the binary. A backup whose fork
