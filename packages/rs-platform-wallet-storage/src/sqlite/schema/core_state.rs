@@ -1042,15 +1042,9 @@ pub fn load_state(
         }
     }
 
-    // A record's InstantSend context is a stored lock too: it stands only on
-    // a lock row stored as verified, and is otherwise back in the mempool.
     for record in &mut cs.records {
-        if matches!(record.context, TransactionContext::InstantSend(_)) {
-            record.context = match cs.instant_locks_for_non_final_records.get(&record.txid) {
-                Some(lock) => TransactionContext::InstantSend(lock.clone()),
-                None => TransactionContext::Mempool,
-            };
-        }
+        let verified = cs.instant_locks_for_non_final_records.get(&record.txid);
+        rest_instant_send_context_on(record, verified.cloned());
     }
 
     // Sync watermarks + persisted chain lock. Read `length()` first so an
@@ -1265,9 +1259,13 @@ pub fn get_tx_record(
     };
     blob::check_size(record_blob_len)?;
     let payload: Vec<u8> = row.get(2)?;
-    let record = blob::decode(&payload)?;
+    let mut record: TransactionRecord = blob::decode(&payload)?;
     drop(rows);
     drop(stmt);
+    if matches!(record.context, TransactionContext::InstantSend(_)) {
+        let verified = verified_instant_lock(conn, wallet_id, txid)?;
+        rest_instant_send_context_on(&mut record, verified);
+    }
     if let Err(mismatch) = ensure_transaction_record_matches_columns(txid, height, &record) {
         // Captured before `mismatch` moves: only a txid disagreement means
         // the row is a different transaction from the one asked for.
@@ -1281,6 +1279,38 @@ pub fn get_tx_record(
         }
     }
     Ok(Some(record))
+}
+
+/// A record's InstantSend context is a stored lock too: it stands only on
+/// `verified`, the lock row stored as verified for its transaction, and is
+/// otherwise back in the mempool.
+fn rest_instant_send_context_on(
+    record: &mut TransactionRecord,
+    verified: Option<dashcore::ephemerealdata::instant_lock::InstantLock>,
+) {
+    if matches!(record.context, TransactionContext::InstantSend(_)) {
+        record.context =
+            verified.map_or(TransactionContext::Mempool, TransactionContext::InstantSend);
+    }
+}
+
+/// The lock row stored as verified for `txid`, if any.
+fn verified_instant_lock(
+    conn: &Connection,
+    wallet_id: &WalletId,
+    txid: &dashcore::Txid,
+) -> Result<Option<dashcore::ephemerealdata::instant_lock::InstantLock>, WalletStorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT length(islock_blob), islock_blob FROM core_instant_locks \
+         WHERE wallet_id = ?1 AND txid = ?2 AND verified = 1",
+    )?;
+    let mut rows = stmt.query(params![wallet_id.as_slice(), AsRef::<[u8]>::as_ref(txid)])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    blob::check_size(row.get::<_, i64>(0)?)?;
+    let blob_bytes: Vec<u8> = row.get(1)?;
+    Ok(Some(blob::decode(&blob_bytes)?))
 }
 
 /// Diagnose typed txid/height columns that disagree with the authoritative blob.
@@ -1493,17 +1523,21 @@ mod tests {
             loaded.instant_locks_for_non_final_records,
             BTreeMap::from([(stored.txid, stored.clone())])
         );
+        let expected = BTreeMap::from([
+            (legacy.txid, TransactionContext::Mempool),
+            (stored.txid, TransactionContext::InstantSend(stored)),
+            (unbacked.txid, TransactionContext::Mempool),
+        ]);
         let contexts: BTreeMap<Txid, TransactionContext> = (loaded.records.iter())
             .map(|r| (r.txid, r.context.clone()))
             .collect();
-        assert_eq!(
-            contexts,
-            BTreeMap::from([
-                (legacy.txid, TransactionContext::Mempool),
-                (stored.txid, TransactionContext::InstantSend(stored)),
-                (unbacked.txid, TransactionContext::Mempool),
-            ])
-        );
+        assert_eq!(contexts, expected);
+        for (txid, context) in &expected {
+            let read = get_tx_record(&conn, &w, txid, &LoadCtx::strict())
+                .unwrap()
+                .expect("stored record");
+            assert_eq!(&read.context, context, "a point read of {txid}");
+        }
     }
 
     #[test]
