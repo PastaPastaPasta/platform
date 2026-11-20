@@ -41,11 +41,15 @@ use crate::sqlite::util::safe_cast;
 ///   a behaviour change, not an accounting one.
 /// - `invitations`: deliberately not rehydrated — the Swift SwiftData mirror
 ///   is the UI's source — which is precisely what this list is for.
+/// - `core::dropped_unsigned_spends`: the recovery record of the unsigned
+///   pending spends an open drops, kept to be put back by hand and never
+///   read by the wallet.
 pub(crate) const LOAD_UNIMPLEMENTED: &[&str] = &[
     "token_balances",
     "dashpay::overlay",
     "pending_contact_crypto",
     "invitations",
+    "core::dropped_unsigned_spends",
 ];
 
 /// Tables backing [`LOAD_UNIMPLEMENTED`], probed for a row count so a
@@ -58,6 +62,7 @@ const LOAD_UNIMPLEMENTED_TABLES: &[&str] = &[
     "dashpay_payments_overlay",
     "pending_contact_crypto",
     "invitations",
+    "core_dropped_unsigned_spends",
 ];
 
 /// The all-zero `WalletId` reserved as the storage spelling of "owned by

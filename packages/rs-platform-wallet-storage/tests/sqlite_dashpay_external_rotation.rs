@@ -599,6 +599,7 @@ fn a_pre_fork_v1_database_migrates_with_no_stamp() {
             "DROP TABLE core_address_pool_retired;
              ALTER TABLE contacts DROP COLUMN external_account_reference;
              ALTER TABLE core_instant_locks DROP COLUMN verified;
+             DROP TABLE core_dropped_unsigned_spends;
              DROP TABLE {FORK_HISTORY_TABLE};"
         ))
         .unwrap();
@@ -638,7 +639,8 @@ fn as_an_old_fork_build_recorded_it(path: &std::path::Path) -> String {
         .unwrap();
     conn.execute_batch(&format!(
         "DROP TABLE {FORK_HISTORY_TABLE};
-         ALTER TABLE core_instant_locks DROP COLUMN verified;"
+         ALTER TABLE core_instant_locks DROP COLUMN verified;
+         DROP TABLE core_dropped_unsigned_spends;"
     ))
     .unwrap();
     conn.execute(
@@ -685,7 +687,7 @@ fn a_backup_from_a_build_that_recorded_v019_restores_and_opens() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(fork, 2);
+    assert_eq!(fork, 3);
 }
 
 /// A database an earlier fork build wrote recorded fork migration 1 in
@@ -784,7 +786,7 @@ fn a_newer_fork_history_refuses_to_open() {
         conn.execute(
             &format!(
                 "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum)
-                 VALUES (3, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
+                 VALUES (4, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
             ),
             [],
         )
@@ -797,8 +799,8 @@ fn a_newer_fork_history_refuses_to_open() {
         matches!(
             err,
             WalletStorageError::ForkSchemaVersionUnsupported {
-                found: 3,
-                max_supported: 2
+                found: 4,
+                max_supported: 3
             }
         ),
         "{err:?}"
@@ -811,7 +813,7 @@ fn a_newer_fork_history_refuses_to_open() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rows, 3);
+    assert_eq!(rows, 4);
 }
 
 /// The history never blocks a live write: a retired generation whose xpub no
