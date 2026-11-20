@@ -182,6 +182,10 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.monitor_revision()
     }
 
+    fn account_generation(&self) -> u64 {
+        self.core_wallet.account_generation()
+    }
+
     // Delegate the chain-lock methods to the inner `ManagedWalletInfo`.
     //
     // Without these delegations, `WalletInfoInterface`'s default impls
@@ -334,6 +338,46 @@ mod tests {
             output: Vec::new(),
             special_transaction_payload: None,
         }
+    }
+
+    /// dash-spv commits a matched filter batch only while the account
+    /// generation it read stands, so the wrapper reports the wallet's own: a
+    /// widened address pool is a new generation.
+    #[test]
+    fn widening_a_pool_is_a_new_account_generation_of_the_platform_wallet() {
+        use key_wallet::account::{AccountType, StandardAccountType};
+        use key_wallet::managed_account::address_pool::KeySource;
+        use key_wallet::managed_account::managed_account_trait::ManagedAccountTrait;
+
+        let wallet = Wallet::new_random(Network::Testnet, WalletAccountCreationOptions::Default)
+            .expect("test wallet");
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        let bip44 = AccountType::Standard {
+            index: 0,
+            standard_account_type: StandardAccountType::BIP44Account,
+        };
+        let xpub = wallet
+            .accounts
+            .account_of_type(bip44)
+            .expect("BIP44 account")
+            .account_xpub;
+        let before = info.account_generation();
+
+        let account = info
+            .core_wallet
+            .accounts
+            .funds_account_mut(&bip44)
+            .expect("account");
+        assert!(!account
+            .set_gap_limit(200, &KeySource::Public(xpub))
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(info.account_generation(), before + 1);
+        assert_eq!(
+            info.account_generation(),
+            info.core_wallet.account_generation()
+        );
     }
 
     /// dash-spv notes a chain-lock height during the initial sync, before a
