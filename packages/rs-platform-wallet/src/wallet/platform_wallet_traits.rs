@@ -186,6 +186,10 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.account_generation()
     }
 
+    fn is_dismissed(&self, txid: &Txid) -> bool {
+        self.core_wallet.is_dismissed(txid)
+    }
+
     // Delegate the chain-lock methods to the inner `ManagedWalletInfo`.
     //
     // Without these delegations, `WalletInfoInterface`'s default impls
@@ -378,6 +382,21 @@ mod tests {
             info.account_generation(),
             info.core_wallet.account_generation()
         );
+    }
+
+    /// A transaction the core wallet dropped as dead is dead for the wrapper
+    /// too, so a delivery of it without a lock reaches no other wallet.
+    #[test]
+    fn an_abandoned_transaction_is_dismissed_for_the_platform_wallet() {
+        use dashcore::hashes::Hash;
+
+        let wallet = Wallet::new_random(Network::Testnet, WalletAccountCreationOptions::Default)
+            .expect("test wallet");
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        let txid = Txid::from_byte_array([0x07; 32]);
+        assert!(!info.is_dismissed(&txid));
+        info.core_wallet.abandon_transaction(txid);
+        assert!(info.is_dismissed(&txid));
     }
 
     /// dash-spv notes a chain-lock height during the initial sync, before a
