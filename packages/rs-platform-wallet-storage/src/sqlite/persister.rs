@@ -400,6 +400,11 @@ impl SqlitePersister {
         }
 
         let _report = crate::sqlite::migrations::run_for_open(&mut conn)?;
+        if config.load_policy != LoadPolicy::Recovery {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::sqlite::schema::core_state::drop_unauthorized_pending_spends(&tx)?;
+            tx.commit()?;
+        }
 
         // The open succeeded, so the claim passes to the persister, whose
         // `Drop` releases it.

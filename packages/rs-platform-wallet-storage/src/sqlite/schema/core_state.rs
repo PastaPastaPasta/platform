@@ -488,6 +488,182 @@ fn surviving_stored_input_claims(
     Ok(claims)
 }
 
+/// Undo what a build without the pending-spend check stored for an
+/// unconfirmed transaction that spends one of the wallet's coins without its
+/// owner's signature. Such a transaction is now ignored on arrival, but an
+/// older build recorded it and marked the coin spent, and a load restores
+/// only unspent coins, so the coin stayed missing.
+///
+/// A transaction counts as such only when it is neither mined nor backed by
+/// a lock row stored as verified, and [`verify_input_authorization`] proves
+/// one of its inputs unsigned for the stored coin it spends, the rule the
+/// wallet applies on arrival. Its row, its lock row and its unspent outputs
+/// go; each coin it claimed is unspent again unless another stored
+/// transaction spends it too. Running it again finds nothing more.
+///
+/// [`verify_input_authorization`]: key_wallet::transaction_checking::verify_input_authorization
+pub(crate) fn drop_unauthorized_pending_spends(
+    tx: &Transaction<'_>,
+) -> Result<usize, WalletStorageError> {
+    let mut pending: Vec<(WalletId, TransactionRecord)> = Vec::new();
+    {
+        let mut stmt = tx.prepare_cached(
+            "SELECT wallet_id, txid, length(record_blob), record_blob FROM core_transactions \
+             WHERE height IS NULL AND record_blob IS NOT NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let wallet_id: Vec<u8> = row.get(0)?;
+            let Ok(wallet_id) = WalletId::try_from(wallet_id.as_slice()) else {
+                continue;
+            };
+            let Some(record) = readable_record(row.get(1)?, row.get(2)?, row.get(3)?) else {
+                continue;
+            };
+            pending.push((wallet_id, record));
+        }
+    }
+
+    let mut dropped: BTreeMap<WalletId, Vec<TransactionRecord>> = BTreeMap::new();
+    {
+        let mut coin_stmt = tx.prepare_cached(
+            "SELECT value, script FROM core_utxos \
+             WHERE wallet_id = ?1 AND outpoint = ?2 AND is_sweep_placeholder = 0",
+        )?;
+        for (wallet_id, record) in pending {
+            if record.block_info().is_some()
+                || verified_instant_lock(tx, &wallet_id, &record.txid)?.is_some()
+            {
+                continue;
+            }
+            let mut unauthorized = false;
+            for (index, input) in record.transaction.input.iter().enumerate() {
+                let op = blob::encode_outpoint(&input.previous_output)?;
+                let Some((value, script)) = coin_stmt
+                    .query_row(params![wallet_id.as_slice(), &op[..]], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .optional()?
+                else {
+                    continue;
+                };
+                let Ok(value) = u64::try_from(value) else {
+                    return Err(WalletStorageError::blob_decode(
+                        "core_utxos.value must not be negative",
+                    ));
+                };
+                let prevout = dashcore::TxOut {
+                    value,
+                    script_pubkey: dashcore::ScriptBuf::from_bytes(script),
+                };
+                if key_wallet::transaction_checking::verify_input_authorization(
+                    &record.transaction,
+                    index,
+                    &prevout,
+                ) == Ok(false)
+                {
+                    unauthorized = true;
+                    break;
+                }
+            }
+            if unauthorized {
+                dropped.entry(wallet_id).or_default().push(record);
+            }
+        }
+    }
+
+    let mut count = 0;
+    for (wallet_id, records) in dropped {
+        let dropped_txids: HashSet<dashcore::Txid> = records.iter().map(|r| r.txid).collect();
+        let Some(claimed) = stored_input_claims_except(tx, &wallet_id, &dropped_txids)? else {
+            continue;
+        };
+        for record in records {
+            tracing::warn!(
+                txid = %record.txid,
+                "an unconfirmed transaction spends a coin without its owner's signature; \
+                 dropped and its coins released"
+            );
+            let txid: &[u8] = record.txid.as_ref();
+            tx.execute(
+                "DELETE FROM core_transactions WHERE wallet_id = ?1 AND txid = ?2",
+                params![wallet_id.as_slice(), txid],
+            )?;
+            tx.execute(
+                "DELETE FROM core_instant_locks WHERE wallet_id = ?1 AND txid = ?2",
+                params![wallet_id.as_slice(), txid],
+            )?;
+            for vout in 0..record.transaction.output.len() {
+                let Ok(vout) = u32::try_from(vout) else {
+                    break;
+                };
+                let op = blob::encode_outpoint(&dashcore::OutPoint {
+                    txid: record.txid,
+                    vout,
+                })?;
+                tx.execute(
+                    "DELETE FROM core_utxos WHERE wallet_id = ?1 AND outpoint = ?2 \
+                     AND spent = 0 AND is_sweep_placeholder = 0",
+                    params![wallet_id.as_slice(), &op[..]],
+                )?;
+            }
+            for input in &record.transaction.input {
+                if claimed.contains(&input.previous_output) {
+                    continue;
+                }
+                let op = blob::encode_outpoint(&input.previous_output)?;
+                tx.execute(
+                    "UPDATE core_utxos SET spent = 0, spent_in_txid = NULL \
+                     WHERE wallet_id = ?1 AND outpoint = ?2 AND is_sweep_placeholder = 0",
+                    params![wallet_id.as_slice(), &op[..]],
+                )?;
+            }
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// A stored record the repair can trust, or `None` for a row the readers
+/// report under the load policy instead.
+fn readable_record(txid: Vec<u8>, length: i64, blob_bytes: Vec<u8>) -> Option<TransactionRecord> {
+    blob::check_size(length).ok()?;
+    let record: TransactionRecord = blob::decode(&blob_bytes).ok()?;
+    (AsRef::<[u8]>::as_ref(&record.txid) == txid.as_slice()).then_some(record)
+}
+
+/// Every outpoint a stored transaction of the wallet spends, whatever its
+/// finality, except the transactions in `except`; `None` when a row cannot
+/// be read, so no claim can be ruled out.
+fn stored_input_claims_except(
+    tx: &Transaction<'_>,
+    wallet_id: &WalletId,
+    except: &HashSet<dashcore::Txid>,
+) -> Result<Option<HashSet<dashcore::OutPoint>>, WalletStorageError> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT txid, length(record_blob), record_blob FROM core_transactions \
+         WHERE wallet_id = ?1 AND record_blob IS NOT NULL",
+    )?;
+    let mut rows = stmt.query(params![wallet_id.as_slice()])?;
+    let mut claims = HashSet::new();
+    while let Some(row) = rows.next()? {
+        let Some(record) = readable_record(row.get(0)?, row.get(1)?, row.get(2)?) else {
+            return Ok(None);
+        };
+        if except.contains(&record.txid) {
+            continue;
+        }
+        claims.extend(
+            record
+                .transaction
+                .input
+                .iter()
+                .map(|input| input.previous_output),
+        );
+    }
+    Ok(Some(claims))
+}
+
 /// Delete a swept transaction's row and outputs, then resolve the coins it
 /// claimed to spend.
 ///
@@ -1566,8 +1742,289 @@ mod tests {
         }
     }
 
+    mod unauthorized_pending_spends {
+        use super::*;
+        use dashcore::secp256k1::Message;
+        use dashcore::sighash::SighashCache;
+        use dashcore::TxIn;
+
+        struct Owner {
+            key: dashcore::secp256k1::Keypair,
+            public: dashcore::PublicKey,
+            address: dashcore::Address,
+        }
+
+        fn owner(byte: u8) -> Owner {
+            let key = format!("{byte:02x}")
+                .repeat(32)
+                .parse::<dashcore::secp256k1::Keypair>()
+                .unwrap();
+            let public = dashcore::PublicKey::new(key.public_key());
+            let address = dashcore::Address::p2pkh(&public, dashcore::Network::Testnet);
+            Owner {
+                key,
+                public,
+                address,
+            }
+        }
+
+        fn coin(owner: &Owner, outpoint: OutPoint, value: u64) -> Utxo {
+            Utxo {
+                outpoint,
+                txout: TxOut {
+                    value,
+                    script_pubkey: owner.address.script_pubkey(),
+                },
+                address: owner.address.clone(),
+                height: 50,
+                is_coinbase: false,
+                is_confirmed: true,
+                is_instantlocked: false,
+                is_locked: false,
+                is_trusted: false,
+            }
+        }
+
+        /// A spend of `coin` to `outputs`, signed by `signer` with the coin
+        /// owner's public key in the input script.
+        fn spend(coin: &Utxo, owner: &Owner, signer: &Owner, outputs: Vec<TxOut>) -> Transaction {
+            let mut tx = Transaction {
+                version: 3,
+                lock_time: 0,
+                input: vec![TxIn {
+                    previous_output: coin.outpoint,
+                    ..TxIn::default()
+                }],
+                output: outputs,
+                special_transaction_payload: None,
+            };
+            let digest = SighashCache::new(&tx)
+                .legacy_signature_hash(0, &coin.txout.script_pubkey, 1)
+                .unwrap();
+            let signature = dashcore::secp256k1::ecdsa::sign(
+                Message::from_digest(digest.to_byte_array()),
+                &(&signer.key).into(),
+            );
+            let mut signature = signature.serialize_der().to_vec();
+            signature.push(1);
+            tx.input[0].script_sig = dashcore::blockdata::script::Builder::new()
+                .push_slice(<&dashcore::script::PushBytes>::try_from(signature.as_slice()).unwrap())
+                .push_key(&owner.public)
+                .into_script();
+            tx
+        }
+
+        fn spend_record(tx: Transaction, context: TransactionContext) -> TransactionRecord {
+            let txid = tx.txid();
+            let mut record = transaction_record(txid, context);
+            record.transaction = tx;
+            record
+        }
+
+        fn unspent(conn: &rusqlite::Connection, w: &[u8; 32]) -> Vec<OutPoint> {
+            let (loaded, _) =
+                load_state(conn, w, dashcore::Network::Testnet, &LoadCtx::strict()).unwrap();
+            let mut outpoints: Vec<_> = loaded.new_utxos.iter().map(|u| u.outpoint).collect();
+            outpoints.sort();
+            outpoints
+        }
+
+        fn repair(conn: &mut rusqlite::Connection) -> usize {
+            let tx = conn.transaction().unwrap();
+            let dropped = drop_unauthorized_pending_spends(&tx).unwrap();
+            tx.commit().unwrap();
+            dropped
+        }
+
+        /// What a build without the pending-spend check stored: the wallet's
+        /// coin, then a peer's unconfirmed spend of it, in `context`, with
+        /// change to the wallet, and the coin marked spent.
+        fn old_build_store(
+            w: &[u8; 32],
+            signer: u8,
+            context: impl Fn(&Transaction) -> TransactionContext,
+        ) -> (rusqlite::Connection, Utxo, Utxo, Transaction) {
+            old_build_store_in(wallet_db(w), w, signer, context)
+        }
+
+        fn old_build_store_in(
+            mut conn: rusqlite::Connection,
+            w: &[u8; 32],
+            signer: u8,
+            context: impl Fn(&Transaction) -> TransactionContext,
+        ) -> (rusqlite::Connection, Utxo, Utxo, Transaction) {
+            let me = owner(0x31);
+            let held = coin(
+                &me,
+                OutPoint {
+                    txid: Txid::from_byte_array([0x61; 32]),
+                    vout: 0,
+                },
+                500_000,
+            );
+            store(
+                &mut conn,
+                w,
+                &CoreChangeSet {
+                    new_utxos: vec![held.clone()],
+                    ..Default::default()
+                },
+            );
+            let claim = spend(
+                &held,
+                &me,
+                &owner(signer),
+                vec![
+                    TxOut {
+                        value: 300_000,
+                        script_pubkey: owner(0x77).address.script_pubkey(),
+                    },
+                    TxOut {
+                        value: 190_000,
+                        script_pubkey: me.address.script_pubkey(),
+                    },
+                ],
+            );
+            let change = coin(
+                &me,
+                OutPoint {
+                    txid: claim.txid(),
+                    vout: 1,
+                },
+                190_000,
+            );
+            let record = spend_record(claim.clone(), context(&claim));
+            let mut cs = CoreChangeSet {
+                records: vec![record],
+                new_utxos: vec![change.clone()],
+                spent_utxos: vec![held.clone()],
+                ..Default::default()
+            };
+            if let TransactionContext::InstantSend(lock) = context(&claim) {
+                cs.instant_locks_for_non_final_records
+                    .insert(claim.txid(), lock);
+            }
+            store(&mut conn, w, &cs);
+            (conn, held, change, claim)
+        }
+
+        #[test]
+        fn a_coin_an_older_build_let_an_unsigned_claim_spend_is_back_after_the_repair() {
+            let w = [0xB1u8; 32];
+            let (mut conn, held, change, claim) =
+                old_build_store(&w, 0x99, |_| TransactionContext::Mempool);
+            assert_eq!(
+                unspent(&conn, &w),
+                vec![change.outpoint],
+                "before the repair the coin is missing and the claim's change is counted"
+            );
+
+            assert_eq!(repair(&mut conn), 1);
+            assert_eq!(unspent(&conn, &w), vec![held.outpoint]);
+            assert!(get_tx_record(&conn, &w, &claim.txid(), &LoadCtx::strict())
+                .unwrap()
+                .is_none());
+
+            assert_eq!(repair(&mut conn), 0, "a second run finds nothing");
+            assert_eq!(unspent(&conn, &w), vec![held.outpoint]);
+        }
+
+        #[test]
+        fn opening_the_store_repairs_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet.db");
+            let w = [0xB6u8; 32];
+            let (conn, held, change, _) = old_build_store_in(
+                wallet_db_in(rusqlite::Connection::open(&path).unwrap(), &w),
+                &w,
+                0x99,
+                |_| TransactionContext::Mempool,
+            );
+            assert_eq!(unspent(&conn, &w), vec![change.outpoint]);
+            drop(conn);
+
+            drop(
+                crate::sqlite::persister::SqlitePersister::open(
+                    crate::sqlite::config::SqlitePersisterConfig::new(&path),
+                )
+                .unwrap(),
+            );
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(unspent(&conn, &w), vec![held.outpoint]);
+        }
+
+        #[test]
+        fn a_spend_the_owner_signed_stays_spent() {
+            let w = [0xB2u8; 32];
+            let (mut conn, _, change, claim) =
+                old_build_store(&w, 0x31, |_| TransactionContext::Mempool);
+            assert_eq!(repair(&mut conn), 0);
+            assert_eq!(unspent(&conn, &w), vec![change.outpoint]);
+            assert!(get_tx_record(&conn, &w, &claim.txid(), &LoadCtx::strict())
+                .unwrap()
+                .is_some());
+        }
+
+        #[test]
+        fn a_mined_or_verified_locked_spend_stays_spent_even_unsigned() {
+            let mined = |_: &Transaction| {
+                TransactionContext::InBlock(BlockInfo::new(
+                    90,
+                    BlockHash::from_byte_array([0x09; 32]),
+                    1_700_000_000,
+                ))
+            };
+            let locked = |tx: &Transaction| {
+                TransactionContext::InstantSend(InstantLock {
+                    txid: tx.txid(),
+                    ..InstantLock::default()
+                })
+            };
+            for (byte, (mut conn, _, change, claim)) in [
+                (0xB3u8, old_build_store(&[0xB3; 32], 0x99, mined)),
+                (0xB4u8, old_build_store(&[0xB4; 32], 0x99, locked)),
+            ] {
+                let w = [byte; 32];
+                assert_eq!(repair(&mut conn), 0);
+                assert_eq!(unspent(&conn, &w), vec![change.outpoint]);
+                assert!(get_tx_record(&conn, &w, &claim.txid(), &LoadCtx::strict())
+                    .unwrap()
+                    .is_some());
+            }
+        }
+
+        #[test]
+        fn a_coin_another_stored_spend_claims_stays_spent() {
+            let w = [0xB5u8; 32];
+            let (mut conn, held, _, _) = old_build_store(&w, 0x99, |_| TransactionContext::Mempool);
+            let me = owner(0x31);
+            let own = spend(
+                &held,
+                &me,
+                &me,
+                vec![TxOut {
+                    value: 490_000,
+                    script_pubkey: owner(0x78).address.script_pubkey(),
+                }],
+            );
+            store(
+                &mut conn,
+                &w,
+                &CoreChangeSet {
+                    records: vec![spend_record(own, TransactionContext::Mempool)],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(repair(&mut conn), 1);
+            assert_eq!(unspent(&conn, &w), Vec::<OutPoint>::new());
+        }
+    }
+
     fn wallet_db(w: &[u8; 32]) -> rusqlite::Connection {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        wallet_db_in(rusqlite::Connection::open_in_memory().unwrap(), w)
+    }
+
+    fn wallet_db_in(mut conn: rusqlite::Connection, w: &[u8; 32]) -> rusqlite::Connection {
         crate::sqlite::migrations::run(&mut conn).unwrap();
         conn.execute(
             "INSERT INTO wallets (wallet_id, network, birth_height) VALUES (?1, 'testnet', 0)",
