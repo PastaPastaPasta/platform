@@ -194,6 +194,10 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.dismiss(txid)
     }
 
+    fn dismiss_spend_of_dismissed(&mut self, tx: &Transaction, txid: Txid) -> bool {
+        self.core_wallet.dismiss_spend_of_dismissed(tx, txid)
+    }
+
     fn undismiss(&mut self, txid: &Txid) {
         self.core_wallet.undismiss(txid)
     }
@@ -405,11 +409,15 @@ mod tests {
         assert!(!info.is_dismissed(&txid));
         info.core_wallet.abandon_transaction(txid);
         assert!(info.is_dismissed(&txid));
-        let child = Txid::from_byte_array([0x08; 32]);
-        info.dismiss(child);
-        assert!(info.core_wallet.is_dismissed(&child));
-        info.undismiss(&child);
-        assert!(!info.core_wallet.is_dismissed(&child));
+        let child = spending(OutPoint::new(txid, 0));
+        let child_txid = child.txid();
+        assert!(info.dismiss_spend_of_dismissed(&child, child_txid));
+        assert!(info.core_wallet.is_dismissed(&child_txid));
+        info.undismiss(&txid);
+        assert!(!info.core_wallet.is_dismissed(&child_txid));
+        let restored = Txid::from_byte_array([0x08; 32]);
+        info.dismiss(restored);
+        assert!(info.core_wallet.is_dismissed(&restored));
     }
 
     /// dash-spv notes a chain-lock height during the initial sync, before a
