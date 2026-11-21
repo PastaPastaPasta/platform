@@ -658,7 +658,8 @@ pub(crate) fn drop_unauthorized_pending_spends(
 
 /// The JSON object of each `core_utxos` column, blobs in hex, for a kept row.
 const KEPT_UTXO_COLUMNS: &str = "json_object('outpoint', hex(outpoint), 'value', value, \
-    'script', hex(script), 'spent', spent, 'spent_in_txid', hex(spent_in_txid), \
+    'script', hex(script), 'spent', spent, \
+    'spent_in_txid', CASE WHEN spent_in_txid IS NULL THEN NULL ELSE hex(spent_in_txid) END, \
     'winner_mined_height', winner_mined_height, 'is_sweep_placeholder', is_sweep_placeholder)";
 
 /// The unspent, materialised output row at `outpoint`, kept as JSON.
@@ -2206,6 +2207,11 @@ mod tests {
             assert_eq!(
                 first.iter().map(|k| k.0).collect::<Vec<_>>(),
                 vec![unsigned.txid()]
+            );
+            assert!(
+                first[0].2.contains(r#""spent_in_txid":null"#),
+                "an absent spender is kept as null: {}",
+                first[0].2
             );
             assert!(backups(dir.path()).is_empty(), "no migration, no copy");
             drop(conn);
