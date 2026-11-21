@@ -1915,6 +1915,14 @@ fn load_one_wallet(
                 ))
             })?;
     }
+    let dismissed =
+        schema::core_state::load_dismissed(conn, &wallet_id).map_err(PersistenceError::from)?;
+    for txid in dismissed {
+        key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface::dismiss(
+            &mut wallet_info,
+            txid,
+        );
+    }
     Ok(platform_wallet::changeset::ClientWalletStartState {
         wallet,
         wallet_info,
@@ -2451,6 +2459,7 @@ mod tests {
             "asset_locks",
             "contacts",
             "core_address_pool",
+            "core_dismissed_transactions",
             "core_instant_locks",
             "core_sync_state",
             "core_transactions",

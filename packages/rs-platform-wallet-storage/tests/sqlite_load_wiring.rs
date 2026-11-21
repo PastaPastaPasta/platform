@@ -132,6 +132,39 @@ fn c1_load_populates_keyless_wallet_payload() {
     assert_eq!(slice.wallet_info.metadata.last_processed_height, 50);
 }
 
+/// A transaction a sweep or an abandon removed loads as dismissed, so a
+/// peer relaying it again unlocked after a restart is still ignored.
+#[test]
+fn a_dismissed_transaction_stays_dismissed_after_a_restart() {
+    use dashcore::hashes::Hash;
+    let (persister, _tmp, path) = fresh_persister();
+    let w = wid(0xC9);
+    ensure_wallet_meta(&persister, &w);
+    let swept = dashcore::Txid::from_byte_array([0x91; 32]);
+    let sweep = platform_wallet::changeset::changeset::SweepBatch {
+        txids: vec![swept],
+        superseded_by: dashcore::Txid::from_byte_array([0x92; 32]),
+        winner_mined_height: None,
+        released_outpoints: Vec::new(),
+    };
+    let changeset = PlatformWalletChangeSet {
+        core: Some(CoreChangeSet {
+            sweeps: vec![sweep],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    persister.store(w, changeset).unwrap();
+    drop(persister);
+
+    let state = reopen(&path).load().unwrap();
+    let slice = state.wallets.get(&w).expect("wallet slice");
+    assert!(slice.wallet_info.is_dismissed(&swept));
+    assert!(!slice
+        .wallet_info
+        .is_dismissed(&dashcore::Txid::from_byte_array([0x93; 32])));
+}
+
 /// Empty DB → empty `wallets`, no error (the `load()` doctest contract).
 #[test]
 fn c2_empty_db_empty_wallets() {

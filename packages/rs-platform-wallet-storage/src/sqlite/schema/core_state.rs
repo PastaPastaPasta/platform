@@ -109,6 +109,15 @@ pub fn apply(
                 payload,
             ])?;
         }
+        let mut undismiss = tx.prepare_cached(
+            "DELETE FROM core_dismissed_transactions WHERE wallet_id = ?1 AND txid = ?2",
+        )?;
+        for record in &cs.records {
+            undismiss.execute(params![
+                wallet_id.as_slice(),
+                AsRef::<[u8]>::as_ref(&record.txid)
+            ])?;
+        }
     }
     // `addresses_derived` is intentionally NOT persisted here — the pool
     // snapshot (`account_address_pools`) is the derived-address source used
@@ -388,10 +397,62 @@ pub fn apply(
             }
         }
     }
+    remember_dismissed(tx, wallet_id, &swept_txids)?;
     if heights_advanced {
         collect_finalized_tombstones(tx, wallet_id)?;
     }
     Ok(())
+}
+
+/// The most dismissed transactions kept per wallet, as many as the wallet keeps in memory.
+const MAX_DISMISSED_KEPT: i64 = 4_096;
+
+/// Keep `swept` as dismissed, newest last, and drop the rows past the newest
+/// [`MAX_DISMISSED_KEPT`].
+fn remember_dismissed(
+    tx: &Transaction<'_>,
+    wallet_id: &WalletId,
+    swept: &HashSet<dashcore::Txid>,
+) -> Result<(), WalletStorageError> {
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO core_dismissed_transactions (wallet_id, txid) VALUES (?1, ?2) \
+         ON CONFLICT(wallet_id, txid) DO NOTHING",
+    )?;
+    for txid in swept {
+        insert.execute(params![wallet_id.as_slice(), AsRef::<[u8]>::as_ref(txid)])?;
+    }
+    tx.execute(
+        "DELETE FROM core_dismissed_transactions WHERE wallet_id = ?1 AND id <= \
+         (SELECT id FROM core_dismissed_transactions WHERE wallet_id = ?1 \
+          ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+        params![wallet_id.as_slice(), MAX_DISMISSED_KEPT],
+    )?;
+    Ok(())
+}
+
+/// The transactions the wallet dropped as dead, oldest first.
+pub fn load_dismissed(
+    conn: &Connection,
+    wallet_id: &WalletId,
+) -> Result<Vec<dashcore::Txid>, WalletStorageError> {
+    use dashcore::hashes::Hash;
+
+    let mut stmt = conn.prepare_cached(
+        "SELECT txid FROM core_dismissed_transactions WHERE wallet_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![wallet_id.as_slice()], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut txids = Vec::new();
+    for bytes in rows {
+        let Ok(txid) = <[u8; 32]>::try_from(bytes?.as_slice()) else {
+            return Err(WalletStorageError::blob_decode(
+                "core_dismissed_transactions.txid must be exactly 32 bytes",
+            ));
+        };
+        txids.push(dashcore::Txid::from_byte_array(txid));
+    }
+    Ok(txids)
 }
 
 /// The union of every input outpoint claimed by a surviving
@@ -2107,6 +2168,7 @@ mod tests {
             conn.execute_batch(&format!(
                 "DELETE FROM {} WHERE version >= 2;
                  DROP TABLE core_dropped_unsigned_spends;
+                 DROP TABLE core_dismissed_transactions;
                  ALTER TABLE core_instant_locks DROP COLUMN verified;",
                 crate::sqlite::migrations::FORK_HISTORY_TABLE
             ))
@@ -2483,6 +2545,49 @@ mod tests {
         let tx = conn.transaction().unwrap();
         apply(&tx, w, cs).unwrap();
         tx.commit().unwrap();
+    }
+
+    /// What a sweep removes stays dismissed until a record of it is stored
+    /// again, and only the newest dismissals are kept.
+    #[test]
+    fn a_swept_transaction_stays_dismissed_until_it_is_stored_again() {
+        use platform_wallet::changeset::changeset::SweepBatch;
+        let w = [0xB1u8; 32];
+        let mut conn = wallet_db(&w);
+        let txid = |n: u16| {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&n.to_le_bytes());
+            Txid::from_byte_array(bytes)
+        };
+        let sweep = |txids: Vec<Txid>| CoreChangeSet {
+            sweeps: vec![SweepBatch {
+                txids,
+                superseded_by: Txid::from_byte_array([0xFF; 32]),
+                winner_mined_height: None,
+                released_outpoints: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        store(&mut conn, &w, &sweep(vec![txid(1), txid(2)]));
+        let dismissed: std::collections::BTreeSet<Txid> =
+            load_dismissed(&conn, &w).unwrap().into_iter().collect();
+        assert_eq!(
+            dismissed,
+            std::collections::BTreeSet::from([txid(1), txid(2)])
+        );
+
+        let back = CoreChangeSet {
+            records: vec![transaction_record(txid(1), TransactionContext::Mempool)],
+            ..Default::default()
+        };
+        store(&mut conn, &w, &back);
+        assert_eq!(load_dismissed(&conn, &w).unwrap(), vec![txid(2)]);
+
+        let kept = MAX_DISMISSED_KEPT as u16;
+        store(&mut conn, &w, &sweep((3..=kept + 2).map(txid).collect()));
+        let dismissed = load_dismissed(&conn, &w).unwrap();
+        assert_eq!(dismissed.len(), kept as usize);
+        assert!(!dismissed.contains(&txid(2)), "the oldest goes first");
     }
 
     /// A payment received, flushed, then its verified lock, flushed, then a

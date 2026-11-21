@@ -57,6 +57,7 @@ const FORK_SCHEMA: &[(i32, ForkObject)] = &[
     ),
     (2, ForkObject::Column("core_instant_locks", "verified")),
     (3, ForkObject::Table("core_dropped_unsigned_spends")),
+    (4, ForkObject::Table("core_dismissed_transactions")),
 ];
 
 /// A schema object a fork migration creates.
@@ -1039,6 +1040,7 @@ mod tests {
         conn.execute_batch(&format!(
             "DROP TABLE {FORK_HISTORY_TABLE};
              DROP TABLE core_dropped_unsigned_spends;
+             DROP TABLE core_dismissed_transactions;
              ALTER TABLE core_instant_locks DROP COLUMN verified;"
         ))
         .unwrap();
@@ -1084,7 +1086,7 @@ mod tests {
         run(&mut conn).unwrap();
         assert_eq!(upstream_versions(&conn), embedded_upstream());
         let fork = fork_history(&conn);
-        assert_eq!(fork.len(), 3);
+        assert_eq!(fork.len(), 4);
         assert_eq!(
             (fork[0].0, fork[0].1.as_str()),
             (1, "dashpay_external_rotation")
@@ -1096,6 +1098,10 @@ mod tests {
         assert_eq!(
             (fork[2].0, fork[2].1.as_str()),
             (3, "dropped_unsigned_spends_recovery_record")
+        );
+        assert_eq!(
+            (fork[3].0, fork[3].1.as_str()),
+            (4, "dismissed_transactions")
         );
         assert!(has_fork_schema(&conn));
         assert_eq!(fork_pending(&conn).unwrap(), 0);
@@ -1140,8 +1146,8 @@ mod tests {
             .collect();
         assert_eq!(
             applied,
-            vec![19, 20, 21, 2, 3],
-            "fork V1 does not re-run; fork V2 and V3 apply"
+            vec![19, 20, 21, 2, 3, 4],
+            "fork V1 does not re-run; fork V2, V3 and V4 apply"
         );
         assert_eq!(
             upstream_history(&conn).last().unwrap().1,
@@ -1157,6 +1163,10 @@ mod tests {
         assert_eq!(
             (after[2].0, after[2].1.as_str()),
             (3, "dropped_unsigned_spends_recovery_record")
+        );
+        assert_eq!(
+            (after[3].0, after[3].1.as_str()),
+            (4, "dismissed_transactions")
         );
         assert!(has_fork_schema(&conn));
     }
@@ -1178,7 +1188,7 @@ mod tests {
             .run(&mut conn)
             .unwrap();
         assert_eq!(upstream_history(&conn), upstream);
-        assert_eq!(fork_history(&conn).len(), 3);
+        assert_eq!(fork_history(&conn).len(), 4);
         assert!(has_fork_schema(&conn));
     }
 
@@ -1221,7 +1231,7 @@ mod tests {
         conn.execute(
             &format!(
                 "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum)
-                 VALUES (4, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
+                 VALUES (5, 'from_a_newer_build', '2026-10-17T00:00:00Z', '1')"
             ),
             [],
         )
@@ -1229,8 +1239,8 @@ mod tests {
         assert!(matches!(
             assert_fork_schema_version_supported(&conn),
             Err(WalletStorageError::ForkSchemaVersionUnsupported {
-                found: 4,
-                max_supported: 3
+                found: 5,
+                max_supported: 4
             })
         ));
     }
@@ -1348,7 +1358,7 @@ mod tests {
             "a clear error: {err:?}"
         );
         assert_eq!(upstream_versions(&conn), embedded_upstream());
-        assert_eq!(fork_history(&conn).len(), 3);
+        assert_eq!(fork_history(&conn).len(), 4);
     }
 
     /// SQL that removes or reshapes a fork migration's schema, with what the
@@ -1378,6 +1388,7 @@ mod tests {
             "is missing",
         ),
         ("DROP TABLE core_dropped_unsigned_spends;", "is missing"),
+        ("DROP TABLE core_dismissed_transactions;", "is missing"),
     ];
 
     /// Test 10: an upstream migration that drops, or rebuilds into another
