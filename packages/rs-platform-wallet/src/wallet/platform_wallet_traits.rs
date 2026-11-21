@@ -198,7 +198,7 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.dismiss_spend_of_dismissed(tx, txid)
     }
 
-    fn undismiss(&mut self, txid: &Txid) {
+    fn undismiss(&mut self, txid: &Txid) -> Vec<Txid> {
         self.core_wallet.undismiss(txid)
     }
 
