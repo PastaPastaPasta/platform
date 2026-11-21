@@ -397,7 +397,11 @@ pub fn apply(
             }
         }
     }
-    remember_dismissed(tx, wallet_id, &swept_txids)?;
+    remember_dismissed(
+        tx,
+        wallet_id,
+        cs.sweeps.iter().flat_map(|batch| &batch.txids),
+    )?;
     if heights_advanced {
         collect_finalized_tombstones(tx, wallet_id)?;
     }
@@ -409,10 +413,10 @@ const MAX_DISMISSED_KEPT: i64 = 4_096;
 
 /// Keep `swept` as dismissed, newest last, and drop the rows past the newest
 /// [`MAX_DISMISSED_KEPT`].
-fn remember_dismissed(
+fn remember_dismissed<'t>(
     tx: &Transaction<'_>,
     wallet_id: &WalletId,
-    swept: &HashSet<dashcore::Txid>,
+    swept: impl IntoIterator<Item = &'t dashcore::Txid>,
 ) -> Result<(), WalletStorageError> {
     let mut insert = tx.prepare_cached(
         "INSERT INTO core_dismissed_transactions (wallet_id, txid) VALUES (?1, ?2) \
@@ -558,20 +562,21 @@ fn surviving_stored_input_claims(
 /// A transaction counts as such only when it is neither mined nor backed by
 /// a lock row stored as verified, and [`verify_input_authorization`] proves
 /// one of its inputs unsigned for the stored coin it spends, the rule the
-/// wallet applies on arrival. What spends its outputs can never confirm
-/// either, so it goes too, in every wallet that recorded any of them, unless
-/// one of them is mined, verified-locked or holds a sweep's final winner,
-/// which shows the first was valid after all, or a wallet that recorded one
-/// has a row the repair cannot read. Each dropped transaction's row, lock row
-/// and output rows go, and it stays dismissed; each coin it claimed is
-/// unspent again unless another stored transaction spends it too. Running it
-/// again finds nothing more.
+/// wallet applies on arrival; one an earlier run dropped still counts. What
+/// spends its outputs can never confirm either, so it goes too, in every
+/// wallet that recorded any of them, unless one of them is mined,
+/// verified-locked or holds a sweep's final winner, which shows the first was
+/// valid after all, or a wallet that recorded one has a row the repair cannot
+/// read. Each dropped transaction's row, lock row and output rows go, and it
+/// stays dismissed; each coin it claimed is unspent again unless another
+/// stored transaction spends it too. Running it again finds nothing more.
 ///
 /// [`verify_input_authorization`]: key_wallet::transaction_checking::verify_input_authorization
 pub(crate) fn drop_unauthorized_pending_spends(
     tx: &Transaction<'_>,
 ) -> Result<usize, WalletStorageError> {
-    let roots = unsigned_pending_spends(tx)?;
+    let mut roots = unsigned_pending_spends(tx)?;
+    roots.extend(dropped_before(tx)?);
     if roots.is_empty() {
         return Ok(0);
     }
@@ -625,10 +630,10 @@ pub(crate) fn drop_unauthorized_pending_spends(
                     released.push((op, row));
                 }
             }
-            drops.push((record.txid, deleted, released));
+            drops.push((record, deleted, released));
         }
-        for (txid, deleted, released) in &drops {
-            let txid: &[u8] = txid.as_ref();
+        for (record, deleted, released) in &drops {
+            let txid: &[u8] = record.txid.as_ref();
             let json = |rows: &[(Vec<u8>, String)]| {
                 format!(
                     "[{}]",
@@ -670,8 +675,12 @@ pub(crate) fn drop_unauthorized_pending_spends(
                 )?;
             }
         }
-        let dropped: HashSet<dashcore::Txid> = drops.iter().map(|(txid, _, _)| *txid).collect();
-        remember_dismissed(tx, &wallet_id, &dropped)?;
+        remember_dismissed(
+            tx,
+            &wallet_id,
+            drops.iter().map(|(record, _, _)| &record.txid),
+        )?;
+        settle_what_the_dropped_sent(tx, &wallet_id, drops.iter().map(|(record, _, _)| *record))?;
         count += drops.len();
     }
     if count > 0 {
@@ -682,6 +691,68 @@ pub(crate) fn drop_unauthorized_pending_spends(
         );
     }
     Ok(count)
+}
+
+/// What a sweep that removes the wallet's `dropped` transactions does beyond
+/// the core rows: an asset lock one of them funds is no longer tracked, and
+/// a DashPay payment one of them sent, pending or confirmed, reads as failed.
+fn settle_what_the_dropped_sent<'r>(
+    tx: &Transaction<'_>,
+    wallet_id: &WalletId,
+    dropped: impl IntoIterator<Item = &'r TransactionRecord>,
+) -> Result<(), WalletStorageError> {
+    use platform_wallet::changeset::IdentityEntry;
+    use platform_wallet::wallet::identity::{PaymentDirection, PaymentEntry, PaymentStatus};
+
+    let mut untrack = tx.prepare_cached(
+        "DELETE FROM asset_locks WHERE wallet_id = ?1 AND outpoint = ?2 AND status != 'consumed'",
+    )?;
+    let mut sent = HashSet::new();
+    for record in dropped {
+        for vout in 0..record.transaction.output.len() {
+            let Ok(vout) = u32::try_from(vout) else {
+                break;
+            };
+            let op = blob::encode_outpoint(&dashcore::OutPoint {
+                txid: record.txid,
+                vout,
+            })?;
+            untrack.execute(params![wallet_id.as_slice(), &op[..]])?;
+        }
+        sent.insert(record.txid.to_string());
+    }
+
+    let mut failed: BTreeMap<dpp::prelude::Identifier, BTreeMap<String, PaymentEntry>> =
+        BTreeMap::new();
+    {
+        let mut stmt = tx.prepare_cached(
+            "SELECT length(entry_blob), entry_blob FROM identities WHERE wallet_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![wallet_id.as_slice()])?;
+        while let Some(row) = rows.next()? {
+            blob::check_size(row.get(0)?)?;
+            let Ok(entry) = blob::decode::<IdentityEntry>(&row.get::<_, Vec<u8>>(1)?) else {
+                continue;
+            };
+            for (txid, payment) in &entry.dashpay_payments {
+                if sent.contains(txid)
+                    && payment.direction == PaymentDirection::Sent
+                    && matches!(
+                        payment.status,
+                        PaymentStatus::Pending | PaymentStatus::Confirmed
+                    )
+                {
+                    let mut payment = payment.clone();
+                    payment.status = PaymentStatus::Failed;
+                    failed
+                        .entry(entry.id)
+                        .or_default()
+                        .insert(txid.clone(), payment);
+                }
+            }
+        }
+    }
+    crate::sqlite::schema::dashpay::apply(tx, wallet_id, None, Some(&failed))
 }
 
 /// The unconfirmed transactions, neither mined nor verified-locked, that one
@@ -752,6 +823,24 @@ fn unsigned_pending_spends(
     Ok(unsigned)
 }
 
+/// Every transaction a repair already dropped, in any wallet: a store an
+/// earlier build repaired keeps what still spends one, or holds it in
+/// another wallet.
+fn dropped_before(tx: &Transaction<'_>) -> Result<BTreeSet<dashcore::Txid>, WalletStorageError> {
+    use dashcore::hashes::Hash;
+
+    let mut stmt = tx.prepare_cached("SELECT DISTINCT txid FROM core_dropped_unsigned_spends")?;
+    let mut rows = stmt.query([])?;
+    let mut txids = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        let txid: Vec<u8> = row.get(0)?;
+        if let Ok(txid) = <[u8; 32]>::try_from(txid.as_slice()) {
+            txids.insert(dashcore::Txid::from_byte_array(txid));
+        }
+    }
+    Ok(txids)
+}
+
 /// A stored record, the wallet that holds it, and whether its row is mined.
 type StoredRecord = (WalletId, bool, TransactionRecord);
 
@@ -783,9 +872,10 @@ fn stored_records(
 }
 
 /// `root` and every stored transaction that spends an output of it, or of
-/// one of those, in any wallet; `None` when one of them is mined,
-/// verified-locked or has an output a sweep holds for its winner, or a
-/// wallet that recorded one has a row that cannot be read.
+/// one of those, in any wallet; `None` when one of them is mined or
+/// verified-locked in any wallet, even one without its record, or has an
+/// output a sweep holds for its winner, or a wallet that recorded one has a
+/// row that cannot be read.
 fn dead_chain(
     tx: &Transaction<'_>,
     records: &[StoredRecord],
@@ -795,6 +885,9 @@ fn dead_chain(
     let mut chain = BTreeSet::from([root]);
     let mut queue = vec![root];
     while let Some(txid) = queue.pop() {
+        if settled_in_any_wallet(tx, &txid)? {
+            return Ok(None);
+        }
         for (wallet_id, mined, record) in records {
             if record.txid == txid {
                 if *mined
@@ -817,6 +910,19 @@ fn dead_chain(
         }
     }
     Ok(Some(chain))
+}
+
+/// Whether any wallet's store holds `txid` as mined, by a row with or
+/// without its record, or under a lock row stored as verified.
+fn settled_in_any_wallet(
+    tx: &Transaction<'_>,
+    txid: &dashcore::Txid,
+) -> Result<bool, WalletStorageError> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT 1 FROM core_transactions WHERE txid = ?1 AND height IS NOT NULL \
+         UNION ALL SELECT 1 FROM core_instant_locks WHERE txid = ?1 AND verified = 1",
+    )?;
+    Ok(stmt.exists(params![AsRef::<[u8]>::as_ref(txid)])?)
 }
 
 /// Whether a sweep holds one of `record`'s outputs in the wallet for the
@@ -2798,6 +2904,242 @@ mod tests {
             );
             assert_eq!(load_dismissed(&conn, &b).unwrap(), vec![claim.txid()]);
         }
+
+        /// Takes a store back to how a fork V3 build left it once its repair
+        /// dropped `claim` from wallet `w`: the claim kept in the recovery
+        /// record and gone from the wallet's history, `held` unspent again,
+        /// and nothing kept as dismissed.
+        fn as_fork_v3_repair_left_it(
+            conn: &rusqlite::Connection,
+            w: &[u8; 32],
+            claim: &Transaction,
+            held: &Utxo,
+        ) {
+            let txid = claim.txid();
+            let txid: &[u8] = txid.as_ref();
+            conn.execute(
+                "INSERT INTO core_dropped_unsigned_spends \
+                    (wallet_id, txid, record_blob, deleted_outputs, released_coins) \
+                 SELECT wallet_id, txid, record_blob, '[]', '[]' FROM core_transactions \
+                 WHERE wallet_id = ?1 AND txid = ?2",
+                params![&w[..], txid],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM core_transactions WHERE wallet_id = ?1 AND txid = ?2",
+                params![&w[..], txid],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE core_utxos SET spent = 0, spent_in_txid = NULL \
+                 WHERE wallet_id = ?1 AND outpoint = ?2",
+                params![&w[..], blob::encode_outpoint(&held.outpoint).unwrap()],
+            )
+            .unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM {} WHERE version >= 4;
+                 DROP TABLE core_dismissed_transactions;",
+                crate::sqlite::migrations::FORK_HISTORY_TABLE
+            ))
+            .unwrap();
+        }
+
+        /// A data root whose unsigned claim a fork V3 build already dropped
+        /// from the wallet whose coin it took, keeping the wallet's own
+        /// pending spend of the claim's change, and the claim in another
+        /// wallet it paid: the first open after the upgrade drops both, and
+        /// the coins they hold.
+        #[test]
+        fn what_an_earlier_repair_left_of_a_dropped_claim_goes_after_the_upgrade() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet.db");
+            let (a, b) = ([0xC4u8; 32], [0xC5u8; 32]);
+            let conn = wallet_db_in(rusqlite::Connection::open(&path).unwrap(), &b);
+            let mut conn = wallet_db_in(conn, &a);
+            let (held, change, claim) = claim_in_store(&mut conn, &a, 0x67, 0x99, pending);
+            let (child_change, child) = child_of(&change);
+            store_spend(
+                &mut conn,
+                &a,
+                &change,
+                &child_change,
+                &child,
+                TransactionContext::Mempool,
+            );
+            let paid = coin(
+                &owner(0x77),
+                OutPoint {
+                    txid: claim.txid(),
+                    vout: 0,
+                },
+                300_000,
+            );
+            store(
+                &mut conn,
+                &b,
+                &CoreChangeSet {
+                    records: vec![spend_record(claim.clone(), TransactionContext::Mempool)],
+                    new_utxos: vec![paid.clone()],
+                    ..Default::default()
+                },
+            );
+            as_fork_v3_repair_left_it(&conn, &a, &claim, &held);
+            assert_eq!(
+                unspent(&conn, &a),
+                sorted(vec![held.outpoint, child_change.outpoint])
+            );
+            assert_eq!(unspent(&conn, &b), vec![paid.outpoint]);
+            drop(conn);
+
+            open_store(&path);
+
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(unspent(&conn, &a), vec![held.outpoint]);
+            assert!(!has_record(&conn, &a, child.txid()));
+            assert_eq!(load_dismissed(&conn, &a).unwrap(), vec![child.txid()]);
+            assert_eq!(
+                kept(&conn, &a).iter().map(|k| k.0).collect::<Vec<_>>(),
+                vec![claim.txid(), child.txid()]
+            );
+            assert_eq!(unspent(&conn, &b), Vec::<OutPoint>::new());
+            assert!(!has_record(&conn, &b, claim.txid()));
+            assert_eq!(load_dismissed(&conn, &b).unwrap(), vec![claim.txid()]);
+            drop(conn);
+
+            open_store(&path);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(kept(&conn, &a).len(), 2, "a second open finds nothing");
+            assert_eq!(unspent(&conn, &a), vec![held.outpoint]);
+        }
+
+        /// A dropped spend that funded a tracked asset lock, or sent a DashPay
+        /// payment, leaves them as a sweep that removes it does: the lock no
+        /// longer tracked, the payment failed.
+        #[test]
+        fn a_dropped_spend_leaves_no_tracked_asset_lock_or_pending_payment() {
+            use dpp::prelude::Identifier;
+            use platform_wallet::changeset::IdentityEntry;
+            use platform_wallet::wallet::identity::{IdentityStatus, PaymentEntry, PaymentStatus};
+
+            let w = [0xC8u8; 32];
+            let (mut conn, _, change, _) = old_build_store(&w, 0x99, pending);
+            let (child_change, child) = child_of(&change);
+            store_spend(
+                &mut conn,
+                &w,
+                &change,
+                &child_change,
+                &child,
+                TransactionContext::Mempool,
+            );
+            let funded = blob::encode_outpoint(&OutPoint {
+                txid: child.txid(),
+                vout: 0,
+            })
+            .unwrap();
+            conn.execute(
+                "INSERT INTO asset_locks (wallet_id, outpoint, status, account_index, \
+                    identity_index, amount_duffs, lifecycle_blob) \
+                 VALUES (?1, ?2, 'broadcast', 0, 0, 100000, x'00')",
+                params![&w[..], funded],
+            )
+            .unwrap();
+            let identity = [0xC9u8; 32];
+            let sent = child.txid().to_string();
+            let mut entry = IdentityEntry {
+                id: Identifier::from(identity),
+                balance: 0,
+                revision: 0,
+                identity_index: Some(0),
+                last_updated_balance_block_time: None,
+                last_synced_keys_block_time: None,
+                dpns_names: Vec::new(),
+                contested_dpns_names: Vec::new(),
+                status: IdentityStatus::Unknown,
+                wallet_id: Some(w),
+                dashpay_profile: None,
+                dashpay_payments: Default::default(),
+                contact_profiles: Default::default(),
+                ignored_senders: Default::default(),
+            };
+            entry.dashpay_payments.insert(
+                sent.clone(),
+                PaymentEntry::new_sent(Identifier::from([0xCA; 32]), 100_000, None),
+            );
+            conn.execute(
+                "INSERT INTO identities (identity_id, wallet_id, identity_index, entry_blob) \
+                 VALUES (?1, ?2, 0, ?3)",
+                params![&identity[..], &w[..], blob::encode(&entry).unwrap()],
+            )
+            .unwrap();
+
+            assert_eq!(repair(&mut conn), 2);
+            let tracked: i64 = conn
+                .query_row("SELECT COUNT(*) FROM asset_locks", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(tracked, 0, "the lock it funded is no longer tracked");
+            let stored: Vec<u8> = conn
+                .query_row(
+                    "SELECT entry_blob FROM identities WHERE identity_id = ?1",
+                    params![&identity[..]],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let stored: IdentityEntry = blob::decode(&stored).unwrap();
+            assert_eq!(stored.dashpay_payments[&sent].status, PaymentStatus::Failed);
+        }
+
+        /// Another wallet's word that a spend of an unsigned claim's change
+        /// is final, without a record of the spend (a mined row of its
+        /// height alone, or a lock stored as verified), shows the claim was
+        /// valid, so nothing is dropped.
+        #[test]
+        fn another_wallets_recordless_proof_of_a_final_spend_keeps_the_claim() {
+            for (byte, mined) in [(0xCBu8, true), (0xCC, false)] {
+                let (a, b) = ([byte; 32], [byte + 0x10; 32]);
+                let (mut conn, _, change, claim) =
+                    old_build_store_in(wallet_db_in(wallet_db(&b), &a), &a, 0x99, pending);
+                let (child_change, child) = child_of(&change);
+                store_spend(
+                    &mut conn,
+                    &a,
+                    &change,
+                    &child_change,
+                    &child,
+                    TransactionContext::Mempool,
+                );
+                let txid = child.txid();
+                let txid: &[u8] = txid.as_ref();
+                if mined {
+                    conn.execute(
+                        "INSERT INTO core_transactions (wallet_id, txid, height, finalized) \
+                         VALUES (?1, ?2, 95, 0)",
+                        params![&b[..], txid],
+                    )
+                    .unwrap();
+                } else {
+                    let lock = InstantLock {
+                        txid: child.txid(),
+                        ..InstantLock::default()
+                    };
+                    conn.execute(
+                        "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob, verified) \
+                         VALUES (?1, ?2, ?3, 1)",
+                        params![&b[..], txid, blob::encode(&lock).unwrap()],
+                    )
+                    .unwrap();
+                }
+
+                assert_eq!(repair(&mut conn), 0, "form {byte:#x}");
+                assert!(has_record(&conn, &a, claim.txid()), "form {byte:#x}");
+                assert!(has_record(&conn, &a, child.txid()), "form {byte:#x}");
+                assert_eq!(
+                    unspent(&conn, &a),
+                    vec![child_change.outpoint],
+                    "form {byte:#x}"
+                );
+            }
+        }
     }
 
     fn wallet_db(w: &[u8; 32]) -> rusqlite::Connection {
@@ -2861,6 +3203,39 @@ mod tests {
         let dismissed = load_dismissed(&conn, &w).unwrap();
         assert_eq!(dismissed.len(), kept as usize);
         assert!(!dismissed.contains(&txid(2)), "the oldest goes first");
+    }
+
+    /// One flush that dismisses more transactions than are kept keeps the
+    /// newest of them, in the order it dismissed them.
+    #[test]
+    fn one_flush_past_the_cap_keeps_its_newest_dismissals_in_order() {
+        use platform_wallet::changeset::changeset::SweepBatch;
+        let w = [0xB2u8; 32];
+        let mut conn = wallet_db(&w);
+        let txid = |n: u16| {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&n.to_le_bytes());
+            Txid::from_byte_array(bytes)
+        };
+        let batch = |txids: std::ops::RangeInclusive<u16>| SweepBatch {
+            txids: txids.map(txid).collect(),
+            superseded_by: Txid::from_byte_array([0xFF; 32]),
+            winner_mined_height: None,
+            released_outpoints: Vec::new(),
+        };
+        let kept = MAX_DISMISSED_KEPT as u16;
+        store(
+            &mut conn,
+            &w,
+            &CoreChangeSet {
+                sweeps: vec![batch(1..=kept / 2), batch(kept / 2 + 1..=kept + 1)],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            load_dismissed(&conn, &w).unwrap(),
+            (2..=kept + 1).map(txid).collect::<Vec<_>>()
+        );
     }
 
     /// A payment received, flushed, then its verified lock, flushed, then a
