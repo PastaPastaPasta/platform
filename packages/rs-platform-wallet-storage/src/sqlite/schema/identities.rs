@@ -394,7 +394,8 @@ pub fn load_state_with_ctx(
             return Err(WalletStorageError::IdentityEntryIdMismatch);
         }
         let ignored = ignored_by_owner.remove(&entry.id).unwrap_or_default();
-        let managed = managed_identity_from_entry(&entry, wallet_id, ignored);
+        let mut managed = managed_identity_from_entry(&entry, wallet_id, ignored);
+        confirmed_only_once_settled(conn, wallet_id, &mut managed)?;
         match entry.identity_index {
             Some(idx) => {
                 let entry_id = entry.id;
@@ -475,6 +476,35 @@ pub fn load_prekeyed(
         state.scan_states.insert(*wallet_id, scan_state);
     }
     Ok(state)
+}
+
+/// A sent payment stored as confirmed whose transaction the wallet's store
+/// holds neither mined nor under a lock stored as verified reads as pending,
+/// so the reconcile pass looks at it again: an older build stored such a
+/// status on the word of a lock that was never verified. An identity of no
+/// wallet has no store of transactions to check against and is left as is.
+fn confirmed_only_once_settled(
+    conn: &Connection,
+    wallet_id: &WalletId,
+    managed: &mut ManagedIdentity,
+) -> Result<(), WalletStorageError> {
+    use platform_wallet::wallet::identity::{PaymentDirection, PaymentStatus};
+
+    if wallet_id_to_param(wallet_id).is_none() {
+        return Ok(());
+    }
+    for (txid, entry) in managed.dashpay_payments_mut().iter_mut() {
+        if entry.direction != PaymentDirection::Sent || entry.status != PaymentStatus::Confirmed {
+            continue;
+        }
+        let Ok(txid) = txid.parse::<dashcore::Txid>() else {
+            continue;
+        };
+        if !crate::sqlite::schema::core_state::is_settled(conn, wallet_id, &txid)? {
+            entry.status = PaymentStatus::Pending;
+        }
+    }
+    Ok(())
 }
 
 /// Reconstruct a [`ManagedIdentity`] from a persisted [`IdentityEntry`]

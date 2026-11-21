@@ -77,65 +77,84 @@ fn loaded_status(
         .map(|entry| entry.status)
 }
 
+type Manager = Arc<
+    tokio::sync::RwLock<
+        platform_wallet::key_wallet_manager::WalletManager<platform_wallet::PlatformWalletInfo>,
+    >,
+>;
+
+/// A persister on `path` holding an identity with a sent payment under
+/// `txid` at `status`, written through the production writer and flushed,
+/// and the wallet manager that holds it.
+async fn session_with_sent_payment(
+    path: &std::path::Path,
+    txid: &str,
+    status: PaymentStatus,
+) -> (Manager, [u8; 32], Arc<SqlitePersister>) {
+    let (wallet_manager, wallet_id, _generation, _signer) =
+        funded_wallet_manager(StandardAccountType::BIP44Account).await;
+    let persister =
+        Arc::new(SqlitePersister::open(SqlitePersisterConfig::new(path)).expect("open persister"));
+    ensure_wallet_meta(&persister, &wallet_id);
+    let mut meta = PlatformWalletChangeSet::default();
+    meta.wallet_metadata = Some(WalletMetadataEntry {
+        network: key_wallet::Network::Testnet,
+        wallet_group_id: wallet_id,
+        birth_height: 0,
+    });
+    persister.store(wallet_id, meta).expect("store metadata");
+
+    let wallet_persister = WalletPersister::new(
+        wallet_id,
+        Arc::clone(&persister) as Arc<dyn PlatformWalletPersistence>,
+    );
+    {
+        let mut wm = wallet_manager.write().await;
+        let info = wm.get_wallet_info_mut(&wallet_id).expect("wallet info");
+        info.identity_manager
+            .add_identity(
+                Identity::V0(IdentityV0 {
+                    id: Identifier::from(OWNER),
+                    public_keys: BTreeMap::new(),
+                    balance: 0,
+                    revision: 0,
+                }),
+                0,
+                wallet_id,
+                &wallet_persister,
+            )
+            .expect("add owner identity");
+        info.identity_manager
+            .managed_identity_mut(&Identifier::from(OWNER))
+            .expect("managed identity")
+            .record_dashpay_payment(
+                txid.to_string(),
+                PaymentEntry {
+                    status,
+                    ..PaymentEntry::new_sent(
+                        Identifier::from(CONTACT),
+                        50_000,
+                        Some("lunch".into()),
+                    )
+                },
+                &wallet_persister,
+            )
+            .expect("record the payment");
+    }
+    persister.flush(wallet_id).expect("flush the payment");
+    (wallet_manager, wallet_id, persister)
+}
+
 #[tokio::test]
 async fn a_swept_sent_payments_failed_verdict_survives_a_reopen() {
     let tmp = secure_tempdir().expect("tempdir");
     let path = tmp.path().join("wallet.db");
     let txid = loser_txid().to_string();
 
-    let (wallet_manager, wallet_id, _generation, _signer) =
-        funded_wallet_manager(StandardAccountType::BIP44Account).await;
-
     // ── Session one: an identity with a Pending sent payment, on disk. ──
+    let (wallet_manager, wallet_id, persister) =
+        session_with_sent_payment(&path, &txid, PaymentStatus::Pending).await;
     {
-        let persister = Arc::new(
-            SqlitePersister::open(SqlitePersisterConfig::new(&path)).expect("open persister"),
-        );
-        ensure_wallet_meta(&persister, &wallet_id);
-        let mut meta = PlatformWalletChangeSet::default();
-        meta.wallet_metadata = Some(WalletMetadataEntry {
-            network: key_wallet::Network::Testnet,
-            wallet_group_id: wallet_id,
-            birth_height: 0,
-        });
-        persister.store(wallet_id, meta).expect("store metadata");
-
-        let wallet_persister = WalletPersister::new(
-            wallet_id,
-            Arc::clone(&persister) as Arc<dyn PlatformWalletPersistence>,
-        );
-        {
-            let mut wm = wallet_manager.write().await;
-            let info = wm.get_wallet_info_mut(&wallet_id).expect("wallet info");
-            info.identity_manager
-                .add_identity(
-                    Identity::V0(IdentityV0 {
-                        id: Identifier::from(OWNER),
-                        public_keys: BTreeMap::new(),
-                        balance: 0,
-                        revision: 0,
-                    }),
-                    0,
-                    wallet_id,
-                    &wallet_persister,
-                )
-                .expect("add owner identity");
-            // Seeded through the production writer, so the on-disk identity
-            // blob genuinely holds `Pending` before the sweep — the state the
-            // restart must NOT resurrect.
-            info.identity_manager
-                .managed_identity_mut(&Identifier::from(OWNER))
-                .expect("managed identity")
-                .record_dashpay_payment(
-                    txid.clone(),
-                    PaymentEntry::new_sent(Identifier::from(CONTACT), 50_000, Some("lunch".into())),
-                    &wallet_persister,
-                )
-                .expect("record the pending payment");
-        }
-        persister.flush(wallet_id).expect("flush session one");
-        drop(wallet_persister);
-
         // ── The sweep, through the real adapter. ──
         //
         // Buffered before the adapter starts and the sender dropped straight
@@ -205,5 +224,44 @@ async fn a_swept_sent_payments_failed_verdict_survives_a_reopen() {
          `dashpay_payments_overlay` — a table `load()` never reads — while \
          the authoritative identity blob kept the pre-sweep status, and the \
          swept transaction is gone with nothing able to re-derive it."
+    );
+}
+
+/// A sent payment stored as confirmed reads as pending after a reopen until
+/// the store holds its transaction under a verified lock: an older build
+/// stored that status on the word of a lock that was never verified.
+#[tokio::test]
+async fn a_confirmed_sent_payment_counts_only_a_settled_transaction() {
+    let tmp = secure_tempdir().expect("tempdir");
+    let path = tmp.path().join("wallet.db");
+    let txid = loser_txid().to_string();
+    let (_wallet_manager, wallet_id, persister) =
+        session_with_sent_payment(&path, &txid, PaymentStatus::Confirmed).await;
+    drop(persister);
+
+    let reopened =
+        SqlitePersister::open(SqlitePersisterConfig::new(&path)).expect("reopen persister");
+    assert_eq!(
+        loaded_status(&reopened, &wallet_id, &txid),
+        Some(PaymentStatus::Pending)
+    );
+
+    let mut core = platform_wallet::changeset::CoreChangeSet::default();
+    core.instant_locks_for_non_final_records.insert(
+        loser_txid(),
+        dashcore::InstantLock {
+            txid: loser_txid(),
+            ..Default::default()
+        },
+    );
+    let mut cs = PlatformWalletChangeSet::default();
+    cs.core = Some(core);
+    reopened
+        .store(wallet_id, cs)
+        .expect("store the verified lock");
+    reopened.flush(wallet_id).expect("flush the verified lock");
+    assert_eq!(
+        loaded_status(&reopened, &wallet_id, &txid),
+        Some(PaymentStatus::Confirmed)
     );
 }

@@ -1751,6 +1751,23 @@ fn verified_instant_lock(
     verified_lock_of_row(txid, &blob_bytes)
 }
 
+/// Whether the wallet's store holds `txid` as mined, or under a lock stored
+/// as verified.
+pub(crate) fn is_settled(
+    conn: &Connection,
+    wallet_id: &WalletId,
+    txid: &dashcore::Txid,
+) -> Result<bool, WalletStorageError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT 1 FROM core_transactions \
+         WHERE wallet_id = ?1 AND txid = ?2 AND height IS NOT NULL",
+    )?;
+    if stmt.exists(params![wallet_id.as_slice(), AsRef::<[u8]>::as_ref(txid)])? {
+        return Ok(true);
+    }
+    Ok(verified_instant_lock(conn, wallet_id, txid)?.is_some())
+}
+
 /// Diagnose typed txid/height columns that disagree with the authoritative blob.
 fn ensure_transaction_record_matches_columns(
     typed_txid: &dashcore::Txid,

@@ -257,3 +257,19 @@ pub fn store_and_flush(
     persister.store(wallet_id, cs).expect("store");
     persister.flush(wallet_id).expect("flush");
 }
+
+/// What a live build stores with an InstantSend-locked asset lock: a lock
+/// stored as verified for each of `txids`.
+pub fn verified_locks(txids: &[dashcore::Txid]) -> platform_wallet::changeset::CoreChangeSet {
+    let mut core = platform_wallet::changeset::CoreChangeSet::default();
+    for txid in txids {
+        core.instant_locks_for_non_final_records.insert(
+            *txid,
+            dashcore::InstantLock {
+                txid: *txid,
+                ..Default::default()
+            },
+        );
+    }
+    core
+}

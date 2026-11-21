@@ -241,6 +241,24 @@ fn status_str(s: &AssetLockStatus) -> &'static str {
     }
 }
 
+/// An InstantSend-locked asset lock whose transaction the store holds
+/// neither mined nor under a lock stored as verified reads as broadcast,
+/// without the proof it cached: an older build stored such a status on the
+/// word of a lock that was never verified.
+fn unless_lock_verified(
+    conn: &Connection,
+    wallet_id: &WalletId,
+    tracked: &mut TrackedAssetLock,
+) -> Result<(), WalletStorageError> {
+    if tracked.status == AssetLockStatus::InstantSendLocked
+        && !crate::sqlite::schema::core_state::is_settled(conn, wallet_id, &tracked.out_point.txid)?
+    {
+        tracked.status = AssetLockStatus::Broadcast;
+        tracked.proof = None;
+    }
+    Ok(())
+}
+
 /// Per-wallet asset-lock slice as returned by the readers — outer-keyed
 /// by `account_index`, inner-keyed by outpoint.
 pub type AssetLocksByAccount = BTreeMap<u32, BTreeMap<OutPoint, TrackedAssetLock>>;
@@ -362,7 +380,8 @@ pub fn status_of(
     blob::check_size(row.get::<_, i64>(3)?)?;
     let blob_bytes: Vec<u8> = row.get(4)?;
     let status: String = row.get(5)?;
-    let (_, _, tracked) = decode_row(&op_bytes, account_index, &blob_bytes, &status, ctx)?;
+    let (_, _, mut tracked) = decode_row(&op_bytes, account_index, &blob_bytes, &status, ctx)?;
+    unless_lock_verified(conn, wallet_id, &mut tracked)?;
     Ok(Some(tracked.status))
 }
 
@@ -391,11 +410,12 @@ pub fn load_unconsumed(
         blob::check_size(row.get::<_, i64>(3)?)?;
         let blob_bytes: Vec<u8> = row.get(4)?;
         let status: String = row.get(5)?;
-        let (acct, outpoint, tracked) =
+        let (acct, outpoint, mut tracked) =
             decode_row(&op_bytes, account_index, &blob_bytes, &status, ctx)?;
         if tracked.status == AssetLockStatus::Consumed {
             continue;
         }
+        unless_lock_verified(conn, wallet_id, &mut tracked)?;
         out.entry(acct).or_default().insert(outpoint, tracked);
     }
     Ok(out)
@@ -495,6 +515,82 @@ mod tests {
                 proof: tracked.proof,
             })
             .expect("stored asset lock must load back")
+    }
+
+    /// An InstantSend-locked asset lock reads as broadcast, without its
+    /// proof, until the store holds its transaction under a lock stored as
+    /// verified or mined.
+    #[test]
+    fn an_instant_send_locked_asset_lock_counts_only_a_verified_lock() {
+        use dpp::identity::state_transition::asset_lock_proof::instant::InstantAssetLockProof;
+        let w = [0xABu8; 32];
+        let mut conn = migrated_conn();
+        conn.execute(
+            "INSERT INTO wallets (wallet_id, network, birth_height) VALUES (?1, 'testnet', 0)",
+            params![&w[..]],
+        )
+        .unwrap();
+        let op = sample_outpoint(0x33);
+        let txid: &[u8] = op.txid.as_ref();
+        let proof = AssetLockProof::Instant(InstantAssetLockProof::default());
+        let mut cs = AssetLockChangeSet::default();
+        cs.asset_locks.insert(
+            op,
+            entry_with_proof(op, AssetLockStatus::InstantSendLocked, Some(proof.clone())),
+        );
+        {
+            let tx = conn.transaction().unwrap();
+            apply(&tx, &w, &cs).unwrap();
+            tx.commit().unwrap();
+        }
+        let read = |conn: &Connection| {
+            let tracked = load_unconsumed(conn, &w, &LoadCtx::strict())
+                .unwrap()
+                .remove(&0)
+                .and_then(|mut by_op| by_op.remove(&op))
+                .unwrap();
+            assert_eq!(
+                status_of(conn, &w, &op, &LoadCtx::strict()).unwrap(),
+                Some(tracked.status.clone())
+            );
+            (tracked.status, tracked.proof)
+        };
+        assert_eq!(read(&conn), (AssetLockStatus::Broadcast, None));
+
+        let lock = dashcore::InstantLock {
+            txid: op.txid,
+            ..Default::default()
+        };
+        conn.execute(
+            "INSERT INTO core_instant_locks (wallet_id, txid, islock_blob, verified) \
+             VALUES (?1, ?2, ?3, 0)",
+            params![&w[..], txid, blob::encode(&lock).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            read(&conn),
+            (AssetLockStatus::Broadcast, None),
+            "unverified"
+        );
+        conn.execute("UPDATE core_instant_locks SET verified = 1", [])
+            .unwrap();
+        assert_eq!(
+            read(&conn),
+            (AssetLockStatus::InstantSendLocked, Some(proof.clone()))
+        );
+
+        conn.execute("DELETE FROM core_instant_locks", []).unwrap();
+        conn.execute(
+            "INSERT INTO core_transactions \
+                (wallet_id, txid, height, block_hash, block_time, finalized, record_blob) \
+             VALUES (?1, ?2, 120, NULL, NULL, 0, NULL)",
+            params![&w[..], txid],
+        )
+        .unwrap();
+        assert_eq!(
+            read(&conn),
+            (AssetLockStatus::InstantSendLocked, Some(proof))
+        );
     }
 
     /// Repro for #4133: a `proof: Some(AssetLockProof::Chain(..))` row must

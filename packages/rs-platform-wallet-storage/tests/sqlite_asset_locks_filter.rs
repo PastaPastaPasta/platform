@@ -167,6 +167,7 @@ fn asset_lock_status_reads_consumed_rows_after_reopen() {
             w,
             platform_wallet::changeset::PlatformWalletChangeSet {
                 asset_locks: Some(cs),
+                core: Some(common::verified_locks(&[live.txid])),
                 ..Default::default()
             },
         )
@@ -277,6 +278,7 @@ fn should_not_see_a_buffered_lock_until_its_flush() {
             w,
             platform_wallet::changeset::PlatformWalletChangeSet {
                 asset_locks: Some(cs),
+                core: Some(common::verified_locks(&[buffered.txid])),
                 ..Default::default()
             },
         )

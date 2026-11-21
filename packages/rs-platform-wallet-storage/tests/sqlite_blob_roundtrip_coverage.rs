@@ -106,6 +106,7 @@ fn proof_bearing_asset_locks_round_trip_through_persister() {
             w,
             PlatformWalletChangeSet {
                 asset_locks: Some(cs),
+                core: Some(common::verified_locks(&[op_instant.txid])),
                 ..Default::default()
             },
         )
