@@ -194,6 +194,10 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.dismiss(txid)
     }
 
+    fn undismiss(&mut self, txid: &Txid) {
+        self.core_wallet.undismiss(txid)
+    }
+
     // Delegate the chain-lock methods to the inner `ManagedWalletInfo`.
     //
     // Without these delegations, `WalletInfoInterface`'s default impls
@@ -404,6 +408,8 @@ mod tests {
         let child = Txid::from_byte_array([0x08; 32]);
         info.dismiss(child);
         assert!(info.core_wallet.is_dismissed(&child));
+        info.undismiss(&child);
+        assert!(!info.core_wallet.is_dismissed(&child));
     }
 
     /// dash-spv notes a chain-lock height during the initial sync, before a

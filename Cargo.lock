@@ -1820,7 +1820,7 @@ dependencies = [
 [[package]]
 name = "dash-network"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "cbindgen 0.29.4",
  "grovedb-bincode",
@@ -1831,7 +1831,7 @@ dependencies = [
 [[package]]
 name = "dash-network-seeds"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "dash-network",
 ]
@@ -1963,7 +1963,7 @@ dependencies = [
 [[package]]
 name = "dash-spv"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2019,7 +2019,7 @@ dependencies = [
 [[package]]
 name = "dashcore"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2044,7 +2044,7 @@ dependencies = [
 [[package]]
 name = "dashcore-crypto"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "base58ck 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitcoin-crypto",
@@ -2065,12 +2065,12 @@ dependencies = [
 [[package]]
 name = "dashcore-private"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 
 [[package]]
 name = "dashcore-rpc"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "dashcore-rpc-json",
  "hex-conservative 1.3.0",
@@ -2083,7 +2083,7 @@ dependencies = [
 [[package]]
 name = "dashcore-rpc-json"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "dashcore",
  "grovedb-bincode",
@@ -2098,7 +2098,7 @@ dependencies = [
 [[package]]
 name = "dashcore_hashes"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "bitcoin_hashes 0.14.101",
  "grovedb-bincode",
@@ -3184,7 +3184,7 @@ dependencies = [
 [[package]]
 name = "git-state"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 
 [[package]]
 name = "glob"
@@ -4424,7 +4424,7 @@ dependencies = [
 [[package]]
 name = "key-wallet"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "async-trait",
  "bip39",
@@ -4447,7 +4447,7 @@ dependencies = [
 [[package]]
 name = "key-wallet-ffi"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "cbindgen 0.29.4",
  "dash-network",
@@ -4463,7 +4463,7 @@ dependencies = [
 [[package]]
 name = "key-wallet-manager"
 version = "0.45.0"
-source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=3a6fe030e5459cc5377d892c1335e802fd20b05c#3a6fe030e5459cc5377d892c1335e802fd20b05c"
+source = "git+https://github.com/PastaPastaPasta/rust-dashcore?rev=d16a508d037aab9dd0ce7aee68bc430711d63e08#d16a508d037aab9dd0ce7aee68bc430711d63e08"
 dependencies = [
  "async-trait",
  "dashcore",
