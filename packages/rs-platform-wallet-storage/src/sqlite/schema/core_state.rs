@@ -337,6 +337,11 @@ pub fn apply(
                 batch.winner_mined_height,
             )?;
         }
+        // A mined winner's holds are claims a later batch's release must
+        // see, so the claims are read again after it.
+        if batch.winner_mined_height.is_some() {
+            stored_claims = None;
+        }
         // Releases are outpoint-keyed facts, so they are applied by outpoint
         // once the batch's losers are done — not only through each loser's
         // decoded inputs above. A chained-sweep claim is a `core_utxos`
@@ -1224,9 +1229,13 @@ fn apply_sweep(
     // that height still proves the funding was delivered or never will be.
     // Materialised rows take the stamp too, outside the collector's reach:
     // it is what `surviving_stored_input_claims` keeps a held coin spent by.
-    // A freed row loses it.
+    // A freed row loses it. A sweep with no mined winner leaves a stamped
+    // hold attributed to the mined winner it was held for.
     let mut spend_stmt = tx.prepare_cached(
-        "UPDATE core_utxos SET spent = ?3, spent_in_txid = ?4, \
+        "UPDATE core_utxos SET spent = ?3, \
+            spent_in_txid = CASE \
+                WHEN ?3 AND ?5 IS NULL AND winner_mined_height IS NOT NULL THEN spent_in_txid \
+                ELSE ?4 END, \
             winner_mined_height = CASE \
                 WHEN ?3 THEN COALESCE(?5, winner_mined_height) ELSE NULL END \
          WHERE wallet_id = ?1 AND outpoint = ?2",

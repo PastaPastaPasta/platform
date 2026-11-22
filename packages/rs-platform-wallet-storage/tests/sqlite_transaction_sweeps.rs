@@ -3494,6 +3494,11 @@ fn a_materialised_coin_the_wallet_re_delivers_unspent_is_released_from_its_hold(
         "a materialised coin follows the wallet: the hold must not survive \
          the wallet handing the coin back"
     );
+    assert_eq!(
+        utxo_row_state(&conn, &w, &x),
+        Some((false, false, None)),
+        "and its stamp is cleared"
+    );
     let link: Option<Vec<u8>> = {
         let bytes = blob::encode_outpoint(&x).unwrap();
         conn.query_row(
@@ -3964,4 +3969,226 @@ fn should_remove_a_swept_height_only_transaction_and_its_outputs() {
         )
         .unwrap();
     assert_eq!(count, 0);
+}
+
+fn apply_round(conn: &mut rusqlite::Connection, w: &WalletId, cs: CoreChangeSet) {
+    let tx = conn.transaction().unwrap();
+    core_state::apply(&tx, w, &cs).unwrap();
+    tx.commit().unwrap();
+}
+
+fn spent_in(conn: &rusqlite::Connection, w: &WalletId, op: &OutPoint) -> Option<Txid> {
+    let bytes = blob::encode_outpoint(op).unwrap();
+    let link: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT spent_in_txid FROM core_utxos WHERE wallet_id = ?1 AND outpoint = ?2",
+            params![w.as_slice(), &bytes[..]],
+            |row| row.get(0),
+        )
+        .unwrap();
+    link.map(|bytes| Txid::from_byte_array(bytes.try_into().unwrap()))
+}
+
+/// One round, three batches: the first releases another coin, so the
+/// stored claims are read; the second holds A for a mined winner the store
+/// never saw; the third, an abandon of another claimant of A, releases it.
+/// The hold the second batch made is a claim the third must see.
+#[test]
+fn a_release_later_in_the_round_than_a_mined_winners_hold_is_refused() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w: WalletId = wid(0x3A);
+    ensure_wallet_meta(&persister, &w);
+    let addr = p2pkh(0x3A);
+    let funding = Txid::from_byte_array([0x30; 32]);
+    let (a, c) = (OutPoint::new(funding, 0), OutPoint::new(funding, 1));
+    let [payment, other, spender_of_c, winner, rival] =
+        [0x31, 0x32, 0x33, 0x34, 0x35].map(|b| Txid::from_byte_array([b; 32]));
+
+    let mut conn = persister.lock_conn_for_test();
+    derive_address(&conn, &w, 0, &addr);
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            new_utxos: vec![
+                make_utxo(&addr, funding, 0, 400),
+                make_utxo(&addr, funding, 1, 600),
+            ],
+            ..Default::default()
+        },
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            records: vec![
+                tx_record(payment, vec![a], Vec::new()),
+                tx_record(other, vec![a], Vec::new()),
+                tx_record(spender_of_c, vec![c], Vec::new()),
+            ],
+            spent_utxos: vec![
+                make_utxo(&addr, funding, 0, 400),
+                make_utxo(&addr, funding, 1, 600),
+            ],
+            ..Default::default()
+        },
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            sweeps: vec![
+                SweepBatch {
+                    txids: vec![spender_of_c],
+                    superseded_by: rival,
+                    winner_mined_height: None,
+                    released_outpoints: vec![c],
+                },
+                SweepBatch {
+                    txids: vec![payment],
+                    superseded_by: winner,
+                    winner_mined_height: Some(WINNER_HEIGHT),
+                    released_outpoints: Vec::new(),
+                },
+                SweepBatch {
+                    txids: vec![other],
+                    superseded_by: other,
+                    winner_mined_height: None,
+                    released_outpoints: vec![a],
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    assert!(unspent(&conn, &w).contains(&c), "sanity: C is released");
+    assert!(
+        !unspent(&conn, &w).contains(&a),
+        "A stays held for the winner"
+    );
+}
+
+/// A held for a mined winner the store never saw; an abandon of another
+/// claimant of A is refused, and must leave A attributed to the winner, not
+/// to the abandoned transaction: a later sweep naming that transaction
+/// again does not free A.
+#[test]
+fn an_abandon_refused_a_mined_winners_coin_leaves_the_hold_with_the_winner() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w: WalletId = wid(0x3B);
+    ensure_wallet_meta(&persister, &w);
+    let addr = p2pkh(0x3B);
+    let funding = Txid::from_byte_array([0x40; 32]);
+    let a = OutPoint::new(funding, 0);
+    let [payment, other, winner, later] =
+        [0x41, 0x42, 0x43, 0x44].map(|b| Txid::from_byte_array([b; 32]));
+
+    let mut conn = persister.lock_conn_for_test();
+    derive_address(&conn, &w, 0, &addr);
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            new_utxos: vec![make_utxo(&addr, funding, 0, 400)],
+            ..Default::default()
+        },
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            records: vec![
+                tx_record(payment, vec![a], Vec::new()),
+                tx_record(other, vec![a], Vec::new()),
+            ],
+            spent_utxos: vec![make_utxo(&addr, funding, 0, 400)],
+            ..Default::default()
+        },
+    );
+    let sweep = |txid, superseded_by, winner_mined_height, released_outpoints| CoreChangeSet {
+        sweeps: vec![SweepBatch {
+            txids: vec![txid],
+            superseded_by,
+            winner_mined_height,
+            released_outpoints,
+        }],
+        ..Default::default()
+    };
+    apply_round(
+        &mut conn,
+        &w,
+        sweep(payment, winner, Some(WINNER_HEIGHT), Vec::new()),
+    );
+    apply_round(&mut conn, &w, sweep(other, other, None, vec![a]));
+    assert!(!unspent(&conn, &w).contains(&a), "the abandon is refused");
+    assert_eq!(spent_in(&conn, &w, &a), Some(winner), "held for the winner");
+    apply_round(&mut conn, &w, sweep(other, later, None, vec![a]));
+    assert!(!unspent(&conn, &w).contains(&a), "A stays held");
+}
+
+/// A held for a mined winner before its funding output was ever seen: the
+/// placeholder materialises when the funding arrives, and an abandon of
+/// another claimant then still cannot free A.
+#[test]
+fn a_hold_made_before_the_funding_arrived_refuses_a_later_release() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w: WalletId = wid(0x3C);
+    ensure_wallet_meta(&persister, &w);
+    let addr = p2pkh(0x3C);
+    let funding = Txid::from_byte_array([0x50; 32]);
+    let a = OutPoint::new(funding, 0);
+    let [payment, other, winner] = [0x51, 0x52, 0x53].map(|b| Txid::from_byte_array([b; 32]));
+
+    let mut conn = persister.lock_conn_for_test();
+    derive_address(&conn, &w, 0, &addr);
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            records: vec![
+                tx_record(payment, vec![a], Vec::new()),
+                tx_record(other, vec![a], Vec::new()),
+            ],
+            ..Default::default()
+        },
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            sweeps: vec![SweepBatch {
+                txids: vec![payment],
+                superseded_by: winner,
+                winner_mined_height: Some(WINNER_HEIGHT),
+                released_outpoints: Vec::new(),
+            }],
+            ..Default::default()
+        },
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            new_utxos: vec![make_utxo(&addr, funding, 0, 400)],
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        utxo_row_state(&conn, &w, &a),
+        Some((true, false, Some(i64::from(WINNER_HEIGHT)))),
+        "sanity: materialised, held, stamped"
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            sweeps: vec![SweepBatch {
+                txids: vec![other],
+                superseded_by: other,
+                winner_mined_height: None,
+                released_outpoints: vec![a],
+            }],
+            ..Default::default()
+        },
+    );
+    assert!(!unspent(&conn, &w).contains(&a), "A stays held");
 }
