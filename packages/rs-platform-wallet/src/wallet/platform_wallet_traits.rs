@@ -190,8 +190,12 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.is_dismissed(txid)
     }
 
-    fn dismiss(&mut self, txid: Txid) {
-        self.core_wallet.dismiss(txid)
+    fn refetch_on_lock(&self, txid: &Txid) -> bool {
+        self.core_wallet.refetch_on_lock(txid)
+    }
+
+    fn dismiss_spend(&mut self, tx: &Transaction) -> bool {
+        self.core_wallet.dismiss_spend(tx)
     }
 
     fn undismiss(&mut self, txid: &Txid) {
@@ -405,11 +409,22 @@ mod tests {
         assert!(!info.is_dismissed(&txid));
         info.core_wallet.abandon_transaction(txid);
         assert!(info.is_dismissed(&txid));
-        let child = Txid::from_byte_array([0x08; 32]);
-        info.dismiss(child);
-        assert!(info.core_wallet.is_dismissed(&child));
-        info.undismiss(&child);
-        assert!(!info.core_wallet.is_dismissed(&child));
+        let child = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![dashcore::TxIn {
+                previous_output: dashcore::OutPoint::new(txid, 0),
+                ..Default::default()
+            }],
+            output: vec![],
+            special_transaction_payload: None,
+        };
+        assert!(info.dismiss_spend(&child));
+        assert!(info.core_wallet.is_dismissed(&child.txid()));
+        info.undismiss(&txid);
+        assert!(!info.core_wallet.is_dismissed(&child.txid()));
+        assert!(info.refetch_on_lock(&child.txid()));
+        assert!(info.core_wallet.refetch_on_lock(&child.txid()));
     }
 
     /// dash-spv notes a chain-lock height during the initial sync, before a
