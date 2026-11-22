@@ -645,6 +645,135 @@ fn a_release_naming_a_coin_a_stored_finalized_record_claims_is_refused() {
     );
 }
 
+/// Who holds a coin a sweep kept spent for its winner, when another claimant
+/// of it is abandoned later.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Holder {
+    Final,
+    Mempool,
+    SweptAlongside,
+}
+
+/// A loser P of coins A and B swept for a winner W that spends B: the
+/// sweep releases nothing, so A stays spent, held for W. Abandoning O,
+/// another claimant of A, then releases A. A network-final W that survives
+/// keeps A spent, across a restart too; a W only in the mempool, or swept in
+/// the same round, does not.
+fn another_claimant_goes(holder: Holder) {
+    use key_wallet::transaction_checking::transaction_context::BlockInfo;
+
+    let (persister, _tmp, path) = fresh_persister();
+    let w: WalletId = wid(0xEC);
+    ensure_wallet_meta(&persister, &w);
+
+    let addr = p2pkh(0x0C);
+    let funding_txid = Txid::from_byte_array([0xC0; 32]);
+    let (a, b) = (
+        OutPoint::new(funding_txid, 0),
+        OutPoint::new(funding_txid, 1),
+    );
+    let payment_txid = Txid::from_byte_array([0xC1; 32]);
+    let winner_txid = Txid::from_byte_array([0xC2; 32]);
+    let other_txid = Txid::from_byte_array([0xC3; 32]);
+    let rival_txid = Txid::from_byte_array([0xC4; 32]);
+
+    let mut winner = tx_record(winner_txid, vec![b], Vec::new());
+    if holder != Holder::Mempool {
+        winner.context = TransactionContext::InBlock(BlockInfo::new(
+            WINNER_HEIGHT,
+            dashcore::BlockHash::from_byte_array([0xC5; 32]),
+            1_735_689_600,
+        ));
+    }
+    let pay = |value| TxOut {
+        value,
+        script_pubkey: addr.script_pubkey(),
+    };
+    let payment = tx_record(payment_txid, vec![a, b], vec![pay(500)]);
+    let other = tx_record(other_txid, vec![a], vec![pay(300)]);
+
+    let mut conn = persister.lock_conn_for_test();
+    derive_address(&conn, &w, 0, &addr);
+    let mut apply = |cs: CoreChangeSet| {
+        let tx = conn.transaction().unwrap();
+        core_state::apply(&tx, &w, &cs).unwrap();
+        tx.commit().unwrap();
+    };
+    apply(CoreChangeSet {
+        new_utxos: vec![
+            make_utxo(&addr, funding_txid, 0, 400),
+            make_utxo(&addr, funding_txid, 1, 600),
+        ],
+        ..Default::default()
+    });
+    apply(CoreChangeSet {
+        records: vec![payment, other, winner],
+        spent_utxos: vec![
+            make_utxo(&addr, funding_txid, 0, 400),
+            make_utxo(&addr, funding_txid, 1, 600),
+        ],
+        ..Default::default()
+    });
+    apply(CoreChangeSet {
+        sweeps: vec![SweepBatch {
+            txids: vec![payment_txid],
+            superseded_by: winner_txid,
+            winner_mined_height: Some(WINNER_HEIGHT),
+            released_outpoints: Vec::new(),
+        }],
+        ..Default::default()
+    });
+    let mut sweeps = vec![SweepBatch {
+        txids: vec![other_txid],
+        superseded_by: other_txid,
+        winner_mined_height: None,
+        released_outpoints: vec![a],
+    }];
+    if holder == Holder::SweptAlongside {
+        sweeps.push(SweepBatch {
+            txids: vec![winner_txid],
+            superseded_by: rival_txid,
+            winner_mined_height: Some(WINNER_HEIGHT + 1),
+            released_outpoints: Vec::new(),
+        });
+    }
+    apply(CoreChangeSet {
+        sweeps,
+        ..Default::default()
+    });
+
+    let freed = holder != Holder::Final;
+    assert_eq!(unspent(&conn, &w).contains(&a), freed, "{holder:?}");
+    drop(conn);
+    drop(persister);
+    let persister = SqlitePersister::open(SqlitePersisterConfig::new(&path)).unwrap();
+    let conn = persister.lock_conn_for_test();
+    assert_eq!(
+        unspent(&conn, &w).contains(&a),
+        freed,
+        "{holder:?}, after a restart"
+    );
+    if holder != Holder::Mempool {
+        // An unsigned mempool W is dropped at the open, freeing B.
+        assert!(!unspent(&conn, &w).contains(&b), "B stays spent");
+    }
+}
+
+#[test]
+fn a_coin_a_sweep_held_for_a_final_winner_stays_spent_when_another_claimant_goes() {
+    another_claimant_goes(Holder::Final);
+}
+
+#[test]
+fn a_coin_a_sweep_held_for_a_mempool_winner_is_freed_when_another_claimant_goes() {
+    another_claimant_goes(Holder::Mempool);
+}
+
+#[test]
+fn a_coin_a_sweep_held_for_a_winner_swept_in_the_round_is_freed() {
+    another_claimant_goes(Holder::SweptAlongside);
+}
+
 /// The stored-claims veto is settled-evidence only: a bare mempool row must
 /// not outrank an authoritative release. A mempool record is the one context
 /// that can go stale forever — an evicted or abandoned mempool transaction

@@ -490,6 +490,13 @@ pub fn load_dismissed(
 /// when the pending spend confirms or dies, and strictly better than a
 /// permanent strand.
 ///
+/// A coin a sweep held for a surviving network-final winner counts as
+/// claimed too: [`apply_sweep`] attributes each input it did not release to
+/// that winner (`spent_in_txid`), and the sweep may have held it for a spend
+/// that leaves no other trace here, such as one in a block the wallet never
+/// recorded, whose observation upstream drops at its ChainLock. A later
+/// release of that coin, by an abandon of another claimant, is then refused.
+///
 /// Fails CLOSED. This scan is the final guard against re-crediting a
 /// consumed coin, so a malformed stored key must fail the round rather than
 /// silently drop that row's veto: a `txid` column of the wrong length and a
@@ -517,6 +524,7 @@ fn surviving_stored_input_claims(
         tx.prepare_cached("SELECT txid, record_blob FROM core_transactions WHERE wallet_id = ?1 AND record_blob IS NOT NULL")?;
     let mut rows = stmt.query(params![wallet_id.as_slice()])?;
     let mut claims: HashSet<dashcore::OutPoint> = HashSet::new();
+    let mut finals: HashSet<dashcore::Txid> = HashSet::new();
     while let Some(row) = rows.next()? {
         let txid_bytes: Vec<u8> = row.get(0)?;
         let Ok(txid_array) = <[u8; 32]>::try_from(txid_bytes.as_slice()) else {
@@ -542,6 +550,7 @@ fn surviving_stored_input_claims(
         ) {
             continue;
         }
+        finals.insert(key_txid);
         claims.extend(
             record
                 .transaction
@@ -549,6 +558,24 @@ fn surviving_stored_input_claims(
                 .iter()
                 .map(|input| input.previous_output),
         );
+    }
+
+    let mut held_stmt = tx.prepare_cached(
+        "SELECT outpoint, spent_in_txid FROM core_utxos \
+         WHERE wallet_id = ?1 AND spent = 1 AND spent_in_txid IS NOT NULL",
+    )?;
+    let mut held_rows = held_stmt.query(params![wallet_id.as_slice()])?;
+    while let Some(row) = held_rows.next()? {
+        let holder: Vec<u8> = row.get(1)?;
+        let Ok(holder) = <[u8; 32]>::try_from(holder.as_slice()) else {
+            return Err(WalletStorageError::blob_decode(
+                "core_utxos.spent_in_txid must be exactly 32 bytes",
+            ));
+        };
+        if finals.contains(&dashcore::Txid::from_byte_array(holder)) {
+            let outpoint: Vec<u8> = row.get(0)?;
+            claims.insert(blob::decode_outpoint(&outpoint)?);
+        }
     }
     Ok(claims)
 }
