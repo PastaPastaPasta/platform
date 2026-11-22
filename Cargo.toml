@@ -65,7 +65,10 @@ grovedb-storage = { git = "https://github.com/dashpay/grovedb", rev = "9791d2772
 grovedb-version = { git = "https://github.com/dashpay/grovedb", rev = "9791d277207998b7789c85b0745e99d37040a12e" }
 grovedb-epoch-based-storage-flags = { git = "https://github.com/dashpay/grovedb", rev = "9791d277207998b7789c85b0745e99d37040a12e" }
 grovedb-commitment-tree = { git = "https://github.com/dashpay/grovedb", rev = "9791d277207998b7789c85b0745e99d37040a12e" }
-# rust-dashcore: PastaPastaPasta/rust-dashcore dw/rc-followup-1@13f3f27e71
+# rust-dashcore: PastaPastaPasta/rust-dashcore dw/rc-followup-1@652203a0e0
+# = dw/rc-followup-1@13f3f27e71 (below) + a lock on a payment the mempool manager holds
+#   fetches its released spends and re-checks its kept locked spends (652203a0e0).
+# dw/rc-followup-1@13f3f27e71
 # = dw/rc-followup-1@1a39959f77 (below) + a spend a lock or block releases from its dismissal
 #   is fetched again (13f3f27e71).
 # dw/rc-followup-1@1a39959f77
@@ -106,14 +109,14 @@ grovedb-commitment-tree = { git = "https://github.com/dashpay/grovedb", rev = "9
 # cherry-picked) merged with dw/0.2-swept-winner-block-hash@9359687d93
 # (+ `TransactionsSwept::winner_block`, the winner's block hash with its height); both on
 # dw/restore-utxos-626c91d1@55663e4352. Back to a dashpay/rust-dashcore revision at the next re-pin.
-dashcore = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-dash-network-seeds = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-dash-spv = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-key-wallet = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-key-wallet-ffi = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-key-wallet-manager = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-dash-network = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
-dashcore-rpc = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "13f3f27e711c9dadc1c8f99e316b8df250efa0fe" }
+dashcore = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+dash-network-seeds = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+dash-spv = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+key-wallet = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+key-wallet-ffi = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+key-wallet-manager = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+dash-network = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
+dashcore-rpc = { git = "https://github.com/PastaPastaPasta/rust-dashcore", rev = "652203a0e08d9a2b93782c57d39b7ccf76866062" }
 tokio-metrics = "0.5"
 
 # Size-tuned profile for the iOS `rs-unified-sdk-ffi` staticlib, which
