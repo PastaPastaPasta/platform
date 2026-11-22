@@ -240,8 +240,9 @@ pub fn apply(
         return Ok(());
     }
 
-    // The surviving claims are a property of the whole changeset, not of any
-    // one batch, so they are built once: the adapter folds up to a full drain
+    // The changeset's surviving claims are a property of the whole changeset,
+    // not of any one batch, so they are built once (the stored claims below
+    // are read again after a batch with a mined winner): the adapter folds up to a full drain
     // into a single store, and rebuilding them per batch would re-hash every
     // swept txid and every surviving record input once per sweep, with the
     // write transaction open the whole time.
@@ -301,10 +302,12 @@ pub fn apply(
     //
     // `stored_input_claims` is therefore upstream's own `retain_unclaimed`
     // predicate — "drop outpoints some surviving record still spends" —
-    // re-evaluated against the unpruned history. Built lazily and at most
-    // once per round: only a batch whose released set survives the
-    // in-round filter above pays for it, and the common sweep (a resend
-    // whose winner spends every input its loser did) releases nothing.
+    // re-evaluated against the unpruned history. Built lazily, and read
+    // again after each batch with a mined winner, whose holds are claims a
+    // later batch's release must see: only a batch whose released set
+    // survives the in-round filter above pays for it, and the common sweep
+    // (a resend whose winner spends every input its loser did) releases
+    // nothing.
     let mut stored_claims: Option<HashSet<dashcore::OutPoint>> = None;
     for batch in &cs.sweeps {
         // Only this stays per batch: a release is true of the wallet its own
@@ -1230,11 +1233,13 @@ fn apply_sweep(
     // Materialised rows take the stamp too, outside the collector's reach:
     // it is what `surviving_stored_input_claims` keeps a held coin spent by.
     // A freed row loses it. A sweep with no mined winner leaves a stamped
-    // hold attributed to the mined winner it was held for.
+    // hold attributed to the mined winner it was held for, while that winner
+    // is still named and is not the loser this sweep removes.
     let mut spend_stmt = tx.prepare_cached(
         "UPDATE core_utxos SET spent = ?3, \
             spent_in_txid = CASE \
-                WHEN ?3 AND ?5 IS NULL AND winner_mined_height IS NOT NULL THEN spent_in_txid \
+                WHEN ?3 AND ?5 IS NULL AND winner_mined_height IS NOT NULL \
+                    AND spent_in_txid IS NOT NULL AND spent_in_txid IS NOT ?6 THEN spent_in_txid \
                 ELSE ?4 END, \
             winner_mined_height = CASE \
                 WHEN ?3 THEN COALESCE(?5, winner_mined_height) ELSE NULL END \
@@ -1301,7 +1306,8 @@ fn apply_sweep(
             &key[..],
             !freed,
             spent_in_txid,
-            winner_mined_height.map(i64::from)
+            winner_mined_height.map(i64::from),
+            AsRef::<[u8]>::as_ref(loser_txid)
         ])?;
         if affected == 0 && !freed {
             // A held input with no row gets a placeholder in EVERY sweep

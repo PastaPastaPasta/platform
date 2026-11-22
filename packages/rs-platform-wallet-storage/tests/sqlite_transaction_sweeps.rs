@@ -4192,3 +4192,59 @@ fn a_hold_made_before_the_funding_arrived_refuses_a_later_release() {
     );
     assert!(!unspent(&conn, &w).contains(&a), "A stays held");
 }
+
+/// A held for a mined winner W the store has; W is then itself swept,
+/// unmined, by W2, which holds A; abandoning W2 then frees A. The hold
+/// follows W2 when W goes, not W's dead link.
+#[test]
+fn a_hold_whose_mined_winner_is_swept_follows_the_new_winner() {
+    let (persister, _tmp, _path) = fresh_persister();
+    let w: WalletId = wid(0x3D);
+    ensure_wallet_meta(&persister, &w);
+    let addr = p2pkh(0x3D);
+    let funding = Txid::from_byte_array([0x60; 32]);
+    let a = OutPoint::new(funding, 0);
+    let [payment, winner, second, third] =
+        [0x61, 0x62, 0x63, 0x64].map(|b| Txid::from_byte_array([b; 32]));
+
+    let mut conn = persister.lock_conn_for_test();
+    derive_address(&conn, &w, 0, &addr);
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            new_utxos: vec![make_utxo(&addr, funding, 0, 400)],
+            ..Default::default()
+        },
+    );
+    apply_round(
+        &mut conn,
+        &w,
+        CoreChangeSet {
+            records: vec![
+                tx_record(payment, vec![a], Vec::new()),
+                tx_record(winner, vec![a], Vec::new()),
+            ],
+            spent_utxos: vec![make_utxo(&addr, funding, 0, 400)],
+            ..Default::default()
+        },
+    );
+    let sweep = |txid, superseded_by, winner_mined_height, released_outpoints| CoreChangeSet {
+        sweeps: vec![SweepBatch {
+            txids: vec![txid],
+            superseded_by,
+            winner_mined_height,
+            released_outpoints,
+        }],
+        ..Default::default()
+    };
+    apply_round(
+        &mut conn,
+        &w,
+        sweep(payment, winner, Some(WINNER_HEIGHT), Vec::new()),
+    );
+    apply_round(&mut conn, &w, sweep(winner, second, None, Vec::new()));
+    assert_eq!(spent_in(&conn, &w, &a), Some(second), "held for W2");
+    apply_round(&mut conn, &w, sweep(second, third, None, vec![a]));
+    assert!(unspent(&conn, &w).contains(&a), "A is free once W2 goes");
+}
