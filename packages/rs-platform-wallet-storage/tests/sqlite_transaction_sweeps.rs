@@ -649,16 +649,18 @@ fn a_release_naming_a_coin_a_stored_finalized_record_claims_is_refused() {
 /// of it is abandoned later.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Holder {
-    Final,
+    Mined,
+    MinedWithNoRow,
     Mempool,
     SweptAlongside,
 }
 
 /// A loser P of coins A and B swept for a winner W that spends B: the
 /// sweep releases nothing, so A stays spent, held for W. Abandoning O,
-/// another claimant of A, then releases A. A network-final W that survives
-/// keeps A spent, across a restart too; a W only in the mempool, or swept in
-/// the same round, does not.
+/// another claimant of A, then releases A. A mined W keeps A spent, across a
+/// restart too, whether or not the store has its row; a W only in the
+/// mempool, whose sweep carries no mined height, or one swept in the same
+/// round, does not.
 fn another_claimant_goes(holder: Holder) {
     use key_wallet::transaction_checking::transaction_context::BlockInfo;
 
@@ -677,8 +679,9 @@ fn another_claimant_goes(holder: Holder) {
     let other_txid = Txid::from_byte_array([0xC3; 32]);
     let rival_txid = Txid::from_byte_array([0xC4; 32]);
 
+    let mined = holder != Holder::Mempool;
     let mut winner = tx_record(winner_txid, vec![b], Vec::new());
-    if holder != Holder::Mempool {
+    if mined {
         winner.context = TransactionContext::InBlock(BlockInfo::new(
             WINNER_HEIGHT,
             dashcore::BlockHash::from_byte_array([0xC5; 32]),
@@ -706,8 +709,12 @@ fn another_claimant_goes(holder: Holder) {
         ],
         ..Default::default()
     });
+    let mut records = vec![payment, other];
+    if holder != Holder::MinedWithNoRow {
+        records.push(winner);
+    }
     apply(CoreChangeSet {
-        records: vec![payment, other, winner],
+        records,
         spent_utxos: vec![
             make_utxo(&addr, funding_txid, 0, 400),
             make_utxo(&addr, funding_txid, 1, 600),
@@ -718,7 +725,7 @@ fn another_claimant_goes(holder: Holder) {
         sweeps: vec![SweepBatch {
             txids: vec![payment_txid],
             superseded_by: winner_txid,
-            winner_mined_height: Some(WINNER_HEIGHT),
+            winner_mined_height: mined.then_some(WINNER_HEIGHT),
             released_outpoints: Vec::new(),
         }],
         ..Default::default()
@@ -742,7 +749,7 @@ fn another_claimant_goes(holder: Holder) {
         ..Default::default()
     });
 
-    let freed = holder != Holder::Final;
+    let freed = matches!(holder, Holder::Mempool | Holder::SweptAlongside);
     assert_eq!(unspent(&conn, &w).contains(&a), freed, "{holder:?}");
     drop(conn);
     drop(persister);
@@ -760,8 +767,13 @@ fn another_claimant_goes(holder: Holder) {
 }
 
 #[test]
-fn a_coin_a_sweep_held_for_a_final_winner_stays_spent_when_another_claimant_goes() {
-    another_claimant_goes(Holder::Final);
+fn a_coin_a_sweep_held_for_a_mined_winner_stays_spent_when_another_claimant_goes() {
+    another_claimant_goes(Holder::Mined);
+}
+
+#[test]
+fn a_coin_a_sweep_held_for_a_mined_winner_the_store_never_saw_stays_spent() {
+    another_claimant_goes(Holder::MinedWithNoRow);
 }
 
 #[test]
@@ -3071,7 +3083,8 @@ fn a_materialised_claim_is_never_collected() {
     );
 
     // The funding output classifies: the valve keeps the coin spent, the
-    // row gains real funding data, and the stale stamp clears.
+    // row gains real funding data, and the stamp stays, so the hold still
+    // vetoes a release.
     {
         let tx = conn.transaction().unwrap();
         let cs = CoreChangeSet {
@@ -3083,14 +3096,14 @@ fn a_materialised_claim_is_never_collected() {
     }
     assert_eq!(
         utxo_row_state(&conn, &w, &p),
-        Some((true, false, None)),
-        "sanity: materialised — real height, stamp cleared, still spent"
+        Some((true, false, Some(i64::from(WINNER_HEIGHT)))),
+        "sanity: materialised — real height, still spent, the stamp kept"
     );
 
     apply_heights(&mut conn, &w, 10_000);
     assert_eq!(
         utxo_row_state(&conn, &w, &p),
-        Some((true, false, None)),
+        Some((true, false, Some(i64::from(WINNER_HEIGHT)))),
         "a materialised claim is the wallet's own coin held spent — no \
          boundary may ever collect it"
     );
@@ -3129,7 +3142,7 @@ fn a_release_frees_a_materialised_claim_in_place() {
     apply_heights(&mut conn, &w, 100);
     seed_tombstone(&mut conn, &w, p, loser, winner, Some(WINNER_HEIGHT));
 
-    // The funding output classifies: real data, stamp cleared, still spent.
+    // The funding output classifies: real data, stamp kept, still spent.
     {
         let tx = conn.transaction().unwrap();
         let cs = CoreChangeSet {
@@ -3141,8 +3154,8 @@ fn a_release_frees_a_materialised_claim_in_place() {
     }
     assert_eq!(
         utxo_row_state(&conn, &w, &p),
-        Some((true, false, None)),
-        "sanity: materialised — real height, stamp cleared, still spent"
+        Some((true, false, Some(i64::from(WINNER_HEIGHT)))),
+        "sanity: materialised — real height, still spent, the stamp kept"
     );
     assert!(
         !unspent(&conn, &w).contains(&p),
@@ -3461,8 +3474,8 @@ fn a_materialised_coin_the_wallet_re_delivers_unspent_is_released_from_its_hold(
     }
     assert_eq!(
         utxo_row_state(&conn, &w, &x),
-        Some((true, false, None)),
-        "sanity: the sweep holds the materialised coin, unstamped"
+        Some((true, false, Some(i64::from(WINNER_HEIGHT)))),
+        "sanity: the sweep holds the materialised coin, stamped"
     );
 
     // The winner's block is reorged out; the wallet re-delivers the coin
@@ -3654,7 +3667,7 @@ fn a_placeholder_with_a_nulled_link_is_still_collected_at_its_stamp() {
 
 /// A delivery through `spent_utxos` is still a delivery: the wallet knows
 /// the coin and knows it spent. Landing on a held placeholder it must
-/// materialise the row — real funding data, placeholder flag clear, stamp cleared —
+/// materialise the row — real funding data, placeholder flag clear, stamp kept —
 /// not just mark it, or the collector would later delete the only durable
 /// record of the spend and a rescan re-delivery would land the coin
 /// unspent.
@@ -3690,8 +3703,8 @@ fn a_spent_delivery_materialises_a_held_placeholder_out_of_the_collectors_reach(
     }
     assert_eq!(
         utxo_row_state(&conn, &w, &x),
-        Some((true, false, None)),
-        "the spent delivery materialises the row: placeholder flag clear, stamp cleared"
+        Some((true, false, Some(i64::from(WINNER_HEIGHT)))),
+        "the spent delivery materialises the row: placeholder flag clear, stamp kept"
     );
 
     apply_heights(&mut conn, &w, WINNER_HEIGHT + 100);

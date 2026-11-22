@@ -381,7 +381,7 @@ pub fn apply(
                  WHERE wallet_id = ?1 AND outpoint = ?2 AND is_sweep_placeholder = 1",
             )?;
             let mut release_stmt = tx.prepare_cached(
-                "UPDATE core_utxos SET spent = 0, spent_in_txid = NULL \
+                "UPDATE core_utxos SET spent = 0, spent_in_txid = NULL, winner_mined_height = NULL \
                  WHERE wallet_id = ?1 AND outpoint = ?2",
             )?;
             for outpoint in &released {
@@ -490,12 +490,14 @@ pub fn load_dismissed(
 /// when the pending spend confirms or dies, and strictly better than a
 /// permanent strand.
 ///
-/// A coin a sweep held for a surviving network-final winner counts as
-/// claimed too: [`apply_sweep`] attributes each input it did not release to
-/// that winner (`spent_in_txid`), and the sweep may have held it for a spend
-/// that leaves no other trace here, such as one in a block the wallet never
-/// recorded, whose observation upstream drops at its ChainLock. A later
-/// release of that coin, by an abandon of another claimant, is then refused.
+/// A coin a sweep held for a mined winner counts as claimed too:
+/// [`apply_sweep`] stamps each input it did not release with the winner's
+/// mined height (`winner_mined_height`), and the sweep may have held it for
+/// a spend that leaves no other trace here, such as one in a block the
+/// wallet never recorded, whose observation upstream drops at its ChainLock
+/// or at a restart. Whether the winner has a row here does not matter. A
+/// later release of that coin, by an abandon of another claimant, is then
+/// refused, unless this round sweeps the winner it was held for.
 ///
 /// Fails CLOSED. This scan is the final guard against re-crediting a
 /// consumed coin, so a malformed stored key must fail the round rather than
@@ -524,7 +526,6 @@ fn surviving_stored_input_claims(
         tx.prepare_cached("SELECT txid, record_blob FROM core_transactions WHERE wallet_id = ?1 AND record_blob IS NOT NULL")?;
     let mut rows = stmt.query(params![wallet_id.as_slice()])?;
     let mut claims: HashSet<dashcore::OutPoint> = HashSet::new();
-    let mut finals: HashSet<dashcore::Txid> = HashSet::new();
     while let Some(row) = rows.next()? {
         let txid_bytes: Vec<u8> = row.get(0)?;
         let Ok(txid_array) = <[u8; 32]>::try_from(txid_bytes.as_slice()) else {
@@ -550,7 +551,6 @@ fn surviving_stored_input_claims(
         ) {
             continue;
         }
-        finals.insert(key_txid);
         claims.extend(
             record
                 .transaction
@@ -562,20 +562,23 @@ fn surviving_stored_input_claims(
 
     let mut held_stmt = tx.prepare_cached(
         "SELECT outpoint, spent_in_txid FROM core_utxos \
-         WHERE wallet_id = ?1 AND spent = 1 AND spent_in_txid IS NOT NULL",
+         WHERE wallet_id = ?1 AND spent = 1 AND winner_mined_height IS NOT NULL",
     )?;
     let mut held_rows = held_stmt.query(params![wallet_id.as_slice()])?;
     while let Some(row) = held_rows.next()? {
-        let holder: Vec<u8> = row.get(1)?;
-        let Ok(holder) = <[u8; 32]>::try_from(holder.as_slice()) else {
-            return Err(WalletStorageError::blob_decode(
-                "core_utxos.spent_in_txid must be exactly 32 bytes",
-            ));
-        };
-        if finals.contains(&dashcore::Txid::from_byte_array(holder)) {
-            let outpoint: Vec<u8> = row.get(0)?;
-            claims.insert(blob::decode_outpoint(&outpoint)?);
+        let holder: Option<Vec<u8>> = row.get(1)?;
+        if let Some(holder) = holder {
+            let Ok(holder) = <[u8; 32]>::try_from(holder.as_slice()) else {
+                return Err(WalletStorageError::blob_decode(
+                    "core_utxos.spent_in_txid must be exactly 32 bytes",
+                ));
+            };
+            if swept_txids.contains(&dashcore::Txid::from_byte_array(holder)) {
+                continue;
+            }
         }
+        let outpoint: Vec<u8> = row.get(0)?;
+        claims.insert(blob::decode_outpoint(&outpoint)?);
     }
     Ok(claims)
 }
@@ -696,7 +699,7 @@ pub(crate) fn drop_unauthorized_pending_spends(
             }
             for (op, _) in released {
                 tx.execute(
-                    "UPDATE core_utxos SET spent = 0, spent_in_txid = NULL \
+                    "UPDATE core_utxos SET spent = 0, spent_in_txid = NULL, winner_mined_height = NULL \
                      WHERE wallet_id = ?1 AND outpoint = ?2",
                     params![wallet_id.as_slice(), &op[..]],
                 )?;
@@ -1219,13 +1222,13 @@ fn apply_sweep(
     // the funding output of a spent outpoint is mined at or below the
     // height of ANY block-context spender of it, so the boundary passing
     // that height still proves the funding was delivered or never will be.
-    // Materialised rows (placeholder flag clear) keep their NULL stamp — they are
-    // outside the collector's reach either way.
+    // Materialised rows take the stamp too, outside the collector's reach:
+    // it is what `surviving_stored_input_claims` keeps a held coin spent by.
+    // A freed row loses it.
     let mut spend_stmt = tx.prepare_cached(
         "UPDATE core_utxos SET spent = ?3, spent_in_txid = ?4, \
             winner_mined_height = CASE \
-                WHEN ?3 AND is_sweep_placeholder = 1 THEN COALESCE(?5, winner_mined_height) \
-                ELSE winner_mined_height END \
+                WHEN ?3 THEN COALESCE(?5, winner_mined_height) ELSE NULL END \
          WHERE wallet_id = ?1 AND outpoint = ?2",
     )?;
     // Only reached for a held input with no existing row — see the doc
@@ -1318,7 +1321,9 @@ const UPSERT_UTXO_SQL: &str = "INSERT INTO core_utxos \
         value = excluded.value, \
         script = excluded.script, \
         is_sweep_placeholder = 0, \
-        winner_mined_height = NULL, \
+        winner_mined_height = CASE \
+            WHEN (core_utxos.is_sweep_placeholder = 1 AND core_utxos.spent) OR excluded.spent \
+            THEN core_utxos.winner_mined_height ELSE NULL END, \
         spent = CASE WHEN core_utxos.is_sweep_placeholder = 1 AND core_utxos.spent \
             THEN 1 ELSE excluded.spent END, \
         spent_in_txid = CASE \
