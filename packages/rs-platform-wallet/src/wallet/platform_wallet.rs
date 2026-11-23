@@ -1614,8 +1614,10 @@ impl PlatformWallet {
         // two top-ups (or a top-up and a shield-from-identity debit) whose
         // waits completed out of execution order would let the older balance
         // overwrite the newer one. Held across build -> broadcast -> wait ->
-        // reconcile.
+        // reconcile. A bind takes it too and may re-bind the account while
+        // this call waits, so the keyset is checked again once it is held.
         let _shield_guard = self.shield_guard.lock().await;
+        self.check_spend_keyset(keyset, account).await?;
 
         let (mut proven_balance, metadata) =
             super::shielded::operations::identity_top_up_from_pool_with_metadata(

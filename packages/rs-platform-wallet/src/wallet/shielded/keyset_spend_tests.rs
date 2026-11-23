@@ -279,13 +279,15 @@ impl WriteCounter {
     }
 }
 
-/// Run `spend` while holding a shared guard on `coordinator`'s store and
-/// counting writes to its database. Every change to the store, the
-/// in-memory note reservation included, needs its write lock, so a call
-/// that would change it can't finish on its first poll; it must finish
-/// there, with no row written. The poll runs outside the task's cooperative
-/// budget, so only a lock that is held makes it wait.
+/// Run `spend` while holding `wallet`'s shield lock and a shared guard on
+/// `coordinator`'s store, counting writes to its database. Every change to
+/// the store, the in-memory note reservation included, needs its write
+/// lock, so a call that would change it can't finish on its first poll; it
+/// must finish there, with no row written. A call that takes the shield
+/// lock before its refusal can't finish there either. The poll runs outside
+/// the task's cooperative budget, so only a lock that is held makes it wait.
 async fn without_writes<F>(
+    wallet: &PlatformWallet,
     coordinator: &NetworkShieldedCoordinator,
     spend: F,
     context: &str,
@@ -295,11 +297,13 @@ where
 {
     let writes = WriteCounter::install(coordinator.db_path());
     let result = {
+        let _shield = wallet.shield_guard.lock().await;
         let _shared = coordinator.store().read().await;
         tokio::task::unconstrained(spend).now_or_never()
     };
-    let result =
-        result.unwrap_or_else(|| panic!("{context}: the call waited for the store's write lock"));
+    let result = result.unwrap_or_else(|| {
+        panic!("{context}: the call waited for the shield lock or the store's write lock")
+    });
     assert_eq!(
         writes.count(),
         0,
@@ -711,6 +715,7 @@ async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
             let stored_before = persister.stored_count();
 
             let result = without_writes(
+                &wallet,
                 &coordinator,
                 spend_with_keyset(&wallet, &coordinator, &wrong, ACCOUNT, kind),
                 &format!("{kind:?} {what}"),
@@ -737,6 +742,62 @@ async fn a_mismatched_keyset_is_refused_and_writes_nothing() {
     }
 }
 
+/// A top-up waiting for the shield lock behind a bind that re-binds its
+/// account away is refused as an unbound account once it holds the lock,
+/// on both entry points, with nothing written.
+#[tokio::test]
+async fn a_top_up_rechecks_the_keyset_once_it_holds_the_shield_lock() {
+    for by_seed in [false, true] {
+        let context = if by_seed { "seed" } else { "keyset" };
+        let own = keyset(&SEED, ACCOUNT);
+        let note = owned_note(&own);
+        let (coordinator, hook, anchor) =
+            hooked_coordinator(&format!("top_up_rebind_{context}"), &note, true).await;
+        let (wallet, _persister) = bound_wallet(&coordinator, anchor, &note, &[&coordinator]).await;
+
+        let shield = wallet.shield_guard.lock().await;
+        let mut rebind = std::pin::pin!(tokio::task::unconstrained(wallet.bind_shielded(
+            &SEED,
+            &[ACCOUNT + 1],
+            &coordinator
+        )));
+        assert!(
+            rebind.as_mut().now_or_never().is_none(),
+            "{context}: the re-bind waits for the shield lock"
+        );
+        let top_up = async {
+            if by_seed {
+                spend_with_seed(&wallet, &coordinator, &SEED, Kind::TopUp).await
+            } else {
+                spend_with_keyset(&wallet, &coordinator, &own, ACCOUNT, Kind::TopUp).await
+            }
+        };
+        let mut top_up = std::pin::pin!(tokio::task::unconstrained(top_up));
+        assert!(
+            top_up.as_mut().now_or_never().is_none(),
+            "{context}: the top-up passes its first check and waits for the shield lock"
+        );
+        drop(shield);
+        rebind.await.expect("the re-bind");
+
+        let result = top_up.await;
+        assert!(
+            matches!(
+                result,
+                Err(PlatformWalletError::ShieldedKeyDerivation(ref message))
+                    if message == "shielded account 0 not bound"
+            ),
+            "{context}: refused as unbound once the shield lock is held, got {result:?}"
+        );
+        assert!(hook.seen().is_empty(), "{context}: dispatch never called");
+        assert_eq!(
+            pending_spend_rows(coordinator.db_path()),
+            0,
+            "{context}: no pending spend row on disk"
+        );
+    }
+}
+
 /// The keyset check runs before the request is parsed: a mismatched
 /// keyset with an unparsable recipient, or an identity create with no key,
 /// is still refused as a mismatch.
@@ -751,6 +812,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     let prover = CachedOrchardProver::new();
 
     let transfer = without_writes(
+        &wallet,
         &coordinator,
         wallet.shielded_transfer_to_with_keyset(
             &coordinator,
@@ -765,6 +827,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     )
     .await;
     let withdraw = without_writes(
+        &wallet,
         &coordinator,
         wallet.shielded_withdraw_to_with_keyset(
             &coordinator,
@@ -779,6 +842,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     )
     .await;
     let unshield = without_writes(
+        &wallet,
         &coordinator,
         wallet.shielded_unshield_to_with_keyset(
             &coordinator,
@@ -792,6 +856,7 @@ async fn a_mismatched_keyset_is_refused_before_the_recipient_is_parsed() {
     )
     .await;
     let create = without_writes(
+        &wallet,
         &coordinator,
         wallet
             .shielded_identity_create_from_pool_with_keyset(
@@ -898,6 +963,7 @@ async fn a_wrong_seed_keeps_its_error_on_the_seed_path() {
 
         let context = format!("{kind:?} wrong seed");
         let result = without_writes(
+            &wallet,
             &coordinator,
             spend_with_seed(&wallet, &coordinator, &OTHER_SEED, kind),
             &context,
@@ -936,6 +1002,7 @@ async fn an_unbound_account_is_refused_on_the_keyset_path() {
         let stored_before = persister.stored_count();
 
         let result = without_writes(
+            &wallet,
             &coordinator,
             spend_with_keyset(&wallet, &coordinator, &keyset(&SEED, 5), 5, kind),
             &format!("{kind:?} unbound account"),
@@ -967,6 +1034,7 @@ async fn an_unbound_account_is_refused_on_the_keyset_path() {
         .await;
         let unbound_stored_before = unbound_persister.stored_count();
         let result = without_writes(
+            &unbound,
             &coordinator,
             spend_with_keyset(&unbound, &coordinator, &own, ACCOUNT, kind),
             &format!("{kind:?} unbound wallet"),
@@ -1485,6 +1553,17 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
 /// bundle has no padding action and that id is known before the call.
 #[tokio::test]
 async fn a_confirmed_keyset_create_registers_the_identity_at_its_slot() {
+    a_confirmed_create_registers_the_identity_at_its_slot(false).await;
+}
+
+/// [`a_confirmed_keyset_create_registers_the_identity_at_its_slot`] on the
+/// seed wrapper, which registers the identity itself.
+#[tokio::test]
+async fn a_confirmed_seed_create_registers_the_identity_at_its_slot() {
+    a_confirmed_create_registers_the_identity_at_its_slot(true).await;
+}
+
+async fn a_confirmed_create_registers_the_identity_at_its_slot(by_seed: bool) {
     use dpp::identity::identity_public_key::accessors::v0::IdentityPublicKeyGettersV0;
     use dpp::state_transition::identity_create_from_shielded_pool_transition::identity_id_from_nullifiers;
 
@@ -1504,7 +1583,7 @@ async fn a_confirmed_keyset_create_registers_the_identity_at_its_slot() {
     )
     .expect("the created identity");
     let (coordinator, hook, anchor) =
-        hooked_coordinator_holding("create_registers", &notes, true).await;
+        hooked_coordinator_holding(&format!("create_registers_{by_seed}"), &notes, true).await;
     let (wallet, _persister) =
         bound_wallet_holding(&coordinator, anchor, &notes, &[&coordinator], Some(created)).await;
     let wallet_id = wallet.wallet_id();
@@ -1519,20 +1598,37 @@ async fn a_confirmed_keyset_create_registers_the_identity_at_its_slot() {
         );
     }
 
-    let identity_id = wallet
-        .shielded_identity_create_from_pool_with_keyset(
-            &coordinator,
-            &own,
-            ACCOUNT,
-            IDENTITY_INDEX,
-            identity_keys(),
-            DENOMINATION,
-            creation_failure_address(),
-            &FixedSigner,
-            &CachedOrchardProver::new(),
-        )
-        .await
-        .expect("the create is confirmed");
+    let prover = CachedOrchardProver::new();
+    let identity_id = if by_seed {
+        wallet
+            .shielded_identity_create_from_pool(
+                &coordinator,
+                &SEED,
+                ACCOUNT,
+                IDENTITY_INDEX,
+                identity_keys(),
+                DENOMINATION,
+                creation_failure_address(),
+                &FixedSigner,
+                &prover,
+            )
+            .await
+    } else {
+        wallet
+            .shielded_identity_create_from_pool_with_keyset(
+                &coordinator,
+                &own,
+                ACCOUNT,
+                IDENTITY_INDEX,
+                identity_keys(),
+                DENOMINATION,
+                creation_failure_address(),
+                &FixedSigner,
+                &prover,
+            )
+            .await
+    }
+    .expect("the create is confirmed");
 
     assert_eq!(identity_id, expected_id, "the id the nullifiers derive");
     let seen = hook.seen();
