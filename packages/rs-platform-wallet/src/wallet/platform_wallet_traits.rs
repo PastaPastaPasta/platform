@@ -203,7 +203,7 @@ impl WalletInfoInterface for PlatformWalletInfo {
         self.core_wallet.undismiss(txid)
     }
 
-    fn unconfirmed_spent_outpoints(&self) -> BTreeSet<OutPoint> {
+    fn unconfirmed_spent_outpoints(&self) -> std::collections::BTreeMap<OutPoint, BTreeSet<Txid>> {
         self.core_wallet.unconfirmed_spent_outpoints()
     }
 
