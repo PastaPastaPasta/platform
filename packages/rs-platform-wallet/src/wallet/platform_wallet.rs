@@ -274,8 +274,8 @@ pub struct PlatformWalletInfo {
     /// Deliberately `pub(crate)`, not `pub`: this `Arc` *is* the generation
     /// identity that `Arc::ptr_eq` compares, and `PlatformWalletInfo` is
     /// reachable mutably from outside the crate through
-    /// [`PlatformWallet::state_mut`] / [`PlatformWallet::state_mut_blocking`].
-    /// A public field would let safe downstream code drop a fresh `Arc` in here
+    /// [`PlatformWallet::checked_state_mut`] / [`PlatformWallet::state_mut`] /
+    /// [`PlatformWallet::state_mut_blocking`]. A public field would let safe downstream code drop a fresh `Arc` in here
     /// while `PlatformWallet` and `CoreWallet` keep the original, splitting the
     /// identity: `is_current_generation()` would then reject the still-live
     /// wallet, generation-bound reservation cleanup would become a no-op, and
@@ -455,28 +455,57 @@ impl PlatformWallet {
 
     /// Read-lock the wallet manager and return a guard that derefs to this
     /// wallet's `PlatformWalletInfo`.
+    ///
+    /// # Panics
+    /// If this wallet has been removed from the wallet manager. Use
+    /// [`Self::checked_state`] where the wallet can be closed concurrently.
     pub async fn state(&self) -> WalletStateReadGuard<'_> {
-        WalletStateReadGuard {
-            guard: self.wallet_manager.read().await,
-            wallet_id: self.wallet_id,
-        }
+        self.checked_state()
+            .await
+            .expect("wallet removed from the wallet manager; use checked_state")
     }
 
     /// Write-lock the wallet manager and return a guard that derefs to this
     /// wallet's `PlatformWalletInfo` (with `DerefMut`).
+    ///
+    /// # Panics
+    /// If this wallet has been removed from the wallet manager. Use
+    /// [`Self::checked_state_mut`] where the wallet can be closed concurrently.
     pub async fn state_mut(&self) -> WalletStateWriteGuard<'_> {
-        WalletStateWriteGuard {
-            guard: self.wallet_manager.write().await,
-            wallet_id: self.wallet_id,
-        }
+        self.checked_state_mut()
+            .await
+            .expect("wallet removed from the wallet manager; use checked_state_mut")
+    }
+
+    /// Read-lock the wallet manager and return a guard that derefs to this
+    /// wallet's `PlatformWalletInfo`.
+    ///
+    /// # Errors
+    /// [`PlatformWalletError::WalletNotFound`] if this wallet is no longer
+    /// registered with the wallet manager.
+    pub async fn checked_state(&self) -> Result<WalletStateReadGuard<'_>, PlatformWalletError> {
+        WalletStateReadGuard::new(self.wallet_manager.read().await, self.wallet_id)
+    }
+
+    /// Write-lock the wallet manager and return a guard that derefs to this
+    /// wallet's `PlatformWalletInfo` (with `DerefMut`).
+    ///
+    /// # Errors
+    /// [`PlatformWalletError::WalletNotFound`] if this wallet is no longer
+    /// registered with the wallet manager.
+    pub async fn checked_state_mut(
+        &self,
+    ) -> Result<WalletStateWriteGuard<'_>, PlatformWalletError> {
+        WalletStateWriteGuard::new(self.wallet_manager.write().await, self.wallet_id)
     }
 
     /// Blocking read-lock.
-    pub fn state_blocking(&self) -> WalletStateReadGuard<'_> {
-        WalletStateReadGuard {
-            guard: self.wallet_manager.blocking_read(),
-            wallet_id: self.wallet_id,
-        }
+    ///
+    /// # Errors
+    /// [`PlatformWalletError::WalletNotFound`] if this wallet is no longer
+    /// registered with the wallet manager.
+    pub fn state_blocking(&self) -> Result<WalletStateReadGuard<'_>, PlatformWalletError> {
+        WalletStateReadGuard::new(self.wallet_manager.blocking_read(), self.wallet_id)
     }
 
     /// Blocking write-lock.
@@ -485,11 +514,12 @@ impl PlatformWallet {
     /// called from within a tokio async context. Exists so sync
     /// callers (e.g. SPV-driven transaction processing) can reach
     /// mutation methods that require the wallet-manager write lock.
-    pub fn state_mut_blocking(&self) -> WalletStateWriteGuard<'_> {
-        WalletStateWriteGuard {
-            guard: self.wallet_manager.blocking_write(),
-            wallet_id: self.wallet_id,
-        }
+    ///
+    /// # Errors
+    /// [`PlatformWalletError::WalletNotFound`] if this wallet is no longer
+    /// registered with the wallet manager.
+    pub fn state_mut_blocking(&self) -> Result<WalletStateWriteGuard<'_>, PlatformWalletError> {
+        WalletStateWriteGuard::new(self.wallet_manager.blocking_write(), self.wallet_id)
     }
 
     // -----------------------------------------------------------------
@@ -629,33 +659,37 @@ impl PlatformWallet {
         Ok(new_balance)
     }
 
-    /// Non-blocking read-lock. Returns `None` if the lock is currently
+    /// Non-blocking read-lock. Returns `Ok(None)` if the lock is currently
     /// held by a writer, or cannot be acquired without parking the
     /// thread. Safe to call from any context — never panics, never
     /// blocks. Intended for sync callers that run on a tokio runtime
     /// thread (e.g. egui UI render callbacks) where blocking variants
     /// would panic and async variants cannot be awaited.
-    pub fn try_state(&self) -> Option<WalletStateReadGuard<'_>> {
+    ///
+    /// # Errors
+    /// [`PlatformWalletError::WalletNotFound`] if the lock was acquired but
+    /// this wallet is no longer registered with the wallet manager.
+    pub fn try_state(&self) -> Result<Option<WalletStateReadGuard<'_>>, PlatformWalletError> {
         self.wallet_manager
             .try_read()
             .ok()
-            .map(|guard| WalletStateReadGuard {
-                guard,
-                wallet_id: self.wallet_id,
-            })
+            .map(|guard| WalletStateReadGuard::new(guard, self.wallet_id))
+            .transpose()
     }
 
-    /// Non-blocking write-lock. Returns `None` if the lock is currently
+    /// Non-blocking write-lock. Returns `Ok(None)` if the lock is currently
     /// held by any reader or writer. Same safety properties as
-    /// [`try_state`]: never panics, never blocks.
-    pub fn try_state_mut(&self) -> Option<WalletStateWriteGuard<'_>> {
+    /// [`Self::try_state`]: never panics, never blocks.
+    ///
+    /// # Errors
+    /// [`PlatformWalletError::WalletNotFound`] if the lock was acquired but
+    /// this wallet is no longer registered with the wallet manager.
+    pub fn try_state_mut(&self) -> Result<Option<WalletStateWriteGuard<'_>>, PlatformWalletError> {
         self.wallet_manager
             .try_write()
             .ok()
-            .map(|guard| WalletStateWriteGuard {
-                guard,
-                wallet_id: self.wallet_id,
-            })
+            .map(|guard| WalletStateWriteGuard::new(guard, self.wallet_id))
+            .transpose()
     }
 
     /// Construct a PlatformWallet from a WalletManager that already contains
@@ -2551,19 +2585,43 @@ impl std::fmt::Debug for PlatformWallet {
 // Wallet state guard types — lock WalletManager, deref to PlatformWalletInfo
 // ---------------------------------------------------------------------------
 
+fn ensure_registered(
+    manager: &WalletManager<PlatformWalletInfo>,
+    wallet_id: &WalletId,
+) -> Result<(), PlatformWalletError> {
+    manager
+        .get_wallet_and_info(wallet_id)
+        .map(|_| ())
+        .ok_or_else(|| PlatformWalletError::WalletNotFound(hex::encode(wallet_id)))
+}
+
+const REGISTERED_UNDER_LOCK: &str =
+    "wallet presence is checked at guard construction and the guard holds the manager lock";
+
 /// Read guard that locks `WalletManager` and derefs to this wallet's
 /// `PlatformWalletInfo`. Also provides `.wallet()` for key material access.
+///
+/// Only constructed after checking, under the held lock, that the wallet is
+/// registered, so the wallet stays present for the guard's lifetime.
 pub struct WalletStateReadGuard<'a> {
     guard: RwLockReadGuard<'a, WalletManager<PlatformWalletInfo>>,
     wallet_id: WalletId,
 }
 
 impl<'a> WalletStateReadGuard<'a> {
+    fn new(
+        guard: RwLockReadGuard<'a, WalletManager<PlatformWalletInfo>>,
+        wallet_id: WalletId,
+    ) -> Result<Self, PlatformWalletError> {
+        ensure_registered(&guard, &wallet_id)?;
+        Ok(Self { guard, wallet_id })
+    }
+
     /// Access the immutable `Wallet` (key material).
     pub fn wallet(&self) -> &Wallet {
         self.guard
             .get_wallet(&self.wallet_id)
-            .expect("wallet exists in guard")
+            .expect(REGISTERED_UNDER_LOCK)
     }
 }
 
@@ -2572,23 +2630,34 @@ impl Deref for WalletStateReadGuard<'_> {
     fn deref(&self) -> &PlatformWalletInfo {
         self.guard
             .get_wallet_info(&self.wallet_id)
-            .expect("wallet exists in guard")
+            .expect(REGISTERED_UNDER_LOCK)
     }
 }
 
 /// Write guard that locks `WalletManager` and derefs to this wallet's
 /// `PlatformWalletInfo` (with `DerefMut`). Also provides `.wallet()`.
+///
+/// Only constructed after checking, under the held lock, that the wallet is
+/// registered, so the wallet stays present for the guard's lifetime.
 pub struct WalletStateWriteGuard<'a> {
     guard: RwLockWriteGuard<'a, WalletManager<PlatformWalletInfo>>,
     wallet_id: WalletId,
 }
 
 impl<'a> WalletStateWriteGuard<'a> {
+    fn new(
+        guard: RwLockWriteGuard<'a, WalletManager<PlatformWalletInfo>>,
+        wallet_id: WalletId,
+    ) -> Result<Self, PlatformWalletError> {
+        ensure_registered(&guard, &wallet_id)?;
+        Ok(Self { guard, wallet_id })
+    }
+
     /// Access the immutable `Wallet` (key material).
     pub fn wallet(&self) -> &Wallet {
         self.guard
             .get_wallet(&self.wallet_id)
-            .expect("wallet exists in guard")
+            .expect(REGISTERED_UNDER_LOCK)
     }
 }
 
@@ -2597,7 +2666,7 @@ impl Deref for WalletStateWriteGuard<'_> {
     fn deref(&self) -> &PlatformWalletInfo {
         self.guard
             .get_wallet_info(&self.wallet_id)
-            .expect("wallet exists in guard")
+            .expect(REGISTERED_UNDER_LOCK)
     }
 }
 
@@ -2605,7 +2674,7 @@ impl DerefMut for WalletStateWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut PlatformWalletInfo {
         self.guard
             .get_wallet_info_mut(&self.wallet_id)
-            .expect("wallet exists in guard")
+            .expect(REGISTERED_UNDER_LOCK)
     }
 }
 

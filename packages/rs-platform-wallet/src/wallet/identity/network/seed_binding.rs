@@ -684,7 +684,12 @@ mod tests {
             .await
             .expect("wallet creation");
         assert!(
-            !wallet.state().await.wallet().has_seed(),
+            !wallet
+                .checked_state()
+                .await
+                .expect("wallet registered")
+                .wallet()
+                .has_seed(),
             "precondition: wallet must be seedless / external-signable"
         );
 
@@ -756,8 +761,9 @@ mod tests {
         assert_eq!(outcome, SeedBindingVerification::Verified);
 
         let expected_xpub = wallet
-            .state()
+            .checked_state()
             .await
+            .expect("wallet registered")
             .wallet()
             .get_bip44_account(0)
             .expect("account 0")
@@ -790,8 +796,9 @@ mod tests {
             .await
             .expect("wallet creation");
         let xpub = wallet
-            .state()
+            .checked_state()
             .await
+            .expect("wallet registered")
             .wallet()
             .get_bip44_account(0)
             .expect("account 0")
@@ -833,8 +840,9 @@ mod tests {
             .await
             .expect("wallet creation");
         let xpub = wallet
-            .state()
+            .checked_state()
             .await
+            .expect("wallet registered")
             .wallet()
             .get_bip44_account(0)
             .expect("account 0")
@@ -888,8 +896,9 @@ mod tests {
             .await
             .expect("wallet creation");
         let xpub = wallet
-            .state()
+            .checked_state()
             .await
+            .expect("wallet registered")
             .wallet()
             .get_bip44_account(0)
             .expect("account 0")
@@ -928,8 +937,9 @@ mod tests {
             .await
             .expect("wallet creation");
         let current_xpub = wallet
-            .state()
+            .checked_state()
             .await
+            .expect("wallet registered")
             .wallet()
             .get_bip44_account(0)
             .expect("account 0")
@@ -984,7 +994,13 @@ mod tests {
             .await
             .expect("wallet creation");
         assert!(
-            wallet.state().await.wallet().get_bip44_account(0).is_none(),
+            wallet
+                .checked_state()
+                .await
+                .expect("wallet registered")
+                .wallet()
+                .get_bip44_account(0)
+                .is_none(),
             "precondition: wallet has no BIP44 account 0"
         );
 

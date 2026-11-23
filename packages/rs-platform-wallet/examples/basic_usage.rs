@@ -84,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read wallet info via state guard (derefs to PlatformWalletInfo)
     {
-        let state = wallet.state().await;
+        let state = wallet.checked_state().await?;
         let synced_height = state.core_wallet.synced_height();
         let utxos = state
             .core_wallet

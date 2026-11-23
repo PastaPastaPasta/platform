@@ -425,6 +425,8 @@ impl PlatformWallet {
     /// differ from the ones the wallet's own accounts hold.
     ///
     /// # Errors
+    /// - [`PlatformWalletError::WalletNotFound`] if this wallet is no longer
+    ///   registered with the wallet manager (e.g. it was closed).
     /// - [`PlatformWalletError::AddressNotFound`] if this wallet has no
     ///   account of the requested kind.
     /// - [`PlatformWalletError::KeyDerivation`] if key derivation fails —
@@ -445,7 +447,7 @@ impl PlatformWallet {
         // callback runs under this guard — the mnemonic resolver (if any)
         // already ran on the FFI side and produced `resolved_seed` before
         // we were called.
-        let state = self.state_blocking();
+        let state = self.state_blocking()?;
 
         // Raw 64-byte BIP39 seed — the exact input the account's curve
         // master consumes (#879). Only obtained when a seed-bearing path

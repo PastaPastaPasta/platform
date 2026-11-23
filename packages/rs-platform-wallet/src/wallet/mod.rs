@@ -15,6 +15,8 @@ pub(crate) mod reservations;
 #[cfg(feature = "shielded")]
 pub mod shielded;
 pub mod signed_payment_registry;
+#[cfg(test)]
+mod state_guard_tests;
 pub mod tokens;
 
 pub use self::core::CoreWallet;

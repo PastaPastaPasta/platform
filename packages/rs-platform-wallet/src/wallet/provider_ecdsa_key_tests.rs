@@ -17,36 +17,13 @@
 //! thread. The tests therefore run on a multi-thread runtime and call it
 //! through `block_in_place` — which is also how a caller must treat it.
 
-use std::sync::Arc;
-
 use tokio::task::block_in_place;
 
 use dashcore::Network;
-use key_wallet::account::StandardAccountType;
 
-use crate::test_support::{funded_wallet_manager, NoopTestPersister};
+use crate::test_support::funded_platform_wallet;
 use crate::wallet::platform_wallet::PlatformWallet;
 use crate::wallet::provider_key_at_index::ProviderKeyKind;
-
-/// A `PlatformWallet` over a fresh, seed-bearing test wallet.
-async fn platform_wallet() -> PlatformWallet {
-    let (wallet_manager, wallet_id, balance, _signer) =
-        funded_wallet_manager(StandardAccountType::BIP44Account).await;
-    let sdk = Arc::new(dash_sdk::Sdk::new_mock());
-    let spv = Arc::new(crate::spv::SpvRuntime::new(
-        Arc::clone(&wallet_manager),
-        Arc::new(crate::events::PlatformEventManager::new(Vec::new())),
-    ));
-    PlatformWallet::new(
-        sdk,
-        wallet_id,
-        wallet_manager,
-        balance,
-        Arc::new(tokio::sync::Notify::new()),
-        Arc::new(NoopTestPersister) as Arc<dyn crate::changeset::PlatformWalletPersistence>,
-        Arc::new(crate::broadcaster::SpvBroadcaster::new(spv)),
-    )
-}
 
 /// The network the test wallet was created on, so address expectations are not
 /// hardcoded to one chain.
@@ -62,7 +39,7 @@ async fn wallet_network(wallet: &PlatformWallet) -> Network {
 /// secp256k1 public side comes off the account xpub and needs no seed at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn public_listing_has_address_and_no_private_material() {
-    let wallet = platform_wallet().await;
+    let wallet = funded_platform_wallet().await;
 
     for kind in [ProviderKeyKind::Owner, ProviderKeyKind::Voting] {
         let derived = block_in_place(|| wallet.derive_provider_key_at_index(kind, 0, None, false))
@@ -98,7 +75,7 @@ async fn public_listing_has_address_and_no_private_material() {
 async fn private_reveal_is_internally_consistent() {
     use dashcore::PrivateKey;
 
-    let wallet = platform_wallet().await;
+    let wallet = funded_platform_wallet().await;
     let network = wallet_network(&wallet).await;
 
     for kind in [ProviderKeyKind::Owner, ProviderKeyKind::Voting] {
@@ -142,7 +119,7 @@ async fn private_reveal_is_internally_consistent() {
 /// index would otherwise pass every consistency check above.
 #[tokio::test(flavor = "multi_thread")]
 async fn indexes_produce_distinct_keys() {
-    let wallet = platform_wallet().await;
+    let wallet = funded_platform_wallet().await;
 
     let keys: Vec<Vec<u8>> = (0u32..5)
         .map(|index| {
@@ -164,7 +141,7 @@ async fn indexes_produce_distinct_keys() {
 /// must not yield the same key for both.
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_and_voting_do_not_share_keys() {
-    let wallet = platform_wallet().await;
+    let wallet = funded_platform_wallet().await;
 
     let owner = block_in_place(|| {
         wallet.derive_provider_key_at_index(ProviderKeyKind::Owner, 0, None, false)
@@ -189,7 +166,7 @@ async fn owner_and_voting_do_not_share_keys() {
 /// rejecting the vote as having no voter identity.
 #[tokio::test(flavor = "multi_thread")]
 async fn foreign_seed_is_rejected_by_the_cross_check() {
-    let wallet = platform_wallet().await;
+    let wallet = funded_platform_wallet().await;
 
     // A valid seed, just not this wallet's.
     let foreign_seed = [7u8; 64];
@@ -217,7 +194,7 @@ async fn foreign_seed_is_rejected_by_the_cross_check() {
 /// wrapper gated on `is_watch_only`, which refuses exactly this caller.
 #[tokio::test(flavor = "multi_thread")]
 async fn explicitly_supplied_seed_matches_the_resident_one() {
-    let wallet = platform_wallet().await;
+    let wallet = funded_platform_wallet().await;
 
     let resident = block_in_place(|| {
         wallet.derive_provider_key_at_index(ProviderKeyKind::Voting, 3, None, true)

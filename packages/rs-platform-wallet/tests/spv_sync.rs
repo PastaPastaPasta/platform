@@ -246,7 +246,10 @@ async fn test_spv_sync_and_balance() {
 
         // Check synced height via state guard.
         let synced = {
-            let state = platform_wallet.state().await;
+            let state = platform_wallet
+                .checked_state()
+                .await
+                .expect("wallet registered");
             state.core_wallet.synced_height()
         };
 

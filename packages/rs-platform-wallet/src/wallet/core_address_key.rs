@@ -64,6 +64,8 @@ impl PlatformWallet {
     /// # Errors
     /// - [`PlatformWalletError::AddressOperation`] if `address_str` is not
     ///   a valid address for this wallet's network.
+    /// - [`PlatformWalletError::WalletNotFound`] if this wallet is no longer
+    ///   registered with the wallet manager (e.g. it was closed).
     /// - [`PlatformWalletError::AddressNotFound`] if the address is valid
     ///   but not tracked by any of this wallet's accounts.
     /// - [`PlatformWalletError::KeyDerivation`] if key derivation fails —
@@ -97,7 +99,7 @@ impl PlatformWallet {
         // wallet from the same guard. No Swift callback runs under this
         // guard — the mnemonic resolver (if any) already ran on the FFI
         // side and produced `resolved_master` before we were called.
-        let state = self.state_blocking();
+        let state = self.state_blocking()?;
 
         let path = state
             .core_wallet

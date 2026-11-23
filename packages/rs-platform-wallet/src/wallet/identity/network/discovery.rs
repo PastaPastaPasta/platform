@@ -1346,7 +1346,12 @@ mod tests {
         let wallet = manager.get_wallet(&wallet_id).await.expect("wallet");
 
         assert!(
-            !wallet.state().await.wallet().has_seed(),
+            !wallet
+                .checked_state()
+                .await
+                .expect("wallet registered")
+                .wallet()
+                .has_seed(),
             "precondition: the resident derive must be the thing that faults"
         );
 

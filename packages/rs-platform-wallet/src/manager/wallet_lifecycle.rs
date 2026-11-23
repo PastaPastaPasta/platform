@@ -1919,7 +1919,12 @@ mod persister_error_tests {
             )
             .await
             .expect("registration succeeds without running discovery");
-        assert!(!wallet.state().await.wallet().has_seed());
+        assert!(!wallet
+            .checked_state()
+            .await
+            .expect("wallet registered")
+            .wallet()
+            .has_seed());
         assert_eq!(
             manager
                 .persister

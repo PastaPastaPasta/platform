@@ -823,6 +823,38 @@ pub async fn test_platform_wallet_manager() -> (
     (manager, wallet_id)
 }
 
+/// A `PlatformWallet` over a fresh, seed-bearing test wallet.
+#[cfg(test)]
+pub(crate) async fn funded_platform_wallet() -> crate::wallet::platform_wallet::PlatformWallet {
+    let (wallet_manager, wallet_id, balance, _signer) =
+        funded_wallet_manager(StandardAccountType::BIP44Account).await;
+    let network = wallet_manager
+        .read()
+        .await
+        .get_wallet(&wallet_id)
+        .expect("wallet registered")
+        .network;
+    let sdk = Arc::new(
+        dash_sdk::SdkBuilder::new_mock()
+            .with_network(network)
+            .build()
+            .expect("mock sdk"),
+    );
+    let spv = Arc::new(crate::spv::SpvRuntime::new(
+        Arc::clone(&wallet_manager),
+        Arc::new(crate::events::PlatformEventManager::new(Vec::new())),
+    ));
+    crate::wallet::platform_wallet::PlatformWallet::new(
+        sdk,
+        wallet_id,
+        wallet_manager,
+        balance,
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(NoopTestPersister) as Arc<dyn crate::changeset::PlatformWalletPersistence>,
+        Arc::new(crate::broadcaster::SpvBroadcaster::new(spv)),
+    )
+}
+
 /// Canonical all-`abandon` BIP-39 test vector. Fixed (not
 /// `TestWalletContext::new_random`) so every key it derives is a stable golden —
 /// which is what lets the signed-message tests pin an RFC6979-deterministic
