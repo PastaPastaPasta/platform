@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use dashcore::ephemerealdata::chain_lock::ChainLock;
 use dashcore::ephemerealdata::instant_lock::InstantLock;
 use dashcore::prelude::CoreBlockHeight;
-use dashcore::{Address as DashAddress, ScriptBuf, Transaction, Txid};
+use dashcore::{Address as DashAddress, OutPoint, ScriptBuf, Transaction, Txid};
 
 use key_wallet::account::AccountType;
 use key_wallet::bip32::ExtendedPubKey;
@@ -17,6 +17,7 @@ use key_wallet::managed_account::managed_account_collection::ManagedAccountColle
 use key_wallet::transaction_checking::account_checker::TransactionCheckResult;
 use key_wallet::transaction_checking::TransactionContext;
 use key_wallet::transaction_checking::WalletTransactionChecker;
+use key_wallet::wallet::managed_wallet_info::helpers::WalletConflictSweep;
 use key_wallet::wallet::managed_wallet_info::managed_account_operations::ManagedAccountOperations;
 use key_wallet::wallet::managed_wallet_info::wallet_info_interface::{
     ApplyChainLockOutcome, Truncation, WalletInfoInterface,
@@ -200,6 +201,18 @@ impl WalletInfoInterface for PlatformWalletInfo {
 
     fn undismiss(&mut self, txid: &Txid) {
         self.core_wallet.undismiss(txid)
+    }
+
+    fn unconfirmed_spent_outpoints(&self) -> BTreeSet<OutPoint> {
+        self.core_wallet.unconfirmed_spent_outpoints()
+    }
+
+    fn sweep_conflicts_only(
+        &mut self,
+        tx: &Transaction,
+        context: &TransactionContext,
+    ) -> WalletConflictSweep {
+        self.core_wallet.sweep_conflicts_only(tx, context)
     }
 
     // Delegate the chain-lock methods to the inner `ManagedWalletInfo`.
