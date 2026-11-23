@@ -56,6 +56,9 @@ members = [
 
 [workspace.dependencies]
 bincode = { package = "grovedb-bincode", version = "=2.1.0" }
+# grovedb: PastaPastaPasta/grovedb dw/commitment-tree-rusqlite-0.41@b48a1d5067
+# = dashpay/grovedb@9791d27720 + dashpay/grovedb#1034 (grovedb-commitment-tree on
+# rusqlite 0.41). Back to a dashpay/grovedb revision at the next re-pin.
 grovedb = { git = "https://github.com/PastaPastaPasta/grovedb", rev = "b48a1d5067f33165f5c8880b252da51b79b2fcd1", default-features = false }
 grovedb-costs = { git = "https://github.com/PastaPastaPasta/grovedb", rev = "b48a1d5067f33165f5c8880b252da51b79b2fcd1" }
 grovedb-merk = { git = "https://github.com/PastaPastaPasta/grovedb", rev = "b48a1d5067f33165f5c8880b252da51b79b2fcd1", default-features = false }
