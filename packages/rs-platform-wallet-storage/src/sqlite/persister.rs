@@ -766,6 +766,17 @@ impl SqlitePersister {
         .map(drop)
     }
 
+    /// The coins earlier open-time repairs of unsigned pending spends gave
+    /// back for `wallet_id`, read from its committed recovery rows: only
+    /// outpoints the dropped transaction spends, in drop order, each once.
+    pub fn repair_released_coins(
+        &self,
+        wallet_id: &WalletId,
+    ) -> Result<Vec<dashcore::OutPoint>, WalletStorageError> {
+        let conn = self.conn()?;
+        schema::core_state::repair_released_coins(&conn, wallet_id)
+    }
+
     fn write_block_spends(
         &self,
         wallet_id: &WalletId,

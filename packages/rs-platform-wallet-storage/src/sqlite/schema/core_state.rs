@@ -988,8 +988,24 @@ struct ArchivedDrop {
     released: Vec<dashcore::OutPoint>,
 }
 
-fn archived_drops(tx: &Transaction<'_>) -> Result<Vec<ArchivedDrop>, WalletStorageError> {
-    let mut stmt = tx.prepare_cached(
+/// The coins earlier open-time repairs gave back for `wallet_id`, from its
+/// readable rows of `core_dropped_unsigned_spends`, in drop order and
+/// without repeats.
+pub fn repair_released_coins(
+    conn: &Connection,
+    wallet_id: &WalletId,
+) -> Result<Vec<dashcore::OutPoint>, WalletStorageError> {
+    let mut seen = HashSet::new();
+    Ok(archived_drops(conn)?
+        .into_iter()
+        .filter(|drop| drop.wallet_id == *wallet_id)
+        .flat_map(|drop| drop.released)
+        .filter(|outpoint| seen.insert(*outpoint))
+        .collect())
+}
+
+fn archived_drops(conn: &Connection) -> Result<Vec<ArchivedDrop>, WalletStorageError> {
+    let mut stmt = conn.prepare_cached(
         "SELECT wallet_id, txid, length(record_blob), record_blob, released_coins \
          FROM core_dropped_unsigned_spends ORDER BY id",
     )?;
@@ -3401,6 +3417,84 @@ mod tests {
                 params![&w[..]],
             )
             .unwrap();
+        }
+
+        /// A recovery row as a repair writes it: `released` names `coins`.
+        fn archived(
+            conn: &rusqlite::Connection,
+            w: &[u8; 32],
+            tx: Transaction,
+            coins: &[OutPoint],
+        ) {
+            let released = coins
+                .iter()
+                .map(|op| format!("{{\"outpoint\":\"{}\",\"value\":1}}", outpoint_hex(op)))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(
+                "INSERT INTO core_dropped_unsigned_spends \
+                    (wallet_id, txid, record_blob, deleted_outputs, released_coins) \
+                 VALUES (?1, ?2, ?3, '[]', ?4)",
+                params![
+                    &w[..],
+                    AsRef::<[u8]>::as_ref(&tx.txid()),
+                    blob::encode(&spend_record(tx, TransactionContext::Mempool)).unwrap(),
+                    format!("[{released}]")
+                ],
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn the_persister_lists_the_coins_a_wallets_repairs_gave_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("wallet.db");
+            let (w, other) = ([0xC5u8; 32], [0xC6u8; 32]);
+            let conn = wallet_db_in(rusqlite::Connection::open(&path).unwrap(), &w);
+            add_wallet(&conn, &other);
+            let me = owner(0x31);
+            let coins: Vec<Utxo> = (0..3u8)
+                .map(|i| {
+                    coin(
+                        &me,
+                        OutPoint::new(Txid::from_byte_array([0x50 + i; 32]), 0),
+                        10_000,
+                    )
+                })
+                .collect();
+            let mut both = spend(&coins[0], &me, &owner(0x99), Vec::new());
+            both.input.push(TxIn {
+                previous_output: coins[1].outpoint,
+                ..both.input[0].clone()
+            });
+            let foreign = OutPoint::new(Txid::from_byte_array([0x5F; 32]), 1);
+            archived(
+                &conn,
+                &w,
+                both,
+                &[coins[0].outpoint, coins[1].outpoint, foreign],
+            );
+            let theirs = spend(&coins[2], &me, &owner(0x99), Vec::new());
+            archived(&conn, &other, theirs, &[coins[2].outpoint]);
+            drop(conn);
+
+            let persister = crate::sqlite::persister::SqlitePersister::open(
+                crate::sqlite::config::SqlitePersisterConfig::new(&path),
+            )
+            .unwrap();
+            assert_eq!(
+                persister.repair_released_coins(&w).unwrap(),
+                vec![coins[0].outpoint, coins[1].outpoint],
+                "only coins the dropped spend spends, and only this wallet's"
+            );
+            assert_eq!(
+                persister.repair_released_coins(&other).unwrap(),
+                vec![coins[2].outpoint]
+            );
+            assert!(persister
+                .repair_released_coins(&[0xC7u8; 32])
+                .unwrap()
+                .is_empty());
         }
 
         /// A pending spend of a dropped claim's change, and a spend of that
