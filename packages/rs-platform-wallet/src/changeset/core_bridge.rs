@@ -3949,6 +3949,7 @@ mod contact_watch_only_projection_tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");
@@ -4484,6 +4485,7 @@ mod tests {
         /// the overlay rows is the persister's job, not a second carrier's.
         dashpay_identity_payments: Option<PaymentOverlay>,
         n_block_spends: usize,
+        core: Option<CoreChangeSet>,
         rejected: bool,
     }
 
@@ -4593,6 +4595,7 @@ mod tests {
                         .collect()
                 }),
                 n_block_spends: core.map(|c| c.block_spends.len()).unwrap_or(0),
+                core: core.cloned(),
                 rejected,
             });
             if rejected {
@@ -6729,6 +6732,67 @@ mod tests {
             .contains("synced_height_persisted=Some(500)"));
     }
 
+    #[test]
+    fn a_host_without_core_block_spends_gets_the_round_without_only_its_block_spends() {
+        use crate::changeset::{BlockSpend, PersistenceCapabilities};
+        use dashcore::hashes::Hash;
+        use dashcore::OutPoint;
+
+        let wallet_id = [0x2Bu8; 32];
+        let mut round = watermark_with_rows(500, 501);
+        round.last_applied_chain_lock =
+            Some(dashcore::ephemerealdata::chain_lock::ChainLock::dummy(400));
+        round.sweeps = vec![crate::changeset::changeset::SweepBatch {
+            txids: vec![dashcore::Txid::from_byte_array([1; 32])],
+            superseded_by: dashcore::Txid::from_byte_array([2; 32]),
+            winner_mined_height: Some(450),
+            released_outpoints: Vec::new(),
+        }];
+        let expected = format!("{round:?}");
+        round.block_spends = vec![BlockSpend {
+            outpoint: OutPoint {
+                txid: dashcore::Txid::from_byte_array([3; 32]),
+                vout: 0,
+            },
+            height: 450,
+            block_hash: dashcore::BlockHash::from_byte_array([4; 32]),
+            spender_txid: dashcore::Txid::from_byte_array([5; 32]),
+        }];
+        round.block_spends_truncated_above = Some(449);
+
+        for (capabilities, stripped) in [
+            (PersistenceCapabilities::CORE_SWEEP_REMOVAL, true),
+            (
+                PersistenceCapabilities::CORE_SWEEP_REMOVAL
+                    .union(PersistenceCapabilities::CORE_BLOCK_SPENDS),
+                false,
+            ),
+        ] {
+            let (obs_tx, mut obs_rx) = unbounded_channel();
+            let persister = ProbePersister::with_capabilities(obs_tx, capabilities);
+            let diag = commit_batch(
+                &persister,
+                one_wallet_batch(wallet_id, round.clone()),
+                1,
+                &mut AdapterFaultState::default(),
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &mut Vec::new(),
+            );
+            let stored = obs_rx
+                .try_recv()
+                .expect("the round is stored")
+                .core
+                .expect("with its core changeset");
+            assert_eq!(diag.persisted, Some(500), "the watermark is not held back");
+            if stripped {
+                assert_eq!(format!("{stored:?}"), expected);
+            } else {
+                assert_eq!(format!("{stored:?}"), format!("{round:?}"));
+            }
+        }
+    }
+
     /// Invariant: a REJECTED `store()` must never be
     /// reported as persisted.
     #[test]
@@ -7443,6 +7507,7 @@ mod utxo_credit_verdict_tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");
@@ -7541,6 +7606,7 @@ mod utxo_credit_verdict_tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");
@@ -8190,6 +8256,34 @@ mod block_spend_tests {
             captured(&info).is_empty(),
             "a mempool record is no block spend"
         );
+        info.check_core_transaction(&spending(input), in_block(101), &mut wallet, true, true)
+            .await;
+        assert_eq!(captured(&info), vec![input]);
+    }
+
+    #[tokio::test]
+    async fn a_record_added_between_checks_of_one_block_is_seen_by_the_next() {
+        let mut wallet = new_wallet();
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        info.check_core_transaction(
+            &spending(outpoint(0x40)),
+            in_block(101),
+            &mut wallet,
+            true,
+            true,
+        )
+        .await;
+        let address = external_addresses(&wallet, bip44_account_0(), 1).remove(0);
+        let pending = transaction_paying(&[address], 50_000, 8);
+        let input = pending.input[0].previous_output;
+        info.check_core_transaction(
+            &pending,
+            TransactionContext::Mempool,
+            &mut wallet,
+            true,
+            true,
+        )
+        .await;
         info.check_core_transaction(&spending(input), in_block(101), &mut wallet, true, true)
             .await;
         assert_eq!(captured(&info), vec![input]);

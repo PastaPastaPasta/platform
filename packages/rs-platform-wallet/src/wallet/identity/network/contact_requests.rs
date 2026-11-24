@@ -4203,6 +4203,7 @@ mod sweep_tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
             dpns_name_states: BTreeMap::new(),
         }
     }

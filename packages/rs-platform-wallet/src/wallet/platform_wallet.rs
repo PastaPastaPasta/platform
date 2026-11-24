@@ -308,6 +308,14 @@ pub struct PlatformWalletInfo {
     /// truncation drops entries above the fork. A mutex so the event
     /// bridge can drain it under the manager's read lock.
     pub(crate) pending_block_spends: std::sync::Mutex<Vec<crate::changeset::BlockSpend>>,
+    /// The inputs of the wallet's unconfirmed records, read once for the
+    /// block being processed and keyed by its hash. A check outside a block,
+    /// a height advance or a truncation drops it. Within a block the live
+    /// set only shrinks, so the snapshot can add a capture, never miss one.
+    pub(crate) block_capture_inputs: Option<(
+        dashcore::BlockHash,
+        std::sync::Arc<std::collections::BTreeSet<OutPoint>>,
+    )>,
 }
 
 impl PlatformWalletInfo {

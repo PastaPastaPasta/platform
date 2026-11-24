@@ -45,6 +45,7 @@ impl WalletInfoInterface for PlatformWalletInfo {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
             dpns_name_states: std::collections::BTreeMap::new(),
         }
     }
@@ -61,6 +62,7 @@ impl WalletInfoInterface for PlatformWalletInfo {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
             dpns_name_states: std::collections::BTreeMap::new(),
         }
     }
@@ -159,6 +161,7 @@ impl WalletInfoInterface for PlatformWalletInfo {
     }
 
     fn update_last_processed_height(&mut self, current_height: u32) {
+        self.block_capture_inputs = None;
         self.core_wallet
             .update_last_processed_height(current_height);
     }
@@ -168,6 +171,7 @@ impl WalletInfoInterface for PlatformWalletInfo {
     }
 
     fn truncate_above(&mut self, height: CoreBlockHeight) -> Result<Truncation, key_wallet::Error> {
+        self.block_capture_inputs = None;
         let truncation = self.core_wallet.truncate_above(height)?;
         self.pending_block_spends
             .get_mut()
@@ -262,6 +266,25 @@ impl WalletInfoInterface for PlatformWalletInfo {
 }
 
 impl PlatformWalletInfo {
+    fn unconfirmed_inputs_of_block(
+        &mut self,
+        block_hash: dashcore::BlockHash,
+    ) -> std::sync::Arc<BTreeSet<OutPoint>> {
+        if let Some((hash, inputs)) = &self.block_capture_inputs {
+            if *hash == block_hash {
+                return std::sync::Arc::clone(inputs);
+            }
+        }
+        let inputs = std::sync::Arc::new(
+            self.core_wallet
+                .unconfirmed_spent_outpoints()
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
+        );
+        self.block_capture_inputs = Some((block_hash, std::sync::Arc::clone(&inputs)));
+        inputs
+    }
+
     fn holds_or_claims(&self, outpoint: &OutPoint) -> bool {
         self.has_restored_claim(outpoint)
             || self
@@ -293,17 +316,20 @@ impl WalletTransactionChecker for PlatformWalletInfo {
             .filter(|_| update_state && !tx.is_coin_base())
             .copied();
         let mut spent: BTreeSet<OutPoint> = match block {
-            Some(_) => {
-                let pending = self.core_wallet.unconfirmed_spent_outpoints();
+            Some(block) => {
+                let pending = self.unconfirmed_inputs_of_block(block.block_hash());
                 tx.input
                     .iter()
                     .map(|input| input.previous_output)
-                    .filter(|outpoint| {
-                        pending.contains_key(outpoint) || self.holds_or_claims(outpoint)
-                    })
+                    .filter(|outpoint| pending.contains(outpoint) || self.holds_or_claims(outpoint))
                     .collect()
             }
-            None => BTreeSet::new(),
+            None => {
+                if update_state {
+                    self.block_capture_inputs = None;
+                }
+                BTreeSet::new()
+            }
         };
         let result = self
             .core_wallet

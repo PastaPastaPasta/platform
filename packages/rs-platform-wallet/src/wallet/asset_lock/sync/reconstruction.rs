@@ -661,6 +661,7 @@ mod tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
             core_wallet: ctx.managed_wallet,
             generation: std::sync::Arc::new(WalletGeneration::new()),
             identity_manager: IdentityManager::new(),

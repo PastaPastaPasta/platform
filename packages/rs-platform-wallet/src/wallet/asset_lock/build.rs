@@ -4211,6 +4211,7 @@ mod tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
             core_wallet,
             generation: Arc::clone(&generation),
             identity_manager: crate::wallet::identity::IdentityManager::new(),

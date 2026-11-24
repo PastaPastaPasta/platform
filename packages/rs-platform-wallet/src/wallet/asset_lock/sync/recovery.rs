@@ -2553,6 +2553,7 @@ mod tests {
             observed_input_conflicts: Default::default(),
             spent_claim_mirror: Default::default(),
             pending_block_spends: Default::default(),
+            block_capture_inputs: None,
             core_wallet: ManagedWalletInfo::from_wallet(&restored_wallet, 0),
             generation: Arc::new(WalletGeneration::new()),
             identity_manager: IdentityManager::new(),
