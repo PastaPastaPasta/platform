@@ -12,12 +12,14 @@ use tokio::task::{JoinError, JoinHandle};
 use dashcore::sml::llmq_entry_verification::LLMQEntryVerificationStatus;
 use dashcore::sml::llmq_type::LLMQType;
 use dashcore::sml::masternode_list::MasternodeList;
-use dashcore::{PubkeyHash, QuorumHash, Transaction};
+use dashcore::{PubkeyHash, QuorumHash, Transaction, Txid};
 
 use dash_spv::network::PeerNetworkManager;
 use dash_spv::storage::{DiskStorageManager, StorageManager};
 use dash_spv::sync::SyncProgress;
-use dash_spv::{BroadcastResult, ClientConfig, DashSpvClient, EventHandler, Hash};
+use dash_spv::{
+    BroadcastResult, ClientConfig, DashSpvClient, EventHandler, Hash, RebroadcastStops,
+};
 
 use key_wallet_manager::WalletManager;
 
@@ -84,6 +86,10 @@ pub struct SpvRuntime {
     /// each stop or storage clear, so none of them interleave.
     shutdown: tokio::sync::Mutex<Shutdown>,
     peer_tracker: Arc<PeerTracker>,
+    /// The latest started client's [`RebroadcastStops`], set before that
+    /// client is published, so no broadcast reaches a client whose stops it
+    /// can't name.
+    rebroadcast_stops: Mutex<Option<RebroadcastStops>>,
 }
 
 /// Classify a failure from the SPV acceptance-check path
@@ -124,6 +130,7 @@ impl SpvRuntime {
             task: Mutex::new(None),
             shutdown: tokio::sync::Mutex::new(Shutdown::Idle),
             peer_tracker: Arc::new(PeerTracker::default()),
+            rebroadcast_stops: Mutex::new(None),
         }
     }
 
@@ -173,6 +180,10 @@ impl SpvRuntime {
         .await
         .map_err(|e| PlatformWalletError::SpvError(e.to_string()))?;
 
+        *self
+            .rebroadcast_stops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(spv_client.rebroadcast_stops());
         let mut client = self.client.write().await;
         *client = Some(spv_client);
         *self.last_config.write().await = Some(retained_config);
@@ -328,6 +339,21 @@ impl SpvRuntime {
             .broadcast_transaction_and_wait(tx, timeout)
             .await
             .map_err(classify_spv_send_error)
+    }
+
+    /// Stops the SPV client from sending `txid` again: its rebroadcast timer
+    /// skips it from now on, and a broadcast of it still queued is not sent
+    /// (dash-spv's `DashSpvClient::stop_rebroadcast`). For a transaction the
+    /// wallet abandoned. Never waits, so a caller holding the wallet
+    /// manager's lock may call it; a no-op before the first start.
+    pub fn stop_rebroadcast(&self, txid: &Txid) {
+        let stops = self
+            .rebroadcast_stops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(stops) = stops.as_ref() {
+            stops.stop(txid);
+        }
     }
 
     /// Look up a quorum public key via the SPV masternode state.
