@@ -555,10 +555,11 @@ pub(crate) fn drop_unauthorized_pending_spends(
         }
     }
     respend_released_coins(tx, &archived, &history.claims, &archive_claims, &valid)?;
-    if !history.unreadable_wallets.is_empty() {
+    if history.unreadable_rows > 0 {
         tracing::warn!(
-            "a stored transaction cannot be read; the open-time repair of unsigned \
-             spends drops nothing this time"
+            rows = history.unreadable_rows,
+            "stored rows cannot be read; the open-time repair of unsigned spends drops \
+             nothing this time"
         );
         return Ok(0);
     }
@@ -569,9 +570,7 @@ pub(crate) fn drop_unauthorized_pending_spends(
     roots.dedup();
     let mut doomed: HashSet<dashcore::Txid> = HashSet::new();
     for group in history.groups(&roots) {
-        let mut kept = group
-            .iter()
-            .any(|t| valid.contains(t) || history.unjudgeable(t));
+        let mut kept = group.iter().any(|t| valid.contains(t));
         if !kept {
             for txid in &group {
                 if let Some(transaction) = transactions.get(txid) {
@@ -916,8 +915,9 @@ struct StoredHistory {
     final_txids: HashSet<dashcore::Txid>,
     /// What each verified lock spends.
     lock_inputs: HashMap<dashcore::Txid, Vec<dashcore::OutPoint>>,
-    unreadable_txids: HashSet<dashcore::Txid>,
-    unreadable_wallets: HashSet<WalletId>,
+    /// Rows with a key or record the repair cannot read: what they hold or
+    /// spend is unknown, so nothing is dropped while there are any.
+    unreadable_rows: usize,
 }
 
 impl StoredHistory {
@@ -932,6 +932,7 @@ impl StoredHistory {
                 .map(dashcore::Txid::from_byte_array)
         };
         let mut wallets = Vec::new();
+        let mut history_unreadable = 0usize;
         {
             let mut stmt = tx.prepare_cached(
                 "SELECT wallet_id FROM core_transactions UNION SELECT wallet_id FROM core_utxos \
@@ -940,8 +941,9 @@ impl StoredHistory {
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let wallet_id: Vec<u8> = row.get(0)?;
-                if let Ok(wallet_id) = WalletId::try_from(wallet_id.as_slice()) {
-                    wallets.push(wallet_id);
+                match WalletId::try_from(wallet_id.as_slice()) {
+                    Ok(wallet_id) => wallets.push(wallet_id),
+                    Err(_) => history_unreadable += 1,
                 }
             }
         }
@@ -953,8 +955,7 @@ impl StoredHistory {
             spenders: HashMap::new(),
             final_txids: HashSet::new(),
             lock_inputs: HashMap::new(),
-            unreadable_txids: HashSet::new(),
-            unreadable_wallets: HashSet::new(),
+            unreadable_rows: history_unreadable,
         };
         {
             let mut stmt = tx.prepare_cached(
@@ -999,11 +1000,12 @@ impl StoredHistory {
         while let Some(row) = rows.next()? {
             let wallet_id: Vec<u8> = row.get(0)?;
             let Ok(wallet_id) = WalletId::try_from(wallet_id.as_slice()) else {
+                history.unreadable_rows += 1;
                 continue;
             };
             let txid_bytes: Vec<u8> = row.get(1)?;
             let Some(txid) = txid_of(&txid_bytes) else {
-                history.unreadable_wallets.insert(wallet_id);
+                history.unreadable_rows += 1;
                 continue;
             };
             history.present.entry(txid).or_default().insert(wallet_id);
@@ -1015,8 +1017,7 @@ impl StoredHistory {
             };
             let length: i64 = row.get(3)?;
             let Some(record) = readable_record(txid_bytes, length, blob_bytes.clone()) else {
-                history.unreadable_txids.insert(txid);
-                history.unreadable_wallets.insert(wallet_id);
+                history.unreadable_rows += 1;
                 continue;
             };
             if record.block_info().is_some() {
@@ -1110,16 +1111,6 @@ impl StoredHistory {
             groups.entry(root).or_default().push(*txid);
         }
         groups.into_values().collect()
-    }
-
-    /// A row of `txid` cannot be read, or a wallet holding it has a row the
-    /// repair cannot read.
-    fn unjudgeable(&self, txid: &dashcore::Txid) -> bool {
-        self.unreadable_txids.contains(txid)
-            || self
-                .present
-                .get(txid)
-                .is_some_and(|wallets| wallets.iter().any(|w| self.unreadable_wallets.contains(w)))
     }
 }
 
@@ -3843,6 +3834,25 @@ mod tests {
             conn.execute(
                 "UPDATE core_transactions SET record_blob = x'00' WHERE wallet_id = ?1",
                 params![&other[..]],
+            )
+            .unwrap();
+            assert_eq!(repair(&mut conn), 0);
+            assert!(has_record(&conn, &w, claim.txid()));
+            assert_eq!(unspent(&conn, &w), vec![change.outpoint]);
+        }
+
+        /// A row whose wallet key is malformed could hold a spend of
+        /// anything: nothing is dropped while it is there.
+        #[test]
+        fn a_row_with_a_malformed_wallet_key_defers_the_drops() {
+            let w = [0xFBu8; 32];
+            let (mut conn, _, change, claim) = old_build_store(&w, 0x99, pending);
+            conn.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO core_transactions \
+                    (wallet_id, txid, height, block_hash, block_time, finalized, record_blob) \
+                 VALUES (x'0102030405', zeroblob(32), NULL, NULL, NULL, 0, x'00');
+                 PRAGMA foreign_keys = ON;",
             )
             .unwrap();
             assert_eq!(repair(&mut conn), 0);
