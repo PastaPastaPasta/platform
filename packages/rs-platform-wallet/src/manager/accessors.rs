@@ -1947,6 +1947,8 @@ mod txo_inventory_tests {
             tracked_asset_locks: BTreeMap::new(),
             dpns_name_states: BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");

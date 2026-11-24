@@ -365,6 +365,8 @@ impl<P: PlatformWalletPersistence + 'static> PlatformWalletManager<P> {
 
         let platform_info = PlatformWalletInfo {
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
             core_wallet: wallet_info,
             generation: Arc::clone(&generation),
             identity_manager: crate::wallet::identity::IdentityManager::new(),

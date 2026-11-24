@@ -4201,6 +4201,8 @@ mod sweep_tests {
             identity_manager: IdentityManager::new(),
             tracked_asset_locks: BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
             dpns_name_states: BTreeMap::new(),
         }
     }

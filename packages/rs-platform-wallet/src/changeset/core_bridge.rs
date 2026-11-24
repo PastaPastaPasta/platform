@@ -778,6 +778,20 @@ fn commit_wallet<P>(
         // as "this batch carried no watermark".
         let proposed_height = core.synced_height;
         freeze_synced_height_if_faulted(&mut core, is_faulted);
+        if (!core.block_spends.is_empty() || core.block_spends_truncated_above.is_some())
+            && !persister
+                .persistence_capabilities()
+                .contains(PersistenceCapabilities::CORE_BLOCK_SPENDS)
+        {
+            tracing::debug!(
+                wallet_id = %hex::encode(wallet_id),
+                block_spends = core.block_spends.len(),
+                "Persister does not advertise CORE_BLOCK_SPENDS; withholding this round's \
+                 block spends"
+            );
+            core.block_spends.clear();
+            core.block_spends_truncated_above = None;
+        }
         if is_faulted {
             if let Some(h) = proposed_height {
                 diag.record_frozen(h);
@@ -1116,8 +1130,24 @@ async fn reconstruct_asset_locks_for_event(
 }
 
 /// Project an upstream [`WalletEvent`] into a [`CoreChangeSet`] suitable
-/// for atomic persistence.
+/// for atomic persistence, carrying every block spend the event's wallet
+/// captured since the last build (see [`CoreChangeSet::block_spends`]).
+/// Drained on every build, whatever the event: a block whose only wallet
+/// fact is a spend of a claimed coin raises no event of its own, so its
+/// spends ride the next one, at the latest the sync checkpoint passing it.
 async fn build_core_changeset(
+    wallet_manager: &Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
+    event: &WalletEvent,
+) -> CoreChangeSet {
+    let mut cs = project_core_event(wallet_manager, event).await;
+    let wm = wallet_manager.read().await;
+    if let Some(info) = wm.get_wallet_info(&event.wallet_id()) {
+        cs.block_spends.extend(info.drain_block_spends());
+    }
+    cs
+}
+
+async fn project_core_event(
     wallet_manager: &Arc<RwLock<WalletManager<PlatformWalletInfo>>>,
     event: &WalletEvent,
 ) -> CoreChangeSet {
@@ -1383,6 +1413,7 @@ async fn build_core_changeset(
             // `SweepBatch` needs a winning transaction, and nothing demotes a
             // confirmed record to unconfirmed. Until it can, the stored rows
             // and the stored sync height stay as they were before the fork.
+            // Only the block spends above the fork are dropped.
             tracing::warn!(
                 height,
                 removed = txids.len(),
@@ -1390,7 +1421,10 @@ async fn build_core_changeset(
                 restored = restored_outpoints.len(),
                 "Chain truncation is not mirrored to the persister; stored wallet state keeps the replaced branch"
             );
-            CoreChangeSet::default()
+            CoreChangeSet {
+                block_spends_truncated_above: Some(*height),
+                ..CoreChangeSet::default()
+            }
         }
         WalletEvent::SyncHeightAdvanced { height, .. } => CoreChangeSet {
             synced_height: Some(*height),
@@ -2243,6 +2277,8 @@ impl CoreChangeSet {
             && self.addresses_marked_used.is_empty()
             && self.account_highest_used.is_empty()
             && self.utxo_credit_verdicts.is_empty()
+            && self.block_spends.is_empty()
+            && self.block_spends_truncated_above.is_none()
     }
 }
 
@@ -2334,7 +2370,7 @@ mod swept_transaction_projection_tests {
     /// produces no persistable change, least of all a sweep (it has no
     /// winning transaction) or a height (heights only move up on merge).
     #[tokio::test]
-    async fn should_persist_nothing_for_a_chain_truncation() {
+    async fn a_chain_truncation_mirrors_only_its_block_spends() {
         let event = WalletEvent::ChainTruncated {
             wallet_id: WALLET_ID,
             height: WINNER_HEIGHT,
@@ -2345,9 +2381,14 @@ mod swept_transaction_projection_tests {
             account_balances: BTreeMap::new(),
         };
 
-        let cs = build_core_changeset(&test_manager(), &event).await;
+        let mut cs = build_core_changeset(&test_manager(), &event).await;
 
-        assert!(cs.is_empty(), "a truncation is not mirrored yet");
+        assert_eq!(cs.block_spends_truncated_above, Some(WINNER_HEIGHT));
+        cs.block_spends_truncated_above = None;
+        assert!(
+            cs.is_empty(),
+            "only the block spends of a truncation are mirrored"
+        );
     }
 
     #[tokio::test]
@@ -3906,6 +3947,8 @@ mod contact_watch_only_projection_tests {
             tracked_asset_locks: BTreeMap::new(),
             dpns_name_states: BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");
@@ -4440,6 +4483,7 @@ mod tests {
         /// stale wholesale replace (dashpay/platform#4651). Durability for
         /// the overlay rows is the persister's job, not a second carrier's.
         dashpay_identity_payments: Option<PaymentOverlay>,
+        n_block_spends: usize,
         rejected: bool,
     }
 
@@ -4548,6 +4592,7 @@ mod tests {
                         .map(|(id, entry)| (*id, entry.dashpay_payments.clone()))
                         .collect()
                 }),
+                n_block_spends: core.map(|c| c.block_spends.len()).unwrap_or(0),
                 rejected,
             });
             if rejected {
@@ -4832,6 +4877,88 @@ mod tests {
         cancel.cancel();
         drop(tx);
         handle.await.unwrap();
+    }
+
+    /// A round carrying a block spend that the store rejects faults the
+    /// wallet like any rejected round: the watermark it carried is not
+    /// persisted and later ones are held. A fresh wallet that restores the
+    /// same claim captures the spend again when the block is replayed.
+    #[tokio::test]
+    async fn a_rejected_block_spend_round_faults_the_wallet_and_replay_recaptures() {
+        use super::block_spend_tests::{new_wallet, spending};
+        use crate::changeset::PersistenceCapabilities;
+        use crate::test_support::wallet_manager_with_persistence;
+        use dashcore::hashes::Hash;
+        use dashcore::OutPoint;
+        use key_wallet_manager::WalletInterface;
+        use std::collections::BTreeSet;
+
+        let claimed = OutPoint {
+            txid: dashcore::Txid::from_byte_array([0x5A; 32]),
+            vout: 0,
+        };
+        let block = dashcore::Block::dummy(150, vec![spending(claimed)]);
+        let wallet = new_wallet();
+        let replay_wallet = wallet.clone();
+        let (manager, wallet_id, receiver) = wallet_manager_with_persistence(wallet);
+        {
+            let mut wm = manager.write().await;
+            wm.get_wallet_info_mut(&wallet_id)
+                .unwrap()
+                .restore_spent_outpoints(&[(claimed, None)]);
+            wm.process_block_for_wallets(
+                &block,
+                block.block_hash(),
+                150,
+                &BTreeSet::from([wallet_id]),
+            )
+            .await;
+            wm.update_wallet_synced_height(&wallet_id, 150);
+        }
+
+        let (obs_tx, mut obs_rx) = unbounded_channel();
+        let persister = Arc::new(ProbePersister::with_capabilities(
+            obs_tx,
+            PersistenceCapabilities::CORE_BLOCK_SPENDS,
+        ));
+        persister.fail_next(wallet_id);
+        let sync_fault = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_wallet_event_adapter(
+            Arc::clone(&manager),
+            Arc::downgrade(&persister),
+            receiver,
+            Arc::clone(&sync_fault),
+            cancel.clone(),
+        ));
+        let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), obs_rx.recv())
+            .await
+            .expect("the round reaches the store")
+            .expect("store observed");
+        assert!(rejected.rejected);
+        assert_eq!(rejected.n_block_spends, 1);
+        assert_eq!(rejected.synced_height, Some(150));
+        cancel.cancel();
+        handle.await.unwrap();
+        assert!(sync_fault.load(Ordering::Relaxed), "the wallet is faulted");
+
+        let (replayed, replay_id, _receiver) = wallet_manager_with_persistence(replay_wallet);
+        let mut wm = replayed.write().await;
+        wm.get_wallet_info_mut(&replay_id)
+            .unwrap()
+            .restore_spent_outpoints(&[(claimed, None)]);
+        wm.process_block_for_wallets(
+            &block,
+            block.block_hash(),
+            150,
+            &BTreeSet::from([replay_id]),
+        )
+        .await;
+        let again = wm.get_wallet_info(&replay_id).unwrap().drain_block_spends();
+        assert_eq!(
+            again.iter().map(|s| s.outpoint).collect::<Vec<_>>(),
+            vec![claimed]
+        );
     }
 
     /// (d) Record-bearing changesets keep persisting after the guard is
@@ -7314,6 +7441,8 @@ mod utxo_credit_verdict_tests {
             tracked_asset_locks: BTreeMap::new(),
             dpns_name_states: BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");
@@ -7410,6 +7539,8 @@ mod utxo_credit_verdict_tests {
             tracked_asset_locks: BTreeMap::new(),
             dpns_name_states: BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
         };
         let mut wm = WalletManager::<PlatformWalletInfo>::new(dashcore::Network::Testnet);
         let wallet_id = wm.insert_wallet(ctx.wallet, info).expect("insert wallet");
@@ -7889,5 +8020,344 @@ mod instant_lock_storage_tests {
     async fn a_lock_that_arrives_after_its_transaction_is_stored() {
         let (stored, lock) = stored_locks(false).await;
         assert_eq!(stored, BTreeMap::from([(lock.txid, lock)]));
+    }
+}
+
+#[cfg(test)]
+mod block_spend_tests {
+    //! The durable "spent in a block" fact: what `check_core_transaction`
+    //! captures, how it rides the changeset, and how a truncation drops it.
+
+    use super::*;
+    use crate::changeset::{BlockSpend, Merge};
+    use crate::test_support::{
+        external_addresses, transaction_paying, wallet_manager_with_persistence,
+    };
+    use dashcore::ephemerealdata::chain_lock::ChainLock;
+    use dashcore::hashes::Hash;
+    use dashcore::{BlockHash, ScriptBuf, Transaction, TxIn, Txid, Witness};
+    use key_wallet::account::StandardAccountType;
+    use key_wallet::transaction_checking::{BlockInfo, WalletTransactionChecker};
+    use key_wallet::wallet::initialization::WalletAccountCreationOptions;
+    use key_wallet::wallet::managed_wallet_info::wallet_info_interface::WalletInfoInterface;
+    use key_wallet::Wallet;
+    use key_wallet_manager::WalletInterface;
+    use std::collections::BTreeSet;
+
+    const BLOCK_HASH: [u8; 32] = [7u8; 32];
+
+    pub(super) fn new_wallet() -> Wallet {
+        Wallet::new_random(
+            key_wallet::Network::Testnet,
+            WalletAccountCreationOptions::Default,
+        )
+        .expect("wallet")
+    }
+
+    fn bip44_account_0() -> AccountType {
+        AccountType::Standard {
+            index: 0,
+            standard_account_type: StandardAccountType::BIP44Account,
+        }
+    }
+
+    fn in_block(height: u32) -> TransactionContext {
+        TransactionContext::InBlock(BlockInfo::new(
+            height,
+            BlockHash::from_byte_array(BLOCK_HASH),
+            1_700_000_000,
+        ))
+    }
+
+    fn foreign_script() -> ScriptBuf {
+        dashcore::Address::dummy(key_wallet::Network::Testnet, 9).script_pubkey()
+    }
+
+    /// A transaction spending `coin` to an address outside the wallet.
+    pub(super) fn spending(coin: OutPoint) -> Transaction {
+        spending_with(coin, 1)
+    }
+
+    fn spending_with(coin: OutPoint, nonce: u64) -> Transaction {
+        Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![TxIn {
+                previous_output: coin,
+                script_sig: ScriptBuf::new(),
+                sequence: u32::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: 1_000 + nonce,
+                script_pubkey: foreign_script(),
+            }],
+            special_transaction_payload: None,
+        }
+    }
+
+    fn outpoint(byte: u8) -> OutPoint {
+        OutPoint {
+            txid: Txid::from_byte_array([byte; 32]),
+            vout: 0,
+        }
+    }
+
+    fn spend(byte: u8, height: u32) -> BlockSpend {
+        BlockSpend {
+            outpoint: outpoint(byte),
+            height,
+            block_hash: BlockHash::from_byte_array([byte; 32]),
+            spender_txid: Txid::from_byte_array([byte ^ 0xFF; 32]),
+        }
+    }
+
+    fn captured(info: &PlatformWalletInfo) -> Vec<OutPoint> {
+        info.drain_block_spends()
+            .into_iter()
+            .map(|s| s.outpoint)
+            .collect()
+    }
+
+    /// A wallet info and its wallet, with one coin funded in a block.
+    async fn funded() -> (PlatformWalletInfo, Wallet, OutPoint) {
+        let mut wallet = new_wallet();
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        let address = external_addresses(&wallet, bip44_account_0(), 1).remove(0);
+        let funding = transaction_paying(&[address], 50_000, 3);
+        let result = info
+            .check_core_transaction(&funding, in_block(100), &mut wallet, true, true)
+            .await;
+        assert!(result.is_relevant);
+        info.drain_block_spends();
+        let coin = OutPoint {
+            txid: funding.txid(),
+            vout: 0,
+        };
+        (info, wallet, coin)
+    }
+
+    #[tokio::test]
+    async fn a_block_spend_of_a_host_restored_claim_is_captured() {
+        let mut wallet = new_wallet();
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        let claimed = outpoint(0x11);
+        info.restore_spent_outpoints(&[(claimed, None)]);
+        let w = spending(claimed);
+        info.check_core_transaction(&w, in_block(120), &mut wallet, true, true)
+            .await;
+        let spends = info.drain_block_spends();
+        assert_eq!(
+            spends,
+            vec![BlockSpend {
+                outpoint: claimed,
+                height: 120,
+                block_hash: BlockHash::from_byte_array(BLOCK_HASH),
+                spender_txid: w.txid(),
+            }]
+        );
+        assert!(info.drain_block_spends().is_empty(), "a drain empties it");
+    }
+
+    #[tokio::test]
+    async fn a_block_spend_of_a_held_utxo_is_captured() {
+        let (mut info, mut wallet, coin) = funded().await;
+        info.check_core_transaction(&spending(coin), in_block(101), &mut wallet, true, true)
+            .await;
+        assert_eq!(captured(&info), vec![coin]);
+    }
+
+    #[tokio::test]
+    async fn a_block_spend_of_an_unconfirmed_spent_outpoint_is_captured() {
+        let mut wallet = new_wallet();
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        let address = external_addresses(&wallet, bip44_account_0(), 1).remove(0);
+        let pending = transaction_paying(&[address], 50_000, 7);
+        let input = pending.input[0].previous_output;
+        info.check_core_transaction(
+            &pending,
+            TransactionContext::Mempool,
+            &mut wallet,
+            true,
+            true,
+        )
+        .await;
+        assert!(info
+            .core_wallet
+            .unconfirmed_spent_outpoints()
+            .contains_key(&input));
+        assert!(
+            captured(&info).is_empty(),
+            "a mempool record is no block spend"
+        );
+        info.check_core_transaction(&spending(input), in_block(101), &mut wallet, true, true)
+            .await;
+        assert_eq!(captured(&info), vec![input]);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_check_captures_nothing() {
+        let (mut info, mut wallet, coin) = funded().await;
+        let claimed = outpoint(0x12);
+        info.restore_spent_outpoints(&[(claimed, None)]);
+        for tx in [spending(coin), spending(claimed)] {
+            info.check_core_transaction(&tx, in_block(101), &mut wallet, false, false)
+                .await;
+        }
+        assert!(captured(&info).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mempool_spend_captures_nothing() {
+        let (mut info, mut wallet, coin) = funded().await;
+        let claimed = outpoint(0x13);
+        info.restore_spent_outpoints(&[(claimed, None)]);
+        for tx in [spending(coin), spending(claimed)] {
+            info.check_core_transaction(&tx, TransactionContext::Mempool, &mut wallet, true, true)
+                .await;
+        }
+        assert!(captured(&info).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_spend_of_an_unclaimed_coin_captures_nothing() {
+        let mut wallet = new_wallet();
+        let mut info = PlatformWalletInfo::from_wallet(&wallet, 0);
+        info.check_core_transaction(
+            &spending(outpoint(0x14)),
+            in_block(101),
+            &mut wallet,
+            true,
+            true,
+        )
+        .await;
+        assert!(captured(&info).is_empty());
+    }
+
+    /// The #268 shape through the manager: a claimed coin is spent by a
+    /// foreign transaction in a block that is born ChainLocked, and the sync
+    /// checkpoint then prunes the observed entry in the same session. The
+    /// block spend still reaches the changeset.
+    #[tokio::test]
+    async fn a_claimed_coins_block_spend_survives_the_finality_prune() {
+        let wallet = new_wallet();
+        let (manager, wallet_id, mut receiver) = wallet_manager_with_persistence(wallet);
+        let claimed = outpoint(0x21);
+        let w = spending(claimed);
+        let block = dashcore::Block::dummy(150, vec![w.clone()]);
+        {
+            let mut wm = manager.write().await;
+            wm.get_wallet_info_mut(&wallet_id)
+                .unwrap()
+                .restore_spent_outpoints(&[(claimed, None)]);
+            wm.apply_chain_lock(ChainLock::dummy(200));
+            wm.process_block_for_wallets(
+                &block,
+                block.block_hash(),
+                150,
+                &BTreeSet::from([wallet_id]),
+            )
+            .await;
+            wm.update_wallet_synced_height(&wallet_id, 150);
+            let info = wm.get_wallet_info(&wallet_id).unwrap();
+            assert!(
+                !info
+                    .core_wallet
+                    .observed_spent_outpoints()
+                    .contains_key(&claimed),
+                "the finality prune dropped the observed spend"
+            );
+        }
+        let mut cs = CoreChangeSet::default();
+        while let Ok(event) = receiver.try_recv() {
+            cs.merge(build_core_changeset(&manager, &event).await);
+        }
+        assert_eq!(
+            cs.block_spends,
+            vec![BlockSpend {
+                outpoint: claimed,
+                height: 150,
+                block_hash: block.block_hash(),
+                spender_txid: w.txid(),
+            }]
+        );
+        assert_eq!(cs.synced_height, Some(150));
+    }
+
+    #[tokio::test]
+    async fn a_truncation_drops_queued_spends_above_the_fork() {
+        let wallet = new_wallet();
+        let (manager, wallet_id, _receiver) = wallet_manager_with_persistence(wallet);
+        let (low, high) = (outpoint(0x31), outpoint(0x32));
+        let mut wm = manager.write().await;
+        wm.get_wallet_info_mut(&wallet_id)
+            .unwrap()
+            .restore_spent_outpoints(&[(low, None), (high, None)]);
+        for (coin, height) in [(low, 100), (high, 102)] {
+            let block = dashcore::Block::dummy(height, vec![spending(coin)]);
+            wm.process_block_for_wallets(
+                &block,
+                block.block_hash(),
+                height,
+                &BTreeSet::from([wallet_id]),
+            )
+            .await;
+        }
+        wm.truncate_above(101).expect("truncates");
+        assert_eq!(captured(wm.get_wallet_info(&wallet_id).unwrap()), vec![low]);
+    }
+
+    #[test]
+    fn merge_appends_block_spends_and_counts_them_as_content() {
+        let mut older = CoreChangeSet {
+            block_spends: vec![spend(1, 10)],
+            ..CoreChangeSet::default()
+        };
+        let newer = CoreChangeSet {
+            block_spends: vec![spend(2, 11), spend(1, 12)],
+            ..CoreChangeSet::default()
+        };
+        assert!(!Merge::is_empty(&newer));
+        assert!(!newer.is_empty_no_records());
+        older.merge(newer);
+        assert_eq!(
+            older.block_spends,
+            vec![spend(1, 10), spend(2, 11), spend(1, 12)]
+        );
+        assert_eq!(older.block_spends_truncated_above, None);
+    }
+
+    #[test]
+    fn merge_rows_then_a_truncation_drops_the_rows_above_it() {
+        let mut older = CoreChangeSet {
+            block_spends: vec![spend(1, 100), spend(2, 101), spend(3, 102)],
+            ..CoreChangeSet::default()
+        };
+        older.merge(CoreChangeSet {
+            block_spends_truncated_above: Some(100),
+            ..CoreChangeSet::default()
+        });
+        assert_eq!(older.block_spends, vec![spend(1, 100)]);
+        assert_eq!(older.block_spends_truncated_above, Some(100));
+    }
+
+    #[test]
+    fn merge_a_truncation_then_rows_keeps_the_rows() {
+        let mut older = CoreChangeSet {
+            block_spends_truncated_above: Some(100),
+            ..CoreChangeSet::default()
+        };
+        assert!(!Merge::is_empty(&older));
+        older.merge(CoreChangeSet {
+            block_spends: vec![spend(4, 101)],
+            ..CoreChangeSet::default()
+        });
+        older.merge(CoreChangeSet {
+            block_spends_truncated_above: Some(105),
+            block_spends: vec![spend(5, 106)],
+            ..CoreChangeSet::default()
+        });
+        assert_eq!(older.block_spends, vec![spend(4, 101), spend(5, 106)]);
+        assert_eq!(older.block_spends_truncated_above, Some(100));
     }
 }

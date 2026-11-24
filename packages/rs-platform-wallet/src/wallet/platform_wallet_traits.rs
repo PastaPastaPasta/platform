@@ -26,6 +26,7 @@ use key_wallet::wallet::managed_wallet_info::TransactionRecord;
 use key_wallet::{Network, Utxo, Wallet, WalletCoreBalance};
 
 use super::platform_wallet::PlatformWalletInfo;
+use crate::changeset::BlockSpend;
 
 // ---------------------------------------------------------------------------
 // WalletInfoInterface — delegate to `self.core`
@@ -42,6 +43,8 @@ impl WalletInfoInterface for PlatformWalletInfo {
             identity_manager: super::identity::IdentityManager::new(),
             tracked_asset_locks: std::collections::BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
             dpns_name_states: std::collections::BTreeMap::new(),
         }
     }
@@ -56,6 +59,8 @@ impl WalletInfoInterface for PlatformWalletInfo {
             identity_manager: super::identity::IdentityManager::new(),
             tracked_asset_locks: std::collections::BTreeMap::new(),
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
             dpns_name_states: std::collections::BTreeMap::new(),
         }
     }
@@ -163,7 +168,12 @@ impl WalletInfoInterface for PlatformWalletInfo {
     }
 
     fn truncate_above(&mut self, height: CoreBlockHeight) -> Result<Truncation, key_wallet::Error> {
-        self.core_wallet.truncate_above(height)
+        let truncation = self.core_wallet.truncate_above(height)?;
+        self.pending_block_spends
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|spend| spend.height <= height);
+        Ok(truncation)
     }
 
     fn matured_coinbase_records(
@@ -251,6 +261,19 @@ impl WalletInfoInterface for PlatformWalletInfo {
     }
 }
 
+impl PlatformWalletInfo {
+    fn holds_or_claims(&self, outpoint: &OutPoint) -> bool {
+        self.has_restored_claim(outpoint)
+            || self
+                .core_wallet
+                .accounts
+                .all_accounts()
+                .into_iter()
+                .filter_map(|account| account.as_funds())
+                .any(|funds| funds.utxos.contains_key(outpoint))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WalletTransactionChecker — delegate to `self.core`
 // ---------------------------------------------------------------------------
@@ -265,10 +288,56 @@ impl WalletTransactionChecker for PlatformWalletInfo {
         update_state: bool,
         update_balance: bool,
     ) -> TransactionCheckResult {
-        // TODO: some logic must here - restore
-        self.core_wallet
+        let block = context
+            .block_info()
+            .filter(|_| update_state && !tx.is_coin_base())
+            .copied();
+        let mut spent: BTreeSet<OutPoint> = match block {
+            Some(_) => {
+                let pending = self.core_wallet.unconfirmed_spent_outpoints();
+                tx.input
+                    .iter()
+                    .map(|input| input.previous_output)
+                    .filter(|outpoint| {
+                        pending.contains_key(outpoint) || self.holds_or_claims(outpoint)
+                    })
+                    .collect()
+            }
+            None => BTreeSet::new(),
+        };
+        let result = self
+            .core_wallet
             .check_core_transaction(tx, context, wallet, update_state, update_balance)
-            .await
+            .await;
+        if let Some(block) = block {
+            let txid = tx.txid();
+            if !result.swept_transactions.is_empty() {
+                spent.extend(tx.input.iter().map(|input| input.previous_output));
+            }
+            for record in result.new_records.iter().chain(&result.updated_records) {
+                if record.txid != txid {
+                    continue;
+                }
+                for detail in &record.input_details {
+                    if let Some(input) = tx.input.get(detail.index as usize) {
+                        spent.insert(input.previous_output);
+                    }
+                }
+            }
+            if !spent.is_empty() {
+                let pending = self
+                    .pending_block_spends
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.extend(spent.into_iter().map(|outpoint| BlockSpend {
+                    outpoint,
+                    height: block.height(),
+                    block_hash: block.block_hash(),
+                    spender_txid: txid,
+                }));
+            }
+        }
+        result
     }
 }
 

@@ -4209,6 +4209,8 @@ mod tests {
         let generation = Arc::new(WalletGeneration::with_fences(fences));
         let info = PlatformWalletInfo {
             observed_input_conflicts: Default::default(),
+            spent_claim_mirror: Default::default(),
+            pending_block_spends: Default::default(),
             core_wallet,
             generation: Arc::clone(&generation),
             identity_manager: crate::wallet::identity::IdentityManager::new(),
