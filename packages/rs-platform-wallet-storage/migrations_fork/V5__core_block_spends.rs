@@ -7,6 +7,11 @@
 //! hands one back as unspent. A row goes only when a chain truncation
 //! replaces its block, when the engine rewinds or resets the wallet's chain
 //! data, or with its wallet.
+//!
+//! `core_block_spends_migrated` marks a wallet whose block spends from before
+//! this table were recovered (a one-time rescan by the host). No row means
+//! the recovery is still owed. A reset of the wallet's chain data keeps it;
+//! a wallet delete removes it.
 
 pub fn migration() -> String {
     "\
@@ -21,6 +26,12 @@ CREATE TABLE core_block_spends (
 );
 
 CREATE INDEX idx_core_block_spends_height
-    ON core_block_spends(wallet_id, height);"
+    ON core_block_spends(wallet_id, height);
+
+CREATE TABLE core_block_spends_migrated (
+    wallet_id BLOB NOT NULL PRIMARY KEY,
+    migrated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    FOREIGN KEY (wallet_id) REFERENCES wallets(wallet_id) ON DELETE CASCADE
+);"
         .to_string()
 }

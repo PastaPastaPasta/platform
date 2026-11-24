@@ -601,6 +601,7 @@ fn a_pre_fork_v1_database_migrates_with_no_stamp() {
              ALTER TABLE core_instant_locks DROP COLUMN verified;
              DROP TABLE core_dropped_unsigned_spends;
              DROP TABLE core_block_spends;
+             DROP TABLE core_block_spends_migrated;
              DROP TABLE {FORK_HISTORY_TABLE};"
         ))
         .unwrap();
@@ -642,7 +643,8 @@ fn as_an_old_fork_build_recorded_it(path: &std::path::Path) -> String {
         "DROP TABLE {FORK_HISTORY_TABLE};
          ALTER TABLE core_instant_locks DROP COLUMN verified;
          DROP TABLE core_dropped_unsigned_spends;
-         DROP TABLE core_block_spends;"
+         DROP TABLE core_block_spends;
+         DROP TABLE core_block_spends_migrated;"
     ))
     .unwrap();
     conn.execute(

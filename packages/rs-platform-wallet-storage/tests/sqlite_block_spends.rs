@@ -298,3 +298,53 @@ async fn deleting_the_wallet_deletes_its_block_spends() {
         .expect("delete");
     assert!(stored(&persister, &wallet_id).is_empty());
 }
+
+#[tokio::test]
+async fn the_block_spends_migration_is_owed_until_marked_and_survives_a_reset() {
+    let (persister, _tmp, _manager, wallet_id, _queued, _) = wallet_with_block_spends().await;
+    assert!(persister
+        .inner
+        .persistence_capabilities()
+        .contains(PersistenceCapabilities::CORE_BLOCK_SPENDS));
+    assert!(
+        !persister
+            .inner
+            .block_spends_migration_done(&wallet_id)
+            .unwrap(),
+        "a store that just attests the bit owes the migration"
+    );
+
+    persister
+        .inner
+        .mark_block_spends_migration_done(&wallet_id)
+        .unwrap();
+    persister
+        .inner
+        .mark_block_spends_migration_done(&wallet_id)
+        .unwrap();
+    assert!(persister
+        .inner
+        .block_spends_migration_done(&wallet_id)
+        .unwrap());
+
+    persister.inner.clear_block_spends(&wallet_id).unwrap();
+    assert!(
+        persister
+            .inner
+            .block_spends_migration_done(&wallet_id)
+            .unwrap(),
+        "a reset keeps the mark"
+    );
+
+    persister
+        .inner
+        .delete_wallet_skip_backup(wallet_id)
+        .expect("delete");
+    assert!(
+        !persister
+            .inner
+            .block_spends_migration_done(&wallet_id)
+            .unwrap(),
+        "a wallet delete removes the mark"
+    );
+}

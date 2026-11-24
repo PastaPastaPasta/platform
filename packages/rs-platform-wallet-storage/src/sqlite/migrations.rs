@@ -58,6 +58,7 @@ const FORK_SCHEMA: &[(i32, ForkObject)] = &[
     (2, ForkObject::Column("core_instant_locks", "verified")),
     (3, ForkObject::Table("core_dropped_unsigned_spends")),
     (5, ForkObject::Table("core_block_spends")),
+    (5, ForkObject::Table("core_block_spends_migrated")),
 ];
 
 /// A schema object a fork migration creates.
@@ -1041,6 +1042,7 @@ mod tests {
             "DROP TABLE {FORK_HISTORY_TABLE};
              DROP TABLE core_dropped_unsigned_spends;
              DROP TABLE core_block_spends;
+             DROP TABLE core_block_spends_migrated;
              ALTER TABLE core_instant_locks DROP COLUMN verified;"
         ))
         .unwrap();
@@ -1381,6 +1383,7 @@ mod tests {
         ),
         ("DROP TABLE core_dropped_unsigned_spends;", "is missing"),
         ("DROP TABLE core_block_spends;", "is missing"),
+        ("DROP TABLE core_block_spends_migrated;", "is missing"),
     ];
 
     /// Test 10: an upstream migration that drops, or rebuilds into another

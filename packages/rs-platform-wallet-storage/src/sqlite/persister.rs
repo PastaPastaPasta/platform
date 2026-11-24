@@ -740,6 +740,32 @@ impl SqlitePersister {
         .map(drop)
     }
 
+    /// Whether `wallet_id`'s block spends from before the block-spend table
+    /// were recovered (the host's one-time rescan). `false` for a wallet the
+    /// mark was never set for, including every wallet of a store that
+    /// attests `CORE_BLOCK_SPENDS` for the first time. A reset of the chain
+    /// data ([`clear_block_spends`](Self::clear_block_spends)) keeps it.
+    pub fn block_spends_migration_done(
+        &self,
+        wallet_id: &WalletId,
+    ) -> Result<bool, WalletStorageError> {
+        let conn = self.conn()?;
+        schema::core_state::block_spends_migration_done(&conn, wallet_id)
+    }
+
+    /// Record that `wallet_id`'s block spends from before the block-spend
+    /// table were recovered, after writing its buffered changeset.
+    /// Idempotent; removed only with the wallet.
+    pub fn mark_block_spends_migration_done(
+        &self,
+        wallet_id: &WalletId,
+    ) -> Result<(), PersistenceError> {
+        self.write_block_spends(wallet_id, "mark_block_spends_migration_done", |conn| {
+            schema::core_state::mark_block_spends_migration_done(conn, wallet_id).map(|()| 0)
+        })
+        .map(drop)
+    }
+
     fn write_block_spends(
         &self,
         wallet_id: &WalletId,
@@ -2560,18 +2586,19 @@ mod tests {
         // Not rehydrated by `load()`, but read on demand by a production
         // entry point, so the state is reachable rather than abandoned.
         const READ_BY_A_DEDICATED_API: &[&str] = &[
-            "core_address_pool_retired", // retired_pool_addresses
-            "core_block_spends",         // block_spent_outpoints
-            "dpns_name_states",          // get_dpns_name_state
-            "meta_contact",              // the kv object store
-            "meta_data_versions",        // schema::versions
-            "meta_global",               // the kv object store
-            "meta_identity",             // the kv object store
-            "meta_platform_address",     // the kv object store
-            "meta_store_generation",     // schema::versions
-            "meta_token",                // the kv object store
-            "meta_wallet",               // the kv object store
-            "tracked_masternodes",       // load_tracked_masternodes
+            "core_address_pool_retired",  // retired_pool_addresses
+            "core_block_spends",          // block_spent_outpoints
+            "core_block_spends_migrated", // block_spends_migration_done
+            "dpns_name_states",           // get_dpns_name_state
+            "meta_contact",               // the kv object store
+            "meta_data_versions",         // schema::versions
+            "meta_global",                // the kv object store
+            "meta_identity",              // the kv object store
+            "meta_platform_address",      // the kv object store
+            "meta_store_generation",      // schema::versions
+            "meta_token",                 // the kv object store
+            "meta_wallet",                // the kv object store
+            "tracked_masternodes",        // load_tracked_masternodes
         ];
         const INFRASTRUCTURE: &[&str] = &["refinery_schema_history", "dw_fork_schema_history"];
         // `load()` rehydrates these only with the `shielded` feature on, so

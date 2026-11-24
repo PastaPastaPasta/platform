@@ -192,6 +192,7 @@ fn migrate_reconciling_an_old_fork_file_applies_nothing() {
             "DROP TABLE {FORK_HISTORY_TABLE};
              DROP TABLE core_dropped_unsigned_spends;
              DROP TABLE core_block_spends;
+             DROP TABLE core_block_spends_migrated;
              ALTER TABLE core_instant_locks DROP COLUMN verified;"
         ))
         .unwrap();

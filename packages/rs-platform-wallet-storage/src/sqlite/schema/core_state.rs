@@ -498,6 +498,31 @@ pub fn record_found_block_spend(
     Ok(())
 }
 
+/// Whether `wallet_id`'s block spends from before `core_block_spends` were
+/// recovered.
+pub fn block_spends_migration_done(
+    conn: &Connection,
+    wallet_id: &WalletId,
+) -> Result<bool, WalletStorageError> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM core_block_spends_migrated WHERE wallet_id = ?1")?
+        .query_row(params![wallet_id.as_slice()], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+/// Mark `wallet_id`'s block spends from before `core_block_spends` recovered.
+pub fn mark_block_spends_migration_done(
+    conn: &Connection,
+    wallet_id: &WalletId,
+) -> Result<(), WalletStorageError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO core_block_spends_migrated (wallet_id) VALUES (?1)",
+        params![wallet_id.as_slice()],
+    )?;
+    Ok(())
+}
+
 /// Delete `wallet_id`'s block spends above `height`; returns how many.
 pub fn delete_block_spends_above(
     conn: &Connection,
@@ -2852,6 +2877,7 @@ mod tests {
                 "DELETE FROM {} WHERE version >= 2;
                  DROP TABLE core_dropped_unsigned_spends;
                  DROP TABLE core_block_spends;
+                 DROP TABLE core_block_spends_migrated;
                  ALTER TABLE core_instant_locks DROP COLUMN verified;",
                 crate::sqlite::migrations::FORK_HISTORY_TABLE
             ))
