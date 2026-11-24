@@ -84,7 +84,7 @@ fn forward_fork_version_rejected_destination_unchanged() {
         conn.execute(
             &format!(
                 "INSERT INTO {FORK_HISTORY_TABLE} (version, name, applied_on, checksum) \
-                 VALUES (4, 'future', '', '0')"
+                 VALUES (6, 'future', '', '0')"
             ),
             [],
         )
@@ -98,8 +98,8 @@ fn forward_fork_version_rejected_destination_unchanged() {
         matches!(
             err,
             Err(WalletStorageError::ForkSchemaVersionUnsupported {
-                found: 4,
-                max_supported: 3
+                found: 6,
+                max_supported: 5
             })
         ),
         "expected ForkSchemaVersionUnsupported, got {err:?}"

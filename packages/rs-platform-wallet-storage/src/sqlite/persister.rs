@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension};
 
 use dpp::prelude::Identifier;
 use platform_wallet::changeset::{
-    ClientStartState, IdentityChangeSet, PersistenceCapabilities, PersistenceError,
+    BlockSpend, ClientStartState, IdentityChangeSet, PersistenceCapabilities, PersistenceError,
     PlatformWalletChangeSet, PlatformWalletPersistence,
 };
 use platform_wallet::wallet::identity::ManagedIdentity;
@@ -664,6 +664,98 @@ impl SqlitePersister {
     ) -> Result<Vec<schema::core_pool::RetiredPoolAddress>, WalletStorageError> {
         let conn = self.conn()?;
         schema::core_pool::load_retired_pool_addresses(&conn, wallet_id, network)
+    }
+
+    /// Every coin of `wallet_id` a processed block spent, as stored: the
+    /// block's height and hash and the spending transaction, by outpoint.
+    /// A coin with a row is never released as unspent, and `load()` never
+    /// hands it back as unspent.
+    ///
+    /// Reads the *committed* table: in [`FlushMode::Manual`] a row still in
+    /// the write buffer is not visible yet.
+    pub fn block_spent_outpoints(
+        &self,
+        wallet_id: &WalletId,
+    ) -> Result<BTreeMap<dashcore::OutPoint, BlockSpend>, WalletStorageError> {
+        let conn = self.conn()?;
+        schema::core_state::load_block_spends(&conn, wallet_id)
+    }
+
+    /// Delete `wallet_id`'s block spends above `height`, after writing its
+    /// buffered changeset, and return how many went. For a rewind of the
+    /// wallet's chain data to `height`: the scan that follows captures again
+    /// every spend still on the chain.
+    pub fn delete_block_spends_above(
+        &self,
+        wallet_id: &WalletId,
+        height: u32,
+    ) -> Result<usize, PersistenceError> {
+        self.write_block_spends(wallet_id, "delete_block_spends_above", |conn| {
+            schema::core_state::delete_block_spends_above(conn, wallet_id, height)
+        })
+    }
+
+    /// Delete every block spend of `wallet_id`, after writing its buffered
+    /// changeset, and return how many went. For a reset of the wallet's
+    /// chain data.
+    pub fn clear_block_spends(&self, wallet_id: &WalletId) -> Result<usize, PersistenceError> {
+        self.write_block_spends(wallet_id, "clear_block_spends", |conn| {
+            schema::core_state::clear_block_spends(conn, wallet_id)
+        })
+    }
+
+    /// Delete `wallet_id`'s block spends above `chain_lock_height` whose
+    /// block hash differs from the one `chain` gives for their height,
+    /// after writing its buffered changeset, and return how many went.
+    /// `None`, or a height `chain` does not name, keeps the row. For a
+    /// load-time check against the SPV header store.
+    pub fn delete_block_spends_off_chain(
+        &self,
+        wallet_id: &WalletId,
+        chain_lock_height: u32,
+        chain: &BTreeMap<u32, Option<dashcore::BlockHash>>,
+    ) -> Result<usize, PersistenceError> {
+        self.write_block_spends(wallet_id, "delete_block_spends_off_chain", |conn| {
+            schema::core_state::delete_block_spends_off_chain(
+                conn,
+                wallet_id,
+                chain_lock_height,
+                chain,
+            )
+        })
+    }
+
+    /// Store a block spend of `wallet_id`'s coin found outside block
+    /// processing (a scan of stored blocks), after writing its buffered
+    /// changeset: the row and the coin's spent mark land in one
+    /// transaction.
+    pub fn record_found_block_spend(
+        &self,
+        wallet_id: &WalletId,
+        spend: BlockSpend,
+    ) -> Result<(), PersistenceError> {
+        self.write_block_spends(wallet_id, "record_found_block_spend", |conn| {
+            schema::core_state::record_found_block_spend(conn, wallet_id, &spend).map(|()| 1)
+        })
+        .map(drop)
+    }
+
+    fn write_block_spends(
+        &self,
+        wallet_id: &WalletId,
+        op: &'static str,
+        write: impl FnOnce(&Connection) -> Result<usize, WalletStorageError>,
+    ) -> Result<usize, PersistenceError> {
+        self.ensure_writable(op).map_err(PersistenceError::from)?;
+        let mut conn = self.conn().map_err(PersistenceError::from)?;
+        self.flush_locked(&mut conn, wallet_id)?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| PersistenceError::from(WalletStorageError::from(e)))?;
+        let deleted = write(&tx).map_err(PersistenceError::from)?;
+        tx.commit()
+            .map_err(|e| PersistenceError::from(WalletStorageError::from(e)))?;
+        Ok(deleted)
     }
 
     /// One asset lock's persisted status by outpoint, `Consumed` rows
@@ -1387,7 +1479,8 @@ impl PlatformWalletPersistence for SqlitePersister {
             .union(PersistenceCapabilities::TRACKED_ASSET_LOCKS)
             .union(PersistenceCapabilities::TRACKED_MASTERNODES)
             .union(PersistenceCapabilities::CORE_SWEEP_REMOVAL)
-            .union(PersistenceCapabilities::DASHPAY_PAYMENTS);
+            .union(PersistenceCapabilities::DASHPAY_PAYMENTS)
+            .union(PersistenceCapabilities::CORE_BLOCK_SPENDS);
         #[cfg(feature = "shielded")]
         {
             capabilities.union(PersistenceCapabilities::SHIELDED_VIEWING_KEYS)
@@ -2468,6 +2561,7 @@ mod tests {
         // entry point, so the state is reachable rather than abandoned.
         const READ_BY_A_DEDICATED_API: &[&str] = &[
             "core_address_pool_retired", // retired_pool_addresses
+            "core_block_spends",         // block_spent_outpoints
             "dpns_name_states",          // get_dpns_name_state
             "meta_contact",              // the kv object store
             "meta_data_versions",        // schema::versions
