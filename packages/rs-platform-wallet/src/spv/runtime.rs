@@ -342,18 +342,31 @@ impl SpvRuntime {
     }
 
     /// Stops the SPV client from sending `txid` again: its rebroadcast timer
-    /// skips it from now on, and a broadcast of it still queued is not sent
-    /// (dash-spv's `DashSpvClient::stop_rebroadcast`). For a transaction the
-    /// wallet abandoned. Never waits, so a caller holding the wallet
-    /// manager's lock may call it; a no-op before the first start.
-    pub fn stop_rebroadcast(&self, txid: &Txid) {
-        let stops = self
-            .rebroadcast_stops
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(stops) = stops.as_ref() {
-            stops.stop(txid);
+    /// skips it from now on, and a broadcast of it still queued is tracked
+    /// but not sent (dash-spv's `DashSpvClient::stop_rebroadcast`). For a
+    /// transaction the wallet abandoned. Never takes the client's lock, so a
+    /// caller holding the wallet manager's lock may call it; a no-op before
+    /// the first start.
+    pub async fn stop_rebroadcast(&self, txid: &Txid) {
+        if let Some(stops) = self.rebroadcast_stops() {
+            stops.stop(txid).await;
         }
+    }
+
+    /// Whether the running SPV client has stopped sending `txid`
+    /// ([`Self::stop_rebroadcast`]); false before the first start.
+    pub async fn is_rebroadcast_stopped(&self, txid: &Txid) -> bool {
+        match self.rebroadcast_stops() {
+            Some(stops) => stops.is_stopped(txid).await,
+            None => false,
+        }
+    }
+
+    fn rebroadcast_stops(&self) -> Option<RebroadcastStops> {
+        self.rebroadcast_stops
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Look up a quorum public key via the SPV masternode state.
