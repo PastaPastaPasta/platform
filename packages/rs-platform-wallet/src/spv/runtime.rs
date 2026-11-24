@@ -678,6 +678,91 @@ impl SpvRuntime {
         }
     }
 
+    /// The compact block filters the SPV store holds for `range`, one per
+    /// height in order.
+    ///
+    /// [`PlatformWalletError::SpvError`] when the SPV client isn't running or
+    /// the store can't serve the whole range.
+    pub async fn stored_filters(
+        &self,
+        range: std::ops::Range<u32>,
+    ) -> Result<Vec<Vec<u8>>, PlatformWalletError> {
+        use dash_spv::storage::FilterStorage;
+
+        let client_guard = self.client.read().await;
+        let Some(client) = client_guard.as_ref() else {
+            return Err(PlatformWalletError::SpvError(
+                "SPV client not running".to_string(),
+            ));
+        };
+        let storage_arc = client.storage();
+        let storage = storage_arc.lock().await;
+        let filters = StorageManager::filters(&*storage);
+        drop(storage);
+        let filters = filters.read().await;
+        FilterStorage::load_filters(&*filters, range)
+            .await
+            .map_err(|e| PlatformWalletError::SpvError(e.to_string()))
+    }
+
+    /// The heights the SPV store holds filters for, `start..=tip`, or `None`
+    /// when it holds none. Dense within the range; nothing below `start`.
+    ///
+    /// [`PlatformWalletError::SpvError`] when the SPV client isn't running or
+    /// the store can't be read.
+    pub async fn stored_filter_heights(
+        &self,
+    ) -> Result<Option<std::ops::RangeInclusive<u32>>, PlatformWalletError> {
+        use dash_spv::storage::FilterStorage;
+
+        let client_guard = self.client.read().await;
+        let Some(client) = client_guard.as_ref() else {
+            return Err(PlatformWalletError::SpvError(
+                "SPV client not running".to_string(),
+            ));
+        };
+        let storage_arc = client.storage();
+        let storage = storage_arc.lock().await;
+        let filters = StorageManager::filters(&*storage);
+        drop(storage);
+        let filters = filters.read().await;
+        let Some(start) = FilterStorage::filter_start_height(&*filters).await else {
+            return Ok(None);
+        };
+        let tip = FilterStorage::filter_tip_height(&*filters)
+            .await
+            .map_err(|e| PlatformWalletError::SpvError(e.to_string()))?;
+        Ok(Some(start..=tip))
+    }
+
+    /// The full block the SPV store kept at `height`, with its hash, or
+    /// `None` when it holds none there.
+    ///
+    /// [`PlatformWalletError::SpvError`] when the SPV client isn't running or
+    /// the store can't be read.
+    pub async fn stored_block(
+        &self,
+        height: u32,
+    ) -> Result<Option<(dashcore::BlockHash, dashcore::Block)>, PlatformWalletError> {
+        use dash_spv::storage::BlockStorage;
+
+        let client_guard = self.client.read().await;
+        let Some(client) = client_guard.as_ref() else {
+            return Err(PlatformWalletError::SpvError(
+                "SPV client not running".to_string(),
+            ));
+        };
+        let storage_arc = client.storage();
+        let storage = storage_arc.lock().await;
+        let blocks = StorageManager::blocks(&*storage);
+        drop(storage);
+        let blocks = blocks.read().await;
+        BlockStorage::load_block(&*blocks, height)
+            .await
+            .map(|block| block.map(|block| (*block.hash(), block.block().clone())))
+            .map_err(|e| PlatformWalletError::SpvError(e.to_string()))
+    }
+
     /// Clear all persisted SPV storage (headers, filters, state).
     ///
     /// A running client is stopped first, as by [`Self::stop`], and stays
@@ -1296,6 +1381,31 @@ mod tests {
         ClientConfig::testnet()
             .with_storage_path(storage.path())
             .with_restrict_to_configured_peers(true)
+    }
+
+    #[tokio::test]
+    async fn stored_filters_and_blocks_need_a_running_client() {
+        let runtime = unstarted_runtime();
+        assert!(matches!(
+            runtime.stored_filters(0..1).await,
+            Err(PlatformWalletError::SpvError(_))
+        ));
+        assert!(matches!(
+            runtime.stored_block(1).await,
+            Err(PlatformWalletError::SpvError(_))
+        ));
+        assert!(matches!(
+            runtime.stored_filter_heights().await,
+            Err(PlatformWalletError::SpvError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_store_holds_no_block_and_no_filter() {
+        let (runtime, _storage) = offline_runtime().await;
+        assert!(runtime.stored_block(1).await.unwrap().is_none());
+        assert_eq!(runtime.stored_filter_heights().await.unwrap(), None);
+        runtime.stop().await.unwrap();
     }
 
     /// The production startup path: `spawn_run_loop` drives upstream `run`,
