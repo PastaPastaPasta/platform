@@ -341,12 +341,9 @@ impl SpvRuntime {
             .map_err(classify_spv_send_error)
     }
 
-    /// Stops the SPV client from sending `txid` again: its rebroadcast timer
-    /// skips it from now on, and a broadcast of it still queued is tracked
-    /// but not sent (dash-spv's `DashSpvClient::stop_rebroadcast`). For a
-    /// transaction the wallet abandoned. Never takes the client's lock, so a
-    /// caller holding the wallet manager's lock may call it; a no-op before
-    /// the first start.
+    /// dash-spv's `DashSpvClient::stop_rebroadcast`, for a transaction the
+    /// wallet abandoned. Never takes the client's lock, so a caller holding
+    /// the wallet manager's lock may call it; a no-op before the first start.
     pub async fn stop_rebroadcast(&self, txid: &Txid) {
         if let Some(stops) = self.rebroadcast_stops() {
             stops.stop(txid).await;
