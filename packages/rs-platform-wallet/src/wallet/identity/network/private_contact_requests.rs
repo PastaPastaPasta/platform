@@ -5246,7 +5246,8 @@ mod tests {
     /// restoration and another relaunch, a private and a public request to
     /// that recipient are refused, while one to anyone else is not held.
     #[cfg(feature = "shielded")]
-    #[tokio::test]
+    // Multi-thread: each relaunch shuts its manager down before the next.
+    #[tokio::test(flavor = "multi_thread")]
     async fn should_hold_a_pair_from_its_journal_when_its_saved_payment_does_not_read() {
         for damage in [
             "UPDATE shielded_pending_spends SET private_contact_payment = x'01'",
@@ -5419,6 +5420,10 @@ mod tests {
                         "{context}: {elsewhere:?}"
                     );
                 }
+                // The next relaunch opens the same store, which one live
+                // store holds at a time: this one's workers stop first.
+                drop((coordinator, restarted));
+                restarted_manager.shutdown().await;
             }
         }
     }

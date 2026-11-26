@@ -759,6 +759,7 @@ fn the_migration_adopts_downstream_block_spend_tables_with_their_rows() {
         conn.execute_batch(
             "DROP TABLE core_block_spends; DROP TABLE core_block_spends_migrated; \
              DROP TABLE core_dismissed_txids; \
+             ALTER TABLE identities DROP COLUMN entry_format; ALTER TABLE dashpay_profiles DROP COLUMN profile_format; \
              DELETE FROM refinery_schema_history WHERE version >= 25;",
         )
         .unwrap();

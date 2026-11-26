@@ -460,6 +460,7 @@ pub(crate) fn rewind_v021(conn: &rusqlite::Connection) {
          DROP TABLE core_dismissed_txids; \
          ALTER TABLE core_instant_locks DROP COLUMN verified; \
          DROP TABLE core_block_spends; DROP TABLE core_block_spends_migrated; \
+         ALTER TABLE identities DROP COLUMN entry_format; ALTER TABLE dashpay_profiles DROP COLUMN profile_format; \
          DELETE FROM refinery_schema_history WHERE version >= 21;",
     )
     .unwrap();

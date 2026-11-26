@@ -27,6 +27,11 @@ use rusqlite::params;
 /// The migration that adds `core_dismissed_txids`.
 const DISMISSED_TXIDS_VERSION: i64 = 26;
 
+/// Undoes V027, the one migration after V026, so a test that takes V026 away
+/// leaves no applied migration above a missing one.
+const UNDO_PROFILE_ENCODING: &str =
+    "ALTER TABLE identities DROP COLUMN entry_format; ALTER TABLE dashpay_profiles DROP COLUMN profile_format;";
+
 fn tx(n: u32) -> Transaction {
     Transaction {
         version: 3,
@@ -371,8 +376,8 @@ fn a_database_from_before_the_table_takes_it_on_open() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(&format!(
-            "DROP TABLE core_dismissed_txids;
-             DELETE FROM refinery_schema_history WHERE version = {DISMISSED_TXIDS_VERSION};"
+            "DROP TABLE core_dismissed_txids; {UNDO_PROFILE_ENCODING}
+             DELETE FROM refinery_schema_history WHERE version >= {DISMISSED_TXIDS_VERSION};"
         ))
         .unwrap();
     }
@@ -461,8 +466,9 @@ fn a_database_that_already_has_the_table_adopts_it() {
             )
             .unwrap();
         }
+        conn.execute_batch(UNDO_PROFILE_ENCODING).unwrap();
         conn.execute(
-            "DELETE FROM refinery_schema_history WHERE version = ?1",
+            "DELETE FROM refinery_schema_history WHERE version >= ?1",
             [DISMISSED_TXIDS_VERSION],
         )
         .unwrap();

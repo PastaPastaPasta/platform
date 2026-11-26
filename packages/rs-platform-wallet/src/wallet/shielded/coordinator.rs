@@ -5687,16 +5687,11 @@ mod tests {
         );
         assert_eq!(holds().await, 1);
 
-        // The kept height is on disk: a store reopened on the same file reads it.
-        let reopened =
-            FileBackedShieldedStore::open_path(dir.join("tree.sqlite"), 100).expect("reopen");
-        assert_eq!(
-            reopened
-                .with_token_pool_conn(|conn| raise_sweep_height(conn, 0))
-                .unwrap(),
-            11
-        );
-        drop(reopened);
+        // The kept height is on disk: another connection to the same file
+        // reads it (the open store holds the file's lock, so no second store).
+        let on_disk = rusqlite::Connection::open(dir.join("tree.sqlite")).expect("reopen");
+        assert_eq!(raise_sweep_height(&on_disk, 0).unwrap(), 11);
+        drop(on_disk);
 
         // The token scan catches up and sees the transfer's note spent: it
         // landed, so its hold goes and its row waits for its confirmation.

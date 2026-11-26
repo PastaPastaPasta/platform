@@ -51,6 +51,11 @@ use crate::error::PlatformWalletError;
 use crate::wallet::platform_wallet::{PlatformWallet, WalletId};
 
 const SEED: [u8; 64] = [0x42; 64];
+
+/// The network of the wallet, its SDK and the coordinators: a bind refuses
+/// a coordinator of another network than the SDK's, and derives the seed's
+/// wallet on the SDK's network.
+const NETWORK: dashcore::Network = dashcore::Network::Testnet;
 const OTHER_SEED: [u8; 64] = [0x43; 64];
 const ACCOUNT: u32 = 0;
 const NOTE_VALUE: u64 = 1_000_000_000_000;
@@ -146,7 +151,7 @@ fn platform_recipient() -> PlatformAddress {
 }
 
 fn platform_recipient_bech32m() -> String {
-    platform_recipient().to_bech32m_string(dash_sdk::Sdk::new_mock().network)
+    platform_recipient().to_bech32m_string(NETWORK)
 }
 
 /// Where a failed identity creation credits the denomination.
@@ -336,8 +341,7 @@ where
 }
 
 fn keyset(seed: &[u8], account: u32) -> OrchardKeySet {
-    OrchardKeySet::from_seed(seed, dash_sdk::Sdk::new_mock().network, account)
-        .expect("ZIP-32 derivation from a fixed seed")
+    OrchardKeySet::from_seed(seed, NETWORK, account).expect("ZIP-32 derivation from a fixed seed")
 }
 
 /// One real, spendable Orchard note of `keys`' default address, as the
@@ -456,6 +460,7 @@ async fn bound_wallet_holding(
     // Pinned, so the anchor response can't move the protocol version between
     // the fee the spend reserves and the fee its builder applies.
     let mut sdk = dash_sdk::SdkBuilder::new_mock()
+        .with_network(NETWORK)
         .with_version(dpp::version::PlatformVersion::latest())
         .build()
         .expect("mock sdk");
@@ -496,7 +501,7 @@ fn core_address() -> String {
         "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
             .parse()
             .expect("a valid public key");
-    dashcore::Address::p2pkh(&key, dash_sdk::Sdk::new_mock().network).to_string()
+    dashcore::Address::p2pkh(&key, NETWORK).to_string()
 }
 
 async fn spend_with_keyset(
@@ -1070,7 +1075,12 @@ async fn an_unbound_account_is_refused_on_the_keyset_path() {
         let unbound_persister = Arc::new(CapturingPersistence::default());
         let unbound = platform_wallet_on(
             Arc::clone(&unbound_persister),
-            Arc::new(dash_sdk::Sdk::new_mock()),
+            Arc::new(
+                dash_sdk::SdkBuilder::new_mock()
+                    .with_network(NETWORK)
+                    .build()
+                    .expect("mock sdk"),
+            ),
         )
         .await;
         let unbound_stored_before = unbound_persister.stored_count();
@@ -1497,7 +1507,7 @@ fn assert_withdrawal_request(st_bytes: &[u8], path: &str) {
     let requested = core_address()
         .parse::<dashcore::Address<dashcore::address::NetworkUnchecked>>()
         .expect("the requested core address parses")
-        .require_network(dash_sdk::Sdk::new_mock().network)
+        .require_network(NETWORK)
         .expect("the requested core address is on the mock network");
     assert_eq!(
         v0.output_script,
@@ -1532,11 +1542,16 @@ async fn the_seed_and_keyset_paths_hand_the_hook_the_same_artifact() {
         let (by_keyset, keyset_hook, keyset_anchor) =
             hooked_coordinator(&format!("same_keyset_{kind:?}"), &note, false).await;
         assert_eq!(anchor, keyset_anchor, "the same tree");
-        let (wallet, _persister) =
-            bound_wallet(&by_seed, anchor, &note, &[&by_seed, &by_keyset]).await;
+        // A spend is admitted only on the coordinator its wallet is bound
+        // on, so each path has its own wallet of the same seed, bound there.
+        let (wallet, _persister) = bound_wallet(&by_seed, anchor, &note, &[&by_seed]).await;
+        let (keyset_wallet, _keyset_persister) =
+            bound_wallet(&by_keyset, anchor, &note, &[&by_keyset]).await;
+        assert_eq!(wallet.wallet_id(), keyset_wallet.wallet_id(), "one seed");
 
         let seed_result = spend_with_seed(&wallet, &by_seed, &SEED, kind).await;
-        let keyset_result = spend_with_keyset(&wallet, &by_keyset, &own, ACCOUNT, kind).await;
+        let keyset_result =
+            spend_with_keyset(&keyset_wallet, &by_keyset, &own, ACCOUNT, kind).await;
 
         for (path, result) in [("seed", &seed_result), ("keyset", &keyset_result)] {
             assert!(
