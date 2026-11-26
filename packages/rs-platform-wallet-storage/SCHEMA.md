@@ -133,6 +133,7 @@ erDiagram
         BLOB wallet_id FK "NULL = orphan identity (no parent wallet yet)"
         INTEGER identity_index "BIP-32 index; NULL for out-of-wallet identities"
         BLOB entry_blob "bincode-encoded IdentityEntry"
+        INTEGER entry_format "V027: 0 = pre-payment-address record, 1 = current"
     }
 
     IDENTITY_KEYS {
@@ -154,6 +155,7 @@ erDiagram
     DASHPAY_PROFILES {
         BLOB identity_id PK "one row per identity"
         BLOB profile_blob "bincode-encoded DashPayProfile"
+        INTEGER profile_format "V027: 0 = pre-payment-address record, 1 = current"
     }
 
     DASHPAY_PAYMENTS_OVERLAY {
@@ -443,7 +445,7 @@ held spent and is permanently outside the collector's reach.
 
 ### `core_transaction_inputs`
 
-V021 indexes every raw input of each stored transaction, even when its ownership
+V022 indexes every raw input of each stored transaction, even when its ownership
 is not yet known. New historical TXOs locate affected records through this index.
 The shared wallet accounting rule updates input/output details, net amount and
 direction; it never changes coins, spend claims or finality. Contact-only scripts
@@ -451,7 +453,7 @@ are excluded from wallet ownership. The one coin rule that reads this index is t
 fill of a re-scan coin: a coin with no `core_utxos` row is written spent when a
 stored transaction spends it.
 
-V021 also indexes and repairs existing mined and unmined records using retained
+V022 also indexes and repairs existing mined and unmined records using retained
 TXOs. Unknown historical ownership is filled when later observations supply it.
 No rows are deleted and no sync checkpoint is rewound. The typed backfill uses
 the live record decoder, with immutable V019 fixtures pinning codec compatibility.
@@ -610,6 +612,13 @@ every identity-scoped child writer, so a changeset carrying both an
 upsert and a removal for one identity commits instead of pulling the FK
 parent out from under its own child inserts.
 
+`entry_format` (V027) stamps the bincode shape of `entry_blob`: 0 is the
+record written before `DashPayProfile` gained its payment addresses, 1 the
+current one. The writer always stamps 1; the reader dispatches on the stamp
+(`schema::identity_profile_encoding::decode_identity`), so rows written
+before V027 stay readable until they are rewritten. The DEFAULT is 1 and the
+migration stamps the rows it finds 0, so only pre-V027 rows are ever legacy.
+
 - PK: `identity_id`.
 - FK: `wallet_id → wallets(wallet_id) ON DELETE CASCADE` (nullable).
 - Index: `idx_identities_wallet(wallet_id)`.
@@ -741,6 +750,11 @@ At most one DashPay profile blob per identity. `None` profile maps to a
 DELETE rather than a NULL blob — the row is absent, not nulled.
 `apply` writes these rows, but `load()` does not return them today;
 `DashPaySyncManager` rebuilds the canonical profile from Platform.
+
+`profile_format` (V027) stamps the bincode shape of `profile_blob` the same
+way `identities.entry_format` does (0 = pre-payment-address record, 1 =
+current); `schema::identity_profile_encoding::decode_profile` is the stamped
+reader for the day `load()` grows one.
 
 - PK: `identity_id` (single-row-per-identity).
 - FK: `identity_id → identities(identity_id) ON DELETE CASCADE`.
@@ -979,3 +993,4 @@ table-rebuild migration, as V004 does.
 | V024 | `V024__core_address_pool_retired.rs` | Adds `core_address_pool_retired` (a rotated DashPay contact's old pool rows, keyed by the xpub they derive from) plus `idx_core_address_pool_retired_script`, so a new-xpub registration no longer fails as a typed-key conflict on every retry. `IF NOT EXISTS`: a file that already holds this exact table and index, created by a downstream build, adopts them in place with their rows. Otherwise purely additive. |
 | V025 | `V025__core_block_spends.rs` | Adds `core_block_spends`, one row per wallet coin a processed block spent (outpoint, block height and hash, spender txid), so a coin a block spent is never handed back as unspent after the wallet's in-memory note is pruned at finality; and `core_block_spends_migrated`, one row per wallet whose earlier block spends were recovered. Idempotent (`IF NOT EXISTS`): a file a downstream build wrote with these exact tables adopts them with their rows. Purely additive otherwise. |
 | V026 | `V026__core_dismissed_txids.rs` | Adds `core_dismissed_txids`, one row per `(wallet_id, txid, abandoned)` the wallet dropped as dead (an abandoned payment, the loser of an InstantSend-locked conflict), ordered by `id`, so a peer delivering one again after a restart is not counted again. `abandoned` tells the user's abandons (1) from swept conflict losers (0); a transaction both swept and abandoned has a row of each. Written in the same transaction as the removal that caused it; the load hands each kind back oldest first and skips any whose transaction the store holds mined or with a verified lock, which the next open (or the wallet's next dismissal write) deletes. At most 4,096 rows of each kind per wallet, the oldest going first as each change applies, as key-wallet's own sets do, so sweeps never push an abandon out; the rows go with their wallet. Applied only where the table is missing (`migrations::v026`): a database that already has it keeps it and its rows, one with the table as it was before `abandoned` has it rebuilt with its rows (but for those of a deleted wallet and those past a wallet's newest 4,096) read as abandoned (the fail-safe kind: an abandon read as swept could be pushed out by later sweeps), and one with another shape is refused with `TableDefinitionMismatch`. Otherwise an upgraded database starts with no dismissals. |
+| V027 | `V027__profile_address_encoding.rs` | Adds the encoding stamps `identities.entry_format` and `dashpay_profiles.profile_format` (`INTEGER NOT NULL DEFAULT 1 CHECK IN (0, 1)`) and stamps every row present at migration time 0. `DashPayProfile` gained the core, platform and shielded payment addresses, which widens the positional bincode record embedded in both blobs; the stamp routes each row to the decoder for the shape it carries (`schema::identity_profile_encoding`). |
